@@ -1,0 +1,172 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { SqliteLcmStore } from "../dist/store.js";
+
+function makeWorkspace(prefix) {
+  return mkdtempSync(path.join(tmpdir(), `${prefix}-`));
+}
+
+function makeOptions(overrides = {}) {
+  return {
+    interop: { contextMode: true, neverOverrideCompactionPrompt: true, ignoreToolPrefixes: ["ctx_"] },
+    scopeDefaults: { grep: "session", describe: "session" },
+    scopeProfiles: [],
+    retention: { staleSessionDays: undefined, deletedSessionDays: 30, orphanBlobDays: 14 },
+    compactContextLimit: 1200,
+    systemHint: true,
+    storeDir: ".lcm",
+    freshTailMessages: 2,
+    minMessagesForTransform: 4,
+    summaryCharBudget: 900,
+    partCharBudget: 120,
+    largeContentThreshold: 80,
+    artifactPreviewChars: 90,
+    artifactViewChars: 1200,
+    binaryPreviewProviders: ["fingerprint"],
+    previewBytePeek: 8,
+    ...overrides,
+  };
+}
+
+function sessionInfo(directory, id, created, parentID) {
+  return {
+    id,
+    slug: id,
+    projectID: "p1",
+    directory,
+    parentID,
+    title: id,
+    version: "1",
+    time: { created, updated: created },
+  };
+}
+
+function userInfo(sessionID, id, created) {
+  return {
+    id,
+    sessionID,
+    role: "user",
+    time: { created },
+    agent: "build",
+    model: { providerID: "openai", modelID: "gpt-4.1" },
+  };
+}
+
+test("exports and imports a portable snapshot", async () => {
+  const sourceDir = makeWorkspace("lcm-export-src");
+  const targetDir = makeWorkspace("lcm-export-dst");
+  const snapshotPath = path.join(sourceDir, "snapshot.json");
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceDir, makeOptions());
+    await source.init();
+    await source.capture({ type: "session.created", properties: { sessionID: "root", info: sessionInfo(sourceDir, "root", 1) } });
+    await source.capture({ type: "message.updated", properties: { sessionID: "root", info: userInfo("root", "m1", 2) } });
+    await source.capture({ type: "message.part.updated", properties: { sessionID: "root", time: 2, part: { id: "p1", sessionID: "root", messageID: "m1", type: "text", text: "portable snapshot body" } } });
+    await source.pinSession({ sessionID: "root", reason: "keep for export" });
+
+    const exportText = await source.exportSnapshot({ filePath: snapshotPath, scope: "all" });
+    assert.match(exportText, /sessions=1/);
+
+    target = new SqliteLcmStore(targetDir, makeOptions());
+    await target.init();
+    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: "replace" });
+    assert.match(importText, /messages=1/);
+
+    const describe = await target.describe({ sessionID: "root" });
+    assert.match(describe, /Pinned: yes/);
+
+    const grep = await target.grep({ query: "portable snapshot body", sessionID: "root" });
+    assert.equal(grep[0]?.id, "m1");
+  } finally {
+    source?.close();
+    target?.close();
+    rmSync(sourceDir, { recursive: true, force: true });
+    rmSync(targetDir, { recursive: true, force: true });
+  }
+});
+
+test("applies worktree scope defaults from profiles", async () => {
+  const workspace = makeWorkspace("lcm-scope");
+  let store;
+  const options = makeOptions({
+    scopeDefaults: { grep: "session", describe: "session" },
+    scopeProfiles: [{ worktree: "c:/repo/a", grep: "worktree", describe: "root" }],
+  });
+
+  try {
+    store = new SqliteLcmStore(workspace, options);
+    await store.init();
+
+    for (const [id, dir, parentID, created] of [
+      ["rootA", "C:/repo/a", undefined, 1],
+      ["branchA", "C:/repo/a", "rootA", 2],
+      ["rootB", "C:/repo/a", undefined, 3],
+    ]) {
+      await store.capture({ type: "session.created", properties: { sessionID: id, info: sessionInfo(dir, id, created, parentID) } });
+    }
+
+    for (const [sessionID, id, created, text] of [
+      ["branchA", "m1", 4, "worktree default query in branchA"],
+      ["rootB", "m2", 5, "worktree default query in rootB"],
+      ["rootA", "m3", 6, "root describe session"],
+    ]) {
+      await store.capture({ type: "message.updated", properties: { sessionID, info: userInfo(sessionID, id, created) } });
+      await store.capture({ type: "message.part.updated", properties: { sessionID, time: created, part: { id: `${id}-p`, sessionID, messageID: id, type: "text", text } } });
+    }
+
+    const grep = await store.grep({ query: "worktree default query", sessionID: "branchA" });
+    assert.deepEqual([...new Set(grep.map((item) => item.sessionID))].sort(), ["branchA", "rootB"]);
+
+    const describe = await store.describe({ sessionID: "branchA" });
+    assert.match(describe, /Scope: root/);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("retention pruning skips pinned sessions and cleans orphan blobs", async () => {
+  const workspace = makeWorkspace("lcm-retention");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ retention: { staleSessionDays: undefined, deletedSessionDays: 30, orphanBlobDays: 14 } }));
+    await store.init();
+
+    await store.capture({ type: "session.created", properties: { sessionID: "keep", info: sessionInfo(workspace, "keep", 1) } });
+    await store.capture({ type: "session.created", properties: { sessionID: "drop", info: sessionInfo(workspace, "drop", 2) } });
+
+    for (const [sessionID, id, created, text] of [
+      ["keep", "m1", 3, "keep pinned session"],
+      ["drop", "m2", 4, "large blob ".repeat(20)],
+    ]) {
+      await store.capture({ type: "message.updated", properties: { sessionID, info: userInfo(sessionID, id, created) } });
+      await store.capture({ type: "message.part.updated", properties: { sessionID, time: created, part: { id: `${id}-p`, sessionID, messageID: id, type: "text", text } } });
+    }
+
+    await store.pinSession({ sessionID: "keep", reason: "do not prune" });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "drop", time: 5, part: { id: "m2-p", sessionID: "drop", messageID: "m2", type: "text", text: "short replacement" } } });
+
+    const dryRun = await store.retentionPrune({ staleSessionDays: 0, orphanBlobDays: 0, apply: false });
+    assert.match(dryRun, /deleted_session_candidates=0|stale_session_candidates=1/);
+    assert.ok(!dryRun.includes("keep pinned session"));
+
+    const applied = await store.retentionPrune({ staleSessionDays: 0, orphanBlobDays: 0, apply: true });
+    assert.match(applied, /deleted_sessions=1/);
+
+    const stats = await store.stats();
+    assert.equal(stats.sessionCount, 1);
+    assert.equal(stats.pinnedSessionCount, 1);
+    assert.equal(stats.orphanArtifactBlobCount, 0);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

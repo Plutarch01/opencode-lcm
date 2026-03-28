@@ -1,0 +1,45 @@
+{
+  "name": "opencode-lcm",
+  "version": "0.1.0",
+  "description": "Long-memory plugin for OpenCode with context-mode interop",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs/interop-mvp.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "memory",
+    "sqlite",
+    "context-mode",
+    "lcm"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "dogfood:opencode": "npm run build && node scripts/dogfood-opencode.mjs",
+    "prepublishOnly": "npm run typecheck && npm run test"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.3.3",
+    "@types/node": "^25.5.0",
+    "typescript": "^5.8.3"
+  }
+}
