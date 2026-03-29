@@ -44,6 +44,9 @@ test("resolveOptions normalizes malformed plugin config", () => {
       maxMessageHits: 3,
       maxSummaryHits: Number.NaN,
       maxArtifactHits: 2,
+      scopeOrder: ["worktree", "bogus", "session", "worktree"],
+      scopeBudgets: { session: -1, root: 4, worktree: 0, all: Number.NaN },
+      stop: { targetHits: -1, stopOnFirstScopeWithHits: true },
     },
     compactContextLimit: Number.NaN,
     previewBytePeek: Number.NaN,
@@ -64,6 +67,17 @@ test("resolveOptions normalizes malformed plugin config", () => {
   assert.equal(resolved.automaticRetrieval.maxMessageHits, 3);
   assert.equal(resolved.automaticRetrieval.maxSummaryHits, DEFAULT_OPTIONS.automaticRetrieval.maxSummaryHits);
   assert.equal(resolved.automaticRetrieval.maxArtifactHits, 2);
+  assert.deepEqual(resolved.automaticRetrieval.scopeOrder, ["worktree", "session"]);
+  assert.deepEqual(resolved.automaticRetrieval.scopeBudgets, {
+    session: DEFAULT_OPTIONS.automaticRetrieval.scopeBudgets.session,
+    root: 4,
+    worktree: 0,
+    all: DEFAULT_OPTIONS.automaticRetrieval.scopeBudgets.all,
+  });
+  assert.deepEqual(resolved.automaticRetrieval.stop, {
+    targetHits: DEFAULT_OPTIONS.automaticRetrieval.stop.targetHits,
+    stopOnFirstScopeWithHits: true,
+  });
   assert.equal(resolved.compactContextLimit, DEFAULT_OPTIONS.compactContextLimit);
   assert.equal(resolved.previewBytePeek, DEFAULT_OPTIONS.previewBytePeek);
   assert.equal(resolved.systemHint, false);
@@ -82,6 +96,7 @@ test("plugin exposes tools, records events, and appends compaction context once"
       "lcm_blob_gc",
       "lcm_blob_stats",
       "lcm_describe",
+      "lcm_doctor",
       "lcm_expand",
       "lcm_export_snapshot",
       "lcm_grep",
@@ -111,10 +126,16 @@ test("plugin exposes tools, records events, and appends compaction context once"
     const toolContext = makeToolContext(workspace, "s1");
     const status = await hooks.tool.lcm_status.execute({}, toolContext);
     const describe = await hooks.tool.lcm_describe.execute({ sessionID: "s1" }, toolContext);
+    const doctor = await hooks.tool.lcm_doctor.execute({ sessionID: "s1" }, toolContext);
 
     assert.match(status, /session_count=1/);
+    assert.match(status, /automatic_retrieval_scope_order=session,root,worktree/);
+    assert.match(status, /automatic_retrieval_scope_budgets=session:16,root:12,worktree:8,all:6/);
+    assert.match(status, /automatic_retrieval_stop_target_hits=3/);
+    assert.match(status, /automatic_retrieval_stop_on_first_scope_with_hits=false/);
     assert.match(describe, /Session: s1/);
     assert.match(describe, /plugin hook body/);
+    assert.match(doctor, /checked_scope=session:s1/);
 
     const firstCompaction = { context: [], prompt: "keep-default" };
     await hooks["experimental.session.compacting"]({ sessionID: "s1" }, firstCompaction);

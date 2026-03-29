@@ -25,6 +25,18 @@ export type RetentionPolicyOptions = {
   orphanBlobDays?: number;
 };
 
+export type AutomaticRetrievalScopeBudgets = {
+  session: number;
+  root: number;
+  worktree: number;
+  all: number;
+};
+
+export type AutomaticRetrievalStopOptions = {
+  targetHits: number;
+  stopOnFirstScopeWithHits: boolean;
+};
+
 export type AutomaticRetrievalOptions = {
   enabled: boolean;
   maxChars: number;
@@ -32,6 +44,9 @@ export type AutomaticRetrievalOptions = {
   maxMessageHits: number;
   maxSummaryHits: number;
   maxArtifactHits: number;
+  scopeOrder: ScopeName[];
+  scopeBudgets: AutomaticRetrievalScopeBudgets;
+  stop: AutomaticRetrievalStopOptions;
 };
 
 export type OpencodeLcmOptions = {

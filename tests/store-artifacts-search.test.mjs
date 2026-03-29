@@ -15,7 +15,7 @@ import {
   writeFixtureFile,
 } from "./helpers.mjs";
 
-test("large repeated content is externalized, deduplicated, and blob GC removes new orphans", async () => {
+test("large repeated content is externalized, deduplicated, and capture cleanup prevents new orphans", async () => {
   const workspace = makeWorkspace("lcm-artifact-dedup");
   let store;
 
@@ -72,10 +72,10 @@ test("large repeated content is externalized, deduplicated, and blob GC removes 
     const applied = await store.gcBlobs({ apply: true });
     const after = await store.stats();
 
-    assert.match(dryRun, /orphan_blobs=1/);
-    assert.match(dryRun, /status=dry-run/);
-    assert.match(applied, /deleted_blobs=1/);
-    assert.match(applied, /status=applied/);
+    assert.match(dryRun, /orphan_blobs=0/);
+    assert.match(dryRun, /status=clean/);
+    assert.match(applied, /orphan_blobs=0/);
+    assert.match(applied, /status=clean/);
     assert.equal(after.orphanArtifactBlobCount, 0);
   } finally {
     store?.close();

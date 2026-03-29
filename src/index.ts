@@ -48,6 +48,10 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `automatic_retrieval_message_hits=${options.automaticRetrieval.maxMessageHits}`,
             `automatic_retrieval_summary_hits=${options.automaticRetrieval.maxSummaryHits}`,
             `automatic_retrieval_artifact_hits=${options.automaticRetrieval.maxArtifactHits}`,
+            `automatic_retrieval_scope_order=${options.automaticRetrieval.scopeOrder.join(",")}`,
+            `automatic_retrieval_scope_budgets=session:${options.automaticRetrieval.scopeBudgets.session},root:${options.automaticRetrieval.scopeBudgets.root},worktree:${options.automaticRetrieval.scopeBudgets.worktree},all:${options.automaticRetrieval.scopeBudgets.all}`,
+            `automatic_retrieval_stop_target_hits=${options.automaticRetrieval.stop.targetHits}`,
+            `automatic_retrieval_stop_on_first_scope_with_hits=${options.automaticRetrieval.stop.stopOnFirstScopeWithHits}`,
             `fresh_tail_messages=${options.freshTailMessages}`,
             `min_messages_for_transform=${options.minMessagesForTransform}`,
             `large_content_threshold=${options.largeContentThreshold}`,
@@ -205,6 +209,22 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         async execute(args) {
           return await store.gcBlobs({
             apply: args.apply,
+            limit: args.limit,
+          });
+        },
+      }),
+
+      lcm_doctor: tool({
+        description: "Inspect or repair archive summaries and indexes",
+        args: {
+          apply: tool.schema.boolean().optional(),
+          sessionID: tool.schema.string().optional(),
+          limit: tool.schema.number().int().min(1).max(50).optional(),
+        },
+        async execute(args) {
+          return await store.doctor({
+            apply: args.apply,
+            sessionID: args.sessionID,
             limit: args.limit,
           });
         },

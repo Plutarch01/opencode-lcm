@@ -15,6 +15,9 @@ const BASE_OPTIONS = {
     maxMessageHits: 2,
     maxSummaryHits: 1,
     maxArtifactHits: 1,
+    scopeOrder: ["session", "root", "worktree"],
+    scopeBudgets: { session: 16, root: 12, worktree: 8, all: 6 },
+    stop: { targetHits: 3, stopOnFirstScopeWithHits: false },
   },
   compactContextLimit: 1200,
   systemHint: true,
@@ -46,7 +49,18 @@ export function makeOptions(overrides = {}) {
     scopeDefaults: { ...BASE_OPTIONS.scopeDefaults, ...overrides.scopeDefaults },
     scopeProfiles: overrides.scopeProfiles ?? BASE_OPTIONS.scopeProfiles,
     retention: { ...BASE_OPTIONS.retention, ...overrides.retention },
-    automaticRetrieval: { ...BASE_OPTIONS.automaticRetrieval, ...overrides.automaticRetrieval },
+    automaticRetrieval: {
+      ...BASE_OPTIONS.automaticRetrieval,
+      ...overrides.automaticRetrieval,
+      scopeBudgets: {
+        ...BASE_OPTIONS.automaticRetrieval.scopeBudgets,
+        ...overrides.automaticRetrieval?.scopeBudgets,
+      },
+      stop: {
+        ...BASE_OPTIONS.automaticRetrieval.stop,
+        ...overrides.automaticRetrieval?.stop,
+      },
+    },
     binaryPreviewProviders: overrides.binaryPreviewProviders ?? BASE_OPTIONS.binaryPreviewProviders,
   };
 }

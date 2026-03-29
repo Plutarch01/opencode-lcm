@@ -1,5 +1,7 @@
 import type {
   AutomaticRetrievalOptions,
+  AutomaticRetrievalScopeBudgets,
+  AutomaticRetrievalStopOptions,
   InteropOptions,
   OpencodeLcmOptions,
   RetentionPolicyOptions,
@@ -32,6 +34,17 @@ const DEFAULT_AUTOMATIC_RETRIEVAL: AutomaticRetrievalOptions = {
   maxMessageHits: 2,
   maxSummaryHits: 1,
   maxArtifactHits: 1,
+  scopeOrder: ["session", "root", "worktree"],
+  scopeBudgets: {
+    session: 16,
+    root: 12,
+    worktree: 8,
+    all: 6,
+  },
+  stop: {
+    targetHits: 3,
+    stopOnFirstScopeWithHits: false,
+  },
 };
 
 export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
@@ -66,6 +79,10 @@ function asNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function asNonNegativeNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function asOptionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
@@ -78,6 +95,19 @@ function asStringArray(value: unknown, fallback: string[]): string[] {
 
 function asScopeName(value: unknown, fallback: ScopeName): ScopeName {
   return value === "session" || value === "root" || value === "worktree" || value === "all" ? value : fallback;
+}
+
+function asScopeNameArray(value: unknown, fallback: ScopeName[]): ScopeName[] {
+  if (!Array.isArray(value)) return fallback;
+  const result: ScopeName[] = [];
+
+  for (const item of value) {
+    if (item !== "session" && item !== "root" && item !== "worktree" && item !== "all") continue;
+    if (result.includes(item)) continue;
+    result.push(item);
+  }
+
+  return result.length > 0 ? result : fallback;
 }
 
 function asScopeDefaults(value: unknown, fallback: ScopeDefaults): ScopeDefaults {
@@ -128,6 +158,33 @@ function asAutomaticRetrievalOptions(value: unknown, fallback: AutomaticRetrieva
     maxMessageHits: asNumber(record?.maxMessageHits, fallback.maxMessageHits),
     maxSummaryHits: asNumber(record?.maxSummaryHits, fallback.maxSummaryHits),
     maxArtifactHits: asNumber(record?.maxArtifactHits, fallback.maxArtifactHits),
+    scopeOrder: asScopeNameArray(record?.scopeOrder, fallback.scopeOrder),
+    scopeBudgets: asAutomaticRetrievalScopeBudgets(record?.scopeBudgets, fallback.scopeBudgets),
+    stop: asAutomaticRetrievalStopOptions(record?.stop, fallback.stop),
+  };
+}
+
+function asAutomaticRetrievalScopeBudgets(
+  value: unknown,
+  fallback: AutomaticRetrievalScopeBudgets,
+): AutomaticRetrievalScopeBudgets {
+  const record = asRecord(value);
+  return {
+    session: asNonNegativeNumber(record?.session, fallback.session),
+    root: asNonNegativeNumber(record?.root, fallback.root),
+    worktree: asNonNegativeNumber(record?.worktree, fallback.worktree),
+    all: asNonNegativeNumber(record?.all, fallback.all),
+  };
+}
+
+function asAutomaticRetrievalStopOptions(
+  value: unknown,
+  fallback: AutomaticRetrievalStopOptions,
+): AutomaticRetrievalStopOptions {
+  const record = asRecord(value);
+  return {
+    targetHits: asNonNegativeNumber(record?.targetHits, fallback.targetHits),
+    stopOnFirstScopeWithHits: asBoolean(record?.stopOnFirstScopeWithHits, fallback.stopOnFirstScopeWithHits),
   };
 }
 

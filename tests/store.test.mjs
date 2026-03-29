@@ -132,6 +132,79 @@ test("applies worktree scope defaults from profiles", async () => {
   }
 });
 
+test("message.updated preserves existing parts and search content", async () => {
+  const workspace = makeWorkspace("lcm-message-update");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "s1",
+        time: 2,
+        part: { id: "m1-p", sessionID: "s1", messageID: "m1", type: "text", text: "preserve this message body" },
+      },
+    });
+
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 3) } });
+
+    const grep = await store.grep({ query: "preserve this message body", sessionID: "s1", limit: 3 });
+    const describe = await store.describe({ sessionID: "s1" });
+
+    assert.equal(grep[0]?.id, "m1");
+    assert.match(describe, /preserve this message body/);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("message.part.delta is recorded without rewriting archived session state", async () => {
+  const workspace = makeWorkspace("lcm-part-delta");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "s1",
+        time: 2,
+        part: { id: "m1-p", sessionID: "s1", messageID: "m1", type: "text", text: "stable archived body" },
+      },
+    });
+
+    const before = await store.describe({ sessionID: "s1" });
+    await store.capture({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "s1",
+        messageID: "m1",
+        partID: "m1-p",
+        field: "text",
+        delta: " stream chunk",
+      },
+    });
+    const after = await store.describe({ sessionID: "s1" });
+    const stats = await store.stats();
+
+    assert.equal(after, before);
+    assert.equal(stats.eventTypes["message.part.delta"], 1);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("retention pruning skips pinned sessions and cleans orphan blobs", async () => {
   const workspace = makeWorkspace("lcm-retention");
   let store;
