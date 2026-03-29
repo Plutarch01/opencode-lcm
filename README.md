@@ -92,7 +92,10 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
       },
       "freshTailMessages": 10,
       "minMessagesForTransform": 16,
-      "summaryCharBudget": 1500
+      "summaryCharBudget": 1500,
+      "systemHint": true,
+      "binaryPreviewProviders": ["fingerprint", "byte-peek", "image-dimensions", "pdf-metadata"],
+      "previewBytePeek": 16
     }]
   ]
 }
@@ -142,17 +145,21 @@ Three ways to turn off the plugin without removing it:
 ## Source layout
 
 - `src/index.ts` - plugin entrypoint and OpenCode hooks
-- `src/options.ts` - option normalization
-- `src/archive-transform.ts` - archive window selection and synthetic context rendering
-- `src/doctor.ts` - archive health report formatting
-- `src/search-ranking.ts` - cross-source search ranking
-- `src/store.ts` - SQLite store, FTS search, summary DAG, artifact externalization, and archive repair
+- `src/options.ts` - option normalization and defaults
 - `src/types.ts` - shared types
+- `src/store.ts` - SQLite store, FTS search, summary DAG, artifact externalization, and archive repair
+- `src/store-snapshot.ts` - portable snapshot export/import with worktree-mode controls and path-safety guards
+- `src/workspace-path.ts` - safe workspace-relative path resolution
+- `src/worktree-key.ts` - worktree key normalization
+- `src/archive-transform.ts` - archive window selection and synthetic context rendering
+- `src/search-ranking.ts` - cross-source search ranking
+- `src/doctor.ts` - archive health report formatting (includes `invalid-summary-graph` diagnosis)
+- `src/preview-providers.ts` - configurable binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata)
 - `docs/interop-mvp.md` - hook ownership, conflict rules, and next milestones
 
 ## Next milestones
 
-1. Continue hardening summary invalidation for multi-branch imports, rewrites, and more pathological lineage changes
+1. Continue hardening summary invalidation for more pathological lineage changes (multi-cycle reparents, cross-worktree collisions)
 2. Add richer recall debugging and tuning controls once the heuristics settle
-3. Add richer media-specific preview providers on top of the binary preview framework
+3. Add richer media-specific preview providers on top of the existing binary preview framework
 4. Add per-worktree mapping tables for more selective multi-worktree snapshot restores
