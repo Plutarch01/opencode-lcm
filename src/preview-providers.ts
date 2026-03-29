@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import path from "node:path";
 
 import type { Part } from "@opencode-ai/sdk";
+
+import { resolveWorkspacePath } from "./workspace-path.js";
 
 type FilePart = Extract<Part, { type: "file" }>;
 
@@ -37,8 +38,12 @@ type ProviderHelpers = {
 function inferLocalPath(workspaceDirectory: string, file: FilePart): string | undefined {
   const sourcePath = file.source && "path" in file.source ? file.source.path : undefined;
   if (!sourcePath) return undefined;
-  if (path.isAbsolute(sourcePath)) return sourcePath;
-  return path.resolve(workspaceDirectory, sourcePath);
+
+  try {
+    return resolveWorkspacePath(workspaceDirectory, sourcePath);
+  } catch {
+    return undefined;
+  }
 }
 
 function toHexPreview(buffer: Buffer, bytes: number): string | undefined {

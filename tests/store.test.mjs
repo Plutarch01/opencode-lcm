@@ -164,6 +164,95 @@ test("message.updated preserves existing parts and search content", async () => 
   }
 });
 
+test("message.removed drops reverted content from session memory and search", async () => {
+  const workspace = makeWorkspace("lcm-message-removed");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "s1",
+        time: 2,
+        part: {
+          id: "m1-p",
+          sessionID: "s1",
+          messageID: "m1",
+          type: "text",
+          text: "reverted memory body ".repeat(8),
+        },
+      },
+    });
+
+    const before = await store.grep({ query: "reverted memory body", sessionID: "s1", limit: 3 });
+    assert.equal(before[0]?.id, "m1");
+
+    await store.capture({ type: "message.removed", properties: { sessionID: "s1", messageID: "m1" } });
+
+    const after = await store.grep({ query: "reverted memory body", sessionID: "s1", limit: 3 });
+    const describe = await store.describe({ sessionID: "s1" });
+    const stats = await store.stats();
+
+    assert.equal(after.length, 0);
+    assert.ok(!describe.includes("reverted memory body"));
+    assert.equal(stats.artifactCount, 0);
+    assert.equal(stats.orphanArtifactBlobCount, 0);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("message.part.updated replaces externalized content without leaving stale artifacts", async () => {
+  const workspace = makeWorkspace("lcm-message-part-replace");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "s1",
+        time: 2,
+        part: { id: "m1-p", sessionID: "s1", messageID: "m1", type: "text", text: "large stale body ".repeat(12) },
+      },
+    });
+
+    const before = await store.stats();
+    assert.equal(before.artifactCount, 1);
+
+    await store.capture({
+      type: "message.part.updated",
+      properties: {
+        sessionID: "s1",
+        time: 3,
+        part: { id: "m1-p", sessionID: "s1", messageID: "m1", type: "text", text: "short replacement" },
+      },
+    });
+
+    const grep = await store.grep({ query: "large stale body", sessionID: "s1", limit: 3 });
+    const describe = await store.describe({ sessionID: "s1" });
+    const after = await store.stats();
+
+    assert.equal(grep.length, 0);
+    assert.match(describe, /short replacement/);
+    assert.equal(after.artifactCount, 0);
+    assert.equal(after.orphanArtifactBlobCount, 0);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("message.part.delta is recorded without rewriting archived session state", async () => {
   const workspace = makeWorkspace("lcm-part-delta");
   let store;

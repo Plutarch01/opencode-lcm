@@ -30,7 +30,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && tsc -p tests/tsconfig.json && node --test tests/*.test.mjs dist-tests/*.test.js",
     "dogfood:opencode": "npm run build && node scripts/dogfood-opencode.mjs",
     "prepublishOnly": "npm run typecheck && npm run test"
   },

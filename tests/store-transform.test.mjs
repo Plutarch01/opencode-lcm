@@ -288,6 +288,295 @@ test("automatic retrieval can build recall queries from later intent tokens", as
   }
 });
 
+test("automatic retrieval ignores pasted system reminders on low-signal confirmation turns", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-confirmation-noise");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }));
+    await store.init();
+
+    await createSession(store, workspace, "s1", 1);
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m2",
+      created: 3,
+      role: "assistant",
+      parts: [textPart("s1", "m2", "m2-p", "stored")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m3",
+      created: 4,
+      parts: [textPart("s1", "m3", "m3-p", "another archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m4",
+      created: 5,
+      parts: [
+        textPart(
+          "s1",
+          "m4",
+          "m4-p",
+          "<system-reminder>opencode-lcm automatically recalled 1 archived context hit(s). Recall telemetry: queries=one thing revert message Recalled context: - message session=s1 id=m1: tenant mapping sqlite Treat recalled archive as supporting context.</system-reminder> go ahead <system-reminder>Your operational mode has changed from plan to build.</system-reminder>",
+        ),
+      ],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m1",
+        created: 2,
+        parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m2",
+        created: 3,
+        role: "assistant",
+        parts: [textPart("s1", "m2", "m2-p", "stored")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m3",
+        created: 4,
+        parts: [textPart("s1", "m3", "m3-p", "another archived note")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m4",
+        created: 5,
+        parts: [
+          textPart(
+            "s1",
+            "m4",
+            "m4-p",
+            "<system-reminder>opencode-lcm automatically recalled 1 archived context hit(s). Recall telemetry: queries=one thing revert message Recalled context: - message session=s1 id=m1: tenant mapping sqlite Treat recalled archive as supporting context.</system-reminder> go ahead <system-reminder>Your operational mode has changed from plan to build.</system-reminder>",
+          ),
+        ],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[3].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+    const summaryPart = messages[3].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "archive-summary");
+
+    assert.equal(retrievalPart, undefined);
+    assert.ok(summaryPart);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("automatic retrieval ignores low-signal commit turns even with noisy nearby history", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-commit-noise");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 3, minMessagesForTransform: 5 }));
+    await store.init();
+
+    await createSession(store, workspace, "s1", 1);
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m2",
+      created: 3,
+      role: "assistant",
+      parts: [textPart("s1", "m2", "m2-p", "stored")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m3",
+      created: 4,
+      parts: [textPart("s1", "m3", "m3-p", "what do you suggest?")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m4",
+      created: 5,
+      role: "assistant",
+      parts: [textPart("s1", "m4", "m4-p", "I suggest shipping after one more verification pass")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m5",
+      created: 6,
+      parts: [
+        textPart(
+          "s1",
+          "m5",
+          "m5-p",
+          "<system-reminder>opencode-lcm automatically recalled 3 archived context hit(s) relevant to the current turn (scope=session). Recall telemetry: queries=commit system reminder operational | commit system reminder | commit system | system reminder operational mode Recalled context: - message session=s1 id=m3: what do you suggest? - artifact session=s1 id=art_meta (artifact:tool): supporting context </[system]-[reminder]> <system-reminder>Your operational mode has changed from plan to build.</system-reminder> commit",
+        ),
+      ],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m1",
+        created: 2,
+        parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m2",
+        created: 3,
+        role: "assistant",
+        parts: [textPart("s1", "m2", "m2-p", "stored")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m3",
+        created: 4,
+        parts: [textPart("s1", "m3", "m3-p", "what do you suggest?")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m4",
+        created: 5,
+        role: "assistant",
+        parts: [textPart("s1", "m4", "m4-p", "I suggest shipping after one more verification pass")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m5",
+        created: 6,
+        parts: [
+          textPart(
+            "s1",
+            "m5",
+            "m5-p",
+            "<system-reminder>opencode-lcm automatically recalled 3 archived context hit(s) relevant to the current turn (scope=session). Recall telemetry: queries=commit system reminder operational | commit system reminder | commit system | system reminder operational mode Recalled context: - message session=s1 id=m3: what do you suggest? - artifact session=s1 id=art_meta (artifact:tool): supporting context </[system]-[reminder]> <system-reminder>Your operational mode has changed from plan to build.</system-reminder> commit",
+          ),
+        ],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[4].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+    const summaryPart = messages[4].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "archive-summary");
+
+    assert.equal(retrievalPart, undefined);
+    assert.ok(summaryPart);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("automatic retrieval ignores meta-heavy artifact snippets when real message hits exist", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-artifact-noise");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4, largeContentThreshold: 40 }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, "s1", 1);
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m2",
+      created: 3,
+      role: "assistant",
+      parts: [
+        toolCompletedPart(
+          "s1",
+          "m2",
+          "m2-p",
+          "lcm_expand",
+          "<system-reminder>Recall telemetry: queries=tenant mapping sqlite Recalled context: artifact session=s1 tenant mapping sqlite lives in the billing cache near invoices_v2</system-reminder>",
+        ),
+      ],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m3",
+      created: 4,
+      parts: [textPart("s1", "m3", "m3-p", "another archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m4",
+      created: 5,
+      parts: [textPart("s1", "m4", "m4-p", "Where did tenant mapping sqlite live again?")],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m1",
+        created: 2,
+        parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m2",
+        created: 3,
+        role: "assistant",
+        parts: [
+          toolCompletedPart(
+            "s1",
+            "m2",
+            "m2-p",
+            "lcm_expand",
+            "<system-reminder>Recall telemetry: queries=tenant mapping sqlite Recalled context: artifact session=s1 tenant mapping sqlite lives in the billing cache near invoices_v2</system-reminder>",
+          ),
+        ],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m3",
+        created: 4,
+        parts: [textPart("s1", "m3", "m3-p", "another archived note")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m4",
+        created: 5,
+        parts: [textPart("s1", "m4", "m4-p", "Where did tenant mapping sqlite live again?")],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[3].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /message session=s1 id=m1/);
+    assert.ok(!retrievalPart.text.includes("artifact:tool"));
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
 test("automatic retrieval escalates from session to worktree when nearby archive is empty", async () => {
   const workspace = makeWorkspace("lcm-auto-retrieval-worktree");
   let store;
