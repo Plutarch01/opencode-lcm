@@ -11,6 +11,7 @@ import {
   firstNodeID,
   makeOptions,
   makeWorkspace,
+  sessionInfo,
   textPart,
   toolCompletedPart,
 } from "./helpers.mjs";
@@ -126,6 +127,7 @@ test("transformMessages automatically injects relevant archived memory snippets"
     assert.ok(retrievalPart);
     assert.ok(summaryPart);
     assert.match(retrievalPart.text, /automatically recalled/);
+    assert.match(retrievalPart.text, /Recall telemetry: queries=/);
     assert.match(retrievalPart.text, /message session=s1 id=m1/);
     assert.ok(!retrievalPart.text.includes("id=m4"));
   } finally {
@@ -210,6 +212,378 @@ test('automatic retrieval ignores framing words like "say" and recalls the archi
   }
 });
 
+test("automatic retrieval can build recall queries from later intent tokens", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-windows");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }));
+    await store.init();
+
+    await createSession(store, workspace, "s1", 1);
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m2",
+      created: 3,
+      role: "assistant",
+      parts: [textPart("s1", "m2", "m2-p", "stored")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m3",
+      created: 4,
+      parts: [textPart("s1", "m3", "m3-p", "another archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m4",
+      created: 5,
+      parts: [textPart("s1", "m4", "m4-p", "legacy adapter tenant mapping sqlite")],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m1",
+        created: 2,
+        parts: [textPart("s1", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m2",
+        created: 3,
+        role: "assistant",
+        parts: [textPart("s1", "m2", "m2-p", "stored")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m3",
+        created: 4,
+        parts: [textPart("s1", "m3", "m3-p", "another archived note")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m4",
+        created: 5,
+        parts: [textPart("s1", "m4", "m4-p", "legacy adapter tenant mapping sqlite")],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[3].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /billing cache/);
+    assert.match(retrievalPart.text, /queries=.*tenant mapping sqlite/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("automatic retrieval escalates from session to worktree when nearby archive is empty", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-worktree");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 3 }));
+    await store.init();
+
+    await createSession(store, workspace, "older", 1);
+    await captureMessage(store, {
+      sessionID: "older",
+      messageID: "om1",
+      created: 2,
+      parts: [textPart("older", "om1", "om1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+
+    await createSession(store, workspace, "current", 10);
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m1",
+      created: 11,
+      parts: [textPart("current", "m1", "m1-p", "current session unrelated archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m2",
+      created: 12,
+      role: "assistant",
+      parts: [textPart("current", "m2", "m2-p", "acknowledged")],
+    });
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m3",
+      created: 13,
+      parts: [textPart("current", "m3", "m3-p", "Where did tenant mapping sqlite live again?")],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m1",
+        created: 11,
+        parts: [textPart("current", "m1", "m1-p", "current session unrelated archived note")],
+      }),
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m2",
+        created: 12,
+        role: "assistant",
+        parts: [textPart("current", "m2", "m2-p", "acknowledged")],
+      }),
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m3",
+        created: 13,
+        parts: [textPart("current", "m3", "m3-p", "Where did tenant mapping sqlite live again?")],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[2].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /scope=session -> worktree/);
+    assert.match(retrievalPart.text, /Recall telemetry: raw_results=/);
+    assert.match(retrievalPart.text, /message session=older id=om1/);
+    assert.match(retrievalPart.text, /billing cache/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("automatic retrieval respects configured scope order", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-order");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 2,
+        automaticRetrieval: { scopeOrder: ["worktree"] },
+      }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, "older", 1);
+    await captureMessage(store, {
+      sessionID: "older",
+      messageID: "om1",
+      created: 2,
+      parts: [textPart("older", "om1", "om1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+
+    await createSession(store, workspace, "current", 10);
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m1",
+      created: 11,
+      parts: [textPart("current", "m1", "m1-p", "current session unrelated archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m2",
+      created: 12,
+      parts: [textPart("current", "m2", "m2-p", "Where did tenant mapping sqlite live again?")],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m1",
+        created: 11,
+        parts: [textPart("current", "m1", "m1-p", "current session unrelated archived note")],
+      }),
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m2",
+        created: 12,
+        parts: [textPart("current", "m2", "m2-p", "Where did tenant mapping sqlite live again?")],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[1].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /scope=worktree/);
+    assert.ok(!retrievalPart.text.includes("scope=session"));
+    assert.match(retrievalPart.text, /message session=older id=om1/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("automatic retrieval can skip a scope with a zero budget", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-budget-skip");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 2,
+        automaticRetrieval: {
+          scopeOrder: ["session", "worktree"],
+          scopeBudgets: { session: 0, worktree: 6 },
+          stop: { targetHits: 1 },
+        },
+      }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, "older", 1);
+    await captureMessage(store, {
+      sessionID: "older",
+      messageID: "om1",
+      created: 2,
+      parts: [textPart("older", "om1", "om1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+
+    await createSession(store, workspace, "current", 10);
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m1",
+      created: 11,
+      parts: [textPart("current", "m1", "m1-p", "current session unrelated archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m2",
+      created: 12,
+      parts: [textPart("current", "m2", "m2-p", "Where did tenant mapping sqlite live again?")],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m1",
+        created: 11,
+        parts: [textPart("current", "m1", "m1-p", "current session unrelated archived note")],
+      }),
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m2",
+        created: 12,
+        parts: [textPart("current", "m2", "m2-p", "Where did tenant mapping sqlite live again?")],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[1].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /scope=worktree/);
+    assert.match(retrievalPart.text, /stop_reason=target-hits-reached/);
+    assert.match(retrievalPart.text, /scope_stats=session:hits=0,raw=0,budget=0 \| worktree:hits=1/);
+    assert.match(retrievalPart.text, /message session=older id=om1/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("automatic retrieval can stop after the first scope with hits", async () => {
+  const workspace = makeWorkspace("lcm-auto-retrieval-stop-first-scope");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 3,
+        automaticRetrieval: {
+          scopeOrder: ["session", "worktree"],
+          stop: { targetHits: 3, stopOnFirstScopeWithHits: true },
+        },
+      }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, "older", 1);
+    await captureMessage(store, {
+      sessionID: "older",
+      messageID: "om1",
+      created: 2,
+      parts: [textPart("older", "om1", "om1-p", "tenant mapping sqlite lives in the remote fallback cache")],
+    });
+
+    await createSession(store, workspace, "current", 10);
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m1",
+      created: 11,
+      parts: [textPart("current", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+    });
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m2",
+      created: 12,
+      role: "assistant",
+      parts: [textPart("current", "m2", "m2-p", "acknowledged")],
+    });
+    await captureMessage(store, {
+      sessionID: "current",
+      messageID: "m3",
+      created: 13,
+      parts: [textPart("current", "m3", "m3-p", "Where did tenant mapping sqlite live again?")],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m1",
+        created: 11,
+        parts: [textPart("current", "m1", "m1-p", "tenant mapping sqlite lives in the billing cache near invoices_v2")],
+      }),
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m2",
+        created: 12,
+        role: "assistant",
+        parts: [textPart("current", "m2", "m2-p", "acknowledged")],
+      }),
+      conversationMessage({
+        sessionID: "current",
+        messageID: "m3",
+        created: 13,
+        parts: [textPart("current", "m3", "m3-p", "Where did tenant mapping sqlite live again?")],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+
+    const retrievalPart = messages[2].parts.find((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context");
+
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /scope=session/);
+    assert.ok(!retrievalPart.text.includes("scope=session -> worktree"));
+    assert.match(retrievalPart.text, /stop_reason=first-scope-hit/);
+    assert.match(retrievalPart.text, /message session=current id=m1/);
+    assert.ok(!retrievalPart.text.includes("session=older id=om1"));
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
 test("transformMessages can disable automatic archived retrieval", async () => {
   const workspace = makeWorkspace("lcm-auto-retrieval-off");
   let store;
@@ -258,6 +632,116 @@ test("transformMessages can disable automatic archived retrieval", async () => {
     assert.equal(changed, true);
     assert.ok(!messages[3].parts.some((part) => part.type === "text" && part.metadata?.opencodeLcm === "retrieved-context"));
     assert.ok(messages[3].parts.some((part) => part.type === "text" && part.metadata?.opencodeLcm === "archive-summary"));
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("transformMessages anchors synthetic context on the latest user when the recent tail is assistant-only", async () => {
+  const workspace = makeWorkspace("lcm-transform-latest-user");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 2,
+        minMessagesForTransform: 5,
+        automaticRetrieval: { enabled: false },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, "s1", 1);
+
+    const messages = [
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m1",
+        created: 1,
+        parts: [textPart("s1", "m1", "m1-p", "older archived message")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m2",
+        created: 2,
+        role: "assistant",
+        parts: [textPart("s1", "m2", "m2-p", "older assistant note")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m3",
+        created: 3,
+        parts: [textPart("s1", "m3", "m3-p", "current user request")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m4",
+        created: 4,
+        role: "assistant",
+        parts: [toolCompletedPart("s1", "m4", "m4-p", "lcm_grep", "first tool output")],
+      }),
+      conversationMessage({
+        sessionID: "s1",
+        messageID: "m5",
+        created: 5,
+        role: "assistant",
+        parts: [toolCompletedPart("s1", "m5", "m5-p", "read", "second tool output")],
+      }),
+    ];
+
+    const changed = await store.transformMessages(messages);
+
+    assert.equal(changed, true);
+    assert.match(messages[0].parts[0].text, /Archived by opencode-lcm/);
+    assert.match(messages[1].parts[0].text, /Archived by opencode-lcm/);
+    assert.equal(messages[2].parts[0].metadata.opencodeLcm, "archive-summary");
+    assert.match(messages[2].parts[0].text, /Archived roots:/);
+    assert.equal(messages[3].parts[0].type, "tool");
+    assert.equal(messages[3].parts[0].tool, "lcm_grep");
+    assert.equal(messages[3].parts[0].state.output, "first tool output");
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("buildCompactionContext keeps the latest user outside the archived summary graph", async () => {
+  const workspace = makeWorkspace("lcm-compaction-latest-user");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 2,
+        minMessagesForTransform: 5,
+        automaticRetrieval: { enabled: false },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, "s1", 1);
+
+    for (const [messageID, created, role, part] of [
+      ["m1", 1, "user", textPart("s1", "m1", "m1-p", "older archived message")],
+      ["m2", 2, "assistant", textPart("s1", "m2", "m2-p", "older assistant note")],
+      ["m3", 3, "user", textPart("s1", "m3", "m3-p", "current user request")],
+      ["m4", 4, "assistant", toolCompletedPart("s1", "m4", "m4-p", "lcm_grep", "first tool output")],
+      ["m5", 5, "assistant", toolCompletedPart("s1", "m5", "m5-p", "read", "second tool output")],
+    ]) {
+      await captureMessage(store, { sessionID: "s1", messageID, created, role, parts: [part] });
+    }
+
+    await store.buildCompactionContext("s1");
+
+    const rootList = await store.expand({ sessionID: "s1" });
+    const nodeID = firstNodeID(rootList);
+    const expanded = await store.expand({ nodeID, includeRaw: true });
+
+    assert.ok(nodeID);
+    assert.match(expanded, /older archived message/);
+    assert.match(expanded, /older assistant note/);
+    assert.ok(!expanded.includes("current user request"));
   } finally {
     store?.close();
     cleanupWorkspace(workspace);
@@ -329,6 +813,53 @@ test("summary rebuilds when archived content changes and expand can target raw m
     assert.match(targeted, /Raw messages:/);
     assert.match(targeted, /m1/);
     assert.match(targeted, /omega revised goal/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("session reparenting refreshes descendant managed resume notes", async () => {
+  const workspace = makeWorkspace("lcm-lineage-reparent");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }));
+    await store.init();
+
+    await createSession(store, workspace, "root-a", 1);
+    await createSession(store, workspace, "root-b", 2);
+    await createSession(store, workspace, "branch", 3, "root-a");
+    await createSession(store, workspace, "leaf", 4, "branch");
+    await captureMessage(store, {
+      sessionID: "leaf",
+      messageID: "m1",
+      created: 5,
+      parts: [textPart("leaf", "m1", "m1-p", "leaf session archived note")],
+    });
+
+    const before = await store.buildCompactionContext("leaf");
+
+    assert.match(before, /Root session: root-a/);
+    assert.match(before, /Parent session: branch/);
+    assert.match(before, /Lineage depth: 2/);
+
+    await store.capture({
+      type: "session.updated",
+      properties: {
+        sessionID: "branch",
+        info: sessionInfo(workspace, "branch", 10, "root-b"),
+      },
+    });
+
+    const resumed = await store.resume("leaf");
+    const lineage = await store.lineage("leaf");
+
+    assert.match(resumed, /Root session: root-b/);
+    assert.match(resumed, /Parent session: branch/);
+    assert.match(resumed, /Lineage depth: 2/);
+    assert.match(lineage, /Root session: root-b/);
+    assert.match(lineage, /Parent session: branch/);
   } finally {
     store?.close();
     cleanupWorkspace(workspace);

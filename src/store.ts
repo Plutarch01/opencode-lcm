@@ -4,15 +4,24 @@ import path from "node:path";
 
 import type { Event, Message, Part } from "@opencode-ai/sdk";
 
+import {
+  buildActiveSummaryText,
+  renderAutomaticRetrievalContext,
+  resolveArchiveTransformWindow,
+  selectAutomaticRetrievalHits,
+} from "./archive-transform.js";
+import { formatDoctorReport, type DoctorReport, type DoctorSessionIssue } from "./doctor.js";
 import type {
   CapturedEvent,
   ConversationMessage,
   NormalizedSession,
   OpencodeLcmOptions,
   SearchResult,
+  ScopeName,
   StoreStats,
 } from "./types.js";
 import { runBinaryPreviewProviders } from "./preview-providers.js";
+import { rankSearchCandidates, type SearchCandidate } from "./search-ranking.js";
 
 type ResumeMap = Record<string, string>;
 
@@ -123,17 +132,6 @@ type ArtifactData = {
   metadata: Record<string, unknown>;
 };
 
-type SearchCandidate = {
-  id: string;
-  type: string;
-  sessionID?: string;
-  timestamp: number;
-  snippet: string;
-  content: string;
-  sourceKind: "message" | "summary" | "artifact";
-  sourceOrder: number;
-};
-
 type SqlStatementLike = {
   run(...args: unknown[]): unknown;
   get(...args: unknown[]): unknown;
@@ -144,14 +142,6 @@ type SqlDatabaseLike = {
   exec(sql: string): unknown;
   close(): void;
   prepare(sql: string): SqlStatementLike;
-};
-
-type AutomaticRetrievalHit = {
-  kind: "message" | "summary" | "artifact";
-  id: string;
-  label: string;
-  sessionID?: string;
-  snippet: string;
 };
 
 type RetentionSessionCandidate = {
@@ -200,6 +190,7 @@ const SUMMARY_NODE_CHAR_LIMIT = 260;
 const EXPAND_MESSAGE_LIMIT = 6;
 const AUTOMATIC_RETRIEVAL_QUERY_TOKENS = 8;
 const AUTOMATIC_RETRIEVAL_RECENT_MESSAGES = 3;
+const AUTOMATIC_RETRIEVAL_QUERY_VARIANTS = 8;
 const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "a",
   "about",
@@ -804,7 +795,9 @@ export class SqliteLcmStore {
     db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)");
     await this.migrateLegacyArtifacts();
     this.backfillArtifactBlobsSync();
+    this.deleteOrphanArtifactBlobsSync();
     this.refreshAllLineageSync();
+    this.syncAllDerivedSessionStateSync(true);
     this.rebuildSearchIndexesSync();
   }
 
@@ -821,20 +814,45 @@ export class SqliteLcmStore {
     this.writeEvent(normalized);
 
     if (!normalized.sessionID) return;
+    if (!this.shouldPersistSessionForEvent(normalized.type)) return;
 
     const session = this.readSessionSync(normalized.sessionID);
-    const next = this.applyEvent(session, normalized);
+    const previousParentSessionID = session.parentSessionID;
+    let next = this.applyEvent(session, normalized);
     next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
     next.eventCount += 1;
+    next = this.prepareSessionForPersistence(next);
 
     const db = this.getDb();
     db.exec("BEGIN");
     try {
-      this.persistSession(next);
+      this.persistCapturedSessionSync(next, normalized);
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
       throw error;
+    }
+
+    if (this.shouldRefreshLineageForEvent(normalized.type)) {
+      this.refreshAllLineageSync();
+      const refreshed = this.readSessionHeaderSync(normalized.sessionID);
+      if (refreshed) {
+        next = {
+          ...next,
+          rootSessionID: refreshed.rootSessionID,
+          lineageDepth: refreshed.lineageDepth,
+        };
+      }
+    }
+
+    this.syncDerivedSessionStateSync(next);
+
+    if (this.shouldSyncDerivedLineageSubtree(normalized.type, previousParentSessionID, next.parentSessionID)) {
+      this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
+    }
+
+    if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
+      this.deleteOrphanArtifactBlobsSync();
     }
   }
 
@@ -990,6 +1008,281 @@ export class SqliteLcmStore {
       "Recent entries:",
       ...recent,
     ].join("\n");
+  }
+
+  async doctor(input?: { sessionID?: string; apply?: boolean; limit?: number }): Promise<string> {
+    const limit = clamp(input?.limit ?? 10, 1, 50);
+    const sessionID = input?.sessionID;
+    const apply = input?.apply ?? false;
+
+    const before = this.collectDoctorReport(sessionID);
+    if (!apply || !this.hasDoctorIssues(before)) {
+      return formatDoctorReport(before, limit);
+    }
+
+    const checkedSessions = sessionID ? [sessionID] : this.readAllSessionsSync().map((session) => session.sessionID);
+    const appliedActions: string[] = [];
+
+    this.ensureSessionColumnsSync();
+    this.ensureSummaryStateColumnsSync();
+    this.ensureArtifactColumnsSync();
+    appliedActions.push("ensured schema columns");
+
+    if (before.summarySessionsNeedingRebuild.length > 0 || before.orphanSummaryEdges > 0) {
+      this.rebuildSummarySessionsSync(checkedSessions);
+      appliedActions.push(`rebuilt summary DAGs for ${checkedSessions.length} checked session(s)`);
+    }
+
+    if (before.lineageSessionsNeedingRefresh.length > 0) {
+      this.refreshAllLineageSync();
+      this.syncAllDerivedSessionStateSync(true);
+      appliedActions.push("refreshed lineage metadata");
+    }
+
+    if (before.orphanArtifactBlobs > 0) {
+      this.backfillArtifactBlobsSync();
+      const deleted = this.deleteOrphanArtifactBlobsSync();
+      if (deleted.length > 0) {
+        appliedActions.push(`deleted ${deleted.length} orphan artifact blob(s)`);
+      }
+    }
+
+    if (
+      before.messageFts.expected !== before.messageFts.actual ||
+      before.summaryFts.expected !== before.summaryFts.actual ||
+      before.artifactFts.expected !== before.artifactFts.actual ||
+      before.summarySessionsNeedingRebuild.length > 0 ||
+      before.orphanSummaryEdges > 0
+    ) {
+      this.rebuildSearchIndexesSync();
+      appliedActions.push("rebuilt FTS indexes");
+    }
+
+    const after = this.collectDoctorReport(sessionID);
+    after.status = this.hasDoctorIssues(after) ? "issues-found" : "repaired";
+    after.appliedActions = appliedActions;
+    return formatDoctorReport(after, limit);
+  }
+
+  private collectDoctorReport(sessionID?: string): DoctorReport {
+    const sessions = sessionID ? [this.readSessionSync(sessionID)] : this.readAllSessionsSync();
+    const sessionIDs = sessions.map((session) => session.sessionID);
+    const summarySessionsNeedingRebuild = sessions
+      .map((session) => this.diagnoseSummarySession(session))
+      .filter((issue): issue is DoctorSessionIssue => Boolean(issue));
+    const lineageSessionsNeedingRefresh = sessions
+      .filter((session) => this.needsLineageRefresh(session))
+      .map((session) => session.sessionID);
+
+    const messageFtsExpected = sessions.reduce((count, session) => {
+      return count + session.messages.filter((message) => guessMessageText(message, this.options.interop.ignoreToolPrefixes).length > 0).length;
+    }, 0);
+
+    const report: DoctorReport = {
+      scope: sessionID ? `session:${sessionID}` : "all",
+      checkedSessions: sessions.length,
+      summarySessionsNeedingRebuild,
+      lineageSessionsNeedingRefresh,
+      orphanSummaryEdges: this.countScopedOrphanSummaryEdges(sessionIDs),
+      messageFts: {
+        expected: messageFtsExpected,
+        actual: this.countScopedFtsRows("message_fts", sessionIDs),
+      },
+      summaryFts: {
+        expected: this.readScopedSummaryRowsSync(sessionIDs).length,
+        actual: this.countScopedFtsRows("summary_fts", sessionIDs),
+      },
+      artifactFts: {
+        expected: this.readScopedArtifactRowsSync(sessionIDs).length,
+        actual: this.countScopedFtsRows("artifact_fts", sessionIDs),
+      },
+      orphanArtifactBlobs: this.readOrphanArtifactBlobRowsSync().length,
+      status: "clean",
+    };
+
+    report.status = this.hasDoctorIssues(report) ? "issues-found" : "clean";
+    return report;
+  }
+
+  private hasDoctorIssues(report: DoctorReport): boolean {
+    return (
+      report.summarySessionsNeedingRebuild.length > 0 ||
+      report.lineageSessionsNeedingRefresh.length > 0 ||
+      report.orphanSummaryEdges > 0 ||
+      report.messageFts.expected !== report.messageFts.actual ||
+      report.summaryFts.expected !== report.summaryFts.actual ||
+      report.artifactFts.expected !== report.artifactFts.actual ||
+      report.orphanArtifactBlobs > 0
+    );
+  }
+
+  private diagnoseSummarySession(session: NormalizedSession): DoctorSessionIssue | undefined {
+    const issues: string[] = [];
+    const archived = this.getArchivedMessages(session.messages);
+    const state = this.getDb().prepare("SELECT * FROM summary_state WHERE session_id = ?").get(session.sessionID) as
+      | SummaryStateRow
+      | undefined;
+    const summaryNodeCount = this.getDb()
+      .prepare("SELECT COUNT(*) AS count FROM summary_nodes WHERE session_id = ?")
+      .get(session.sessionID) as { count: number };
+    const summaryEdgeCount = this.getDb()
+      .prepare("SELECT COUNT(*) AS count FROM summary_edges WHERE session_id = ?")
+      .get(session.sessionID) as { count: number };
+
+    if (archived.length === 0) {
+      if (state) issues.push("unexpected-summary-state");
+      if (summaryNodeCount.count > 0) issues.push("unexpected-summary-nodes");
+      if (summaryEdgeCount.count > 0) issues.push("unexpected-summary-edges");
+      return issues.length > 0 ? { sessionID: session.sessionID, issues } : undefined;
+    }
+
+    const latestMessageCreated = archived.at(-1)?.info.time.created ?? 0;
+    const archivedSignature = this.buildArchivedSignature(archived);
+    const rootIDs = state ? parseJson<string[]>(state.root_node_ids_json) : [];
+
+    if (!state) {
+      issues.push("missing-summary-state");
+    } else {
+      if (state.archived_count !== archived.length) issues.push("archived-count-mismatch");
+      if (state.latest_message_created !== latestMessageCreated) issues.push("latest-message-mismatch");
+      if (state.archived_signature !== archivedSignature) issues.push("archived-signature-mismatch");
+      if (rootIDs.length === 0) issues.push("missing-root-node-ids");
+      if (rootIDs.some((nodeID) => !this.readSummaryNodeSync(nodeID))) issues.push("missing-root-node-record");
+    }
+
+    if (summaryNodeCount.count === 0) issues.push("missing-summary-nodes");
+    return issues.length > 0 ? { sessionID: session.sessionID, issues } : undefined;
+  }
+
+  private needsLineageRefresh(session: NormalizedSession): boolean {
+    const chain = this.readLineageChainSync(session.sessionID);
+    const expectedRoot = chain[0]?.sessionID ?? session.sessionID;
+    const expectedDepth = Math.max(0, chain.length - 1);
+    return (session.rootSessionID ?? session.sessionID) !== expectedRoot || (session.lineageDepth ?? 0) !== expectedDepth;
+  }
+
+  private rebuildSummarySessionsSync(sessionIDs: string[]): void {
+    for (const sessionID of sessionIDs) {
+      const session = this.readSessionSync(sessionID);
+      this.ensureSummaryGraphSync(sessionID, this.getArchivedMessages(session.messages));
+    }
+  }
+
+  private countScopedFtsRows(table: "message_fts" | "summary_fts" | "artifact_fts", sessionIDs?: string[]): number {
+    if (sessionIDs && sessionIDs.length === 0) return 0;
+
+    if (!sessionIDs) {
+      const row = this.getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
+      return row.count;
+    }
+
+    const placeholders = sessionIDs.map(() => "?").join(", ");
+    const row = this.getDb()
+      .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id IN (${placeholders})`)
+      .get(...sessionIDs) as { count: number };
+    return row.count;
+  }
+
+  private countScopedOrphanSummaryEdges(sessionIDs?: string[]): number {
+    if (sessionIDs && sessionIDs.length === 0) return 0;
+
+    const scopeClause = sessionIDs ? `e.session_id IN (${sessionIDs.map(() => "?").join(", ")}) AND ` : "";
+    const row = this.getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM summary_edges e
+         WHERE ${scopeClause}(
+           NOT EXISTS (SELECT 1 FROM summary_nodes parent WHERE parent.node_id = e.parent_id)
+           OR NOT EXISTS (SELECT 1 FROM summary_nodes child WHERE child.node_id = e.child_id)
+         )`,
+      )
+      .get(...(sessionIDs ?? [])) as { count: number };
+    return row.count;
+  }
+
+  private shouldRefreshLineageForEvent(eventType: string): boolean {
+    return eventType === "session.created" || eventType === "session.updated" || eventType === "session.deleted";
+  }
+
+  private shouldPersistSessionForEvent(eventType: string): boolean {
+    return (
+      eventType === "session.created" ||
+      eventType === "session.updated" ||
+      eventType === "session.deleted" ||
+      eventType === "session.compacted" ||
+      eventType === "message.updated" ||
+      eventType === "message.removed" ||
+      eventType === "message.part.updated" ||
+      eventType === "message.part.removed"
+    );
+  }
+
+  private shouldSyncDerivedLineageSubtree(
+    eventType: string,
+    previousParentSessionID?: string,
+    nextParentSessionID?: string,
+  ): boolean {
+    return eventType === "session.created" || (eventType === "session.updated" && previousParentSessionID !== nextParentSessionID);
+  }
+
+  private shouldCleanupOrphanBlobsForEvent(eventType: string): boolean {
+    return eventType === "message.removed" || eventType === "message.part.updated" || eventType === "message.part.removed";
+  }
+
+  private syncAllDerivedSessionStateSync(preserveExistingResume = false): void {
+    for (const session of this.readAllSessionsSync()) {
+      this.syncDerivedSessionStateSync(session, preserveExistingResume);
+    }
+  }
+
+  private syncDerivedSessionStateSync(session: NormalizedSession, preserveExistingResume = false): SummaryNodeData[] {
+    const roots = this.ensureSummaryGraphSync(session.sessionID, this.getArchivedMessages(session.messages));
+    this.writeResumeSync(session, roots, preserveExistingResume);
+    return roots;
+  }
+
+  private syncDerivedLineageSubtreeSync(sessionID: string, preserveExistingResume = false): void {
+    const queue = [sessionID];
+    const seen = new Set<string>([sessionID]);
+
+    while (queue.length > 0) {
+      const currentSessionID = queue.shift();
+      if (!currentSessionID) continue;
+
+      if (currentSessionID !== sessionID) {
+        this.syncDerivedSessionStateSync(this.readSessionSync(currentSessionID), preserveExistingResume);
+      }
+
+      for (const child of this.readChildSessionsSync(currentSessionID)) {
+        if (seen.has(child.sessionID)) continue;
+        seen.add(child.sessionID);
+        queue.push(child.sessionID);
+      }
+    }
+  }
+
+  private writeResumeSync(session: NormalizedSession, roots: SummaryNodeData[], preserveExistingResume = false): void {
+    const db = this.getDb();
+    if (session.messages.length === 0) {
+      db.prepare("DELETE FROM resumes WHERE session_id = ?").run(session.sessionID);
+      return;
+    }
+
+    const existing = this.getResumeSync(session.sessionID);
+    if (preserveExistingResume && existing && !this.isManagedResumeNote(existing)) {
+      return;
+    }
+
+    const note = this.buildResumeNote(session, roots);
+    db.prepare(
+      `INSERT INTO resumes (session_id, note, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
+    ).run(session.sessionID, note, Date.now());
+  }
+
+  private isManagedResumeNote(note: string): boolean {
+    return note.startsWith("LCM prototype resume note\n") || note === "LCM prototype resume note";
   }
 
   private resolveRetentionPolicy(input?: {
@@ -1449,14 +1742,11 @@ export class SqliteLcmStore {
       ...(orphan.length > 0
         ? ["orphan_blobs_preview:", ...orphan.map((row) => `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`)]
         : ["orphan_blobs_preview:", "- none"]),
-    ].join("\n");
+      ].join("\n");
   }
 
-  async gcBlobs(input?: { apply?: boolean; limit?: number }): Promise<string> {
-    const apply = input?.apply ?? false;
-    const limit = clamp(input?.limit ?? 10, 1, 50);
-    const db = this.getDb();
-    const orphanRows = db
+  private readOrphanArtifactBlobRowsSync(): RetentionBlobCandidate[] {
+    return this.getDb()
       .prepare(
         `SELECT content_hash, char_count, created_at
          FROM artifact_blobs b
@@ -1465,7 +1755,29 @@ export class SqliteLcmStore {
          )
          ORDER BY char_count DESC, created_at ASC`,
       )
-      .all() as Array<{ content_hash: string; char_count: number; created_at: number }>;
+      .all() as RetentionBlobCandidate[];
+  }
+
+  private deleteOrphanArtifactBlobsSync(): RetentionBlobCandidate[] {
+    const orphanRows = this.readOrphanArtifactBlobRowsSync();
+    if (orphanRows.length === 0) return [];
+
+    this.getDb()
+      .prepare(
+        `DELETE FROM artifact_blobs
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
+         )`,
+      )
+      .run();
+
+    return orphanRows;
+  }
+
+  async gcBlobs(input?: { apply?: boolean; limit?: number }): Promise<string> {
+    const apply = input?.apply ?? false;
+    const limit = clamp(input?.limit ?? 10, 1, 50);
+    const orphanRows = this.readOrphanArtifactBlobRowsSync();
 
     const totalChars = orphanRows.reduce((sum, row) => sum + row.char_count, 0);
     if (orphanRows.length === 0) {
@@ -1488,12 +1800,7 @@ export class SqliteLcmStore {
       ].join("\n");
     }
 
-    db.prepare(
-      `DELETE FROM artifact_blobs
-       WHERE NOT EXISTS (
-         SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
-       )`,
-    ).run();
+    this.deleteOrphanArtifactBlobsSync();
 
     return [
       `orphan_blobs=${orphanRows.length}`,
@@ -1596,6 +1903,7 @@ export class SqliteLcmStore {
     }
 
     this.refreshAllLineageSync();
+    this.syncAllDerivedSessionStateSync(true);
     this.rebuildSearchIndexesSync();
 
     return [
@@ -1783,6 +2091,7 @@ export class SqliteLcmStore {
 
     this.backfillArtifactBlobsSync();
     this.refreshAllLineageSync();
+    this.syncAllDerivedSessionStateSync(true);
     this.rebuildSearchIndexesSync();
     return [
       `file=${sourcePath}`,
@@ -1877,18 +2186,15 @@ export class SqliteLcmStore {
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
     if (messages.length < this.options.minMessagesForTransform) return false;
 
-    const archivedCount = Math.max(0, messages.length - this.options.freshTailMessages);
-    if (archivedCount <= 0) return false;
+    const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
+    if (!window) return false;
 
-    const archived = messages.slice(0, archivedCount);
-    const recent = messages.slice(archivedCount);
-    const anchor = recent.find((message) => message.info.role === "user") ?? recent[0];
-    if (!anchor) return false;
+    const { anchor, archived, recent } = window;
 
     const roots = this.ensureSummaryGraphSync(anchor.info.sessionID, archived);
     if (roots.length === 0) return false;
 
-    const summary = this.buildActiveSummaryFromRoots(roots, archived.length);
+    const summary = buildActiveSummaryText(roots, archived.length, this.options.summaryCharBudget);
     const retrieval = await this.buildAutomaticRetrievalContext(anchor.info.sessionID, recent, anchor);
     for (const message of archived) {
       this.compactMessageInPlace(message);
@@ -1943,30 +2249,105 @@ export class SqliteLcmStore {
     const query = this.buildAutomaticRetrievalQuery(anchor, recent);
     if (!query) return undefined;
 
-    const scope = this.resolveConfiguredScope("grep", undefined, sessionID);
     const allowedHits =
       clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4) +
       clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3) +
       clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3);
     if (allowedHits <= 0) return undefined;
 
-    const limit = clamp(allowedHits * 3, 3, 18);
-    const results = await this.grep({
-      query: query.query,
-      sessionID,
-      scope,
-      limit,
-    });
-    const hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+    const targetHits = this.resolveAutomaticRetrievalTargetHits(allowedHits);
+    const results: SearchResult[] = [];
+    const seenResults = new Set<string>();
+    const searchedScopes: ScopeName[] = [];
+    const scopeStats: Array<{ scope: string; budget: number; rawResults: number; selectedHits: number }> = [];
+    let stopReason = "scope-order-exhausted";
+    let hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+
+    for (const scope of this.buildAutomaticRetrievalScopeOrder(sessionID)) {
+      const budget = this.resolveAutomaticRetrievalScopeBudget(scope);
+      if (budget <= 0) {
+        scopeStats.push({ scope, budget, rawResults: 0, selectedHits: 0 });
+        continue;
+      }
+
+      searchedScopes.push(scope);
+      let scopeRawResults = 0;
+      let scopeSelectedHits = 0;
+
+      for (const candidateQuery of query.queries) {
+        const remainingBudget = budget - scopeRawResults;
+        if (remainingBudget <= 0) break;
+
+        const previousHits = hits;
+        const scopedResults = await this.grep({
+          query: candidateQuery,
+          sessionID,
+          scope,
+          limit: remainingBudget,
+        });
+
+        for (const result of scopedResults) {
+          const key = `${result.type}:${result.id}`;
+          if (seenResults.has(key)) continue;
+          seenResults.add(key);
+          results.push(result);
+          scopeRawResults += 1;
+        }
+
+        hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+        scopeSelectedHits += this.countNewAutomaticRetrievalHits(previousHits, hits);
+
+        if (hits.length >= allowedHits) {
+          stopReason = "hit-quota-reached";
+          break;
+        }
+
+        if (hits.length >= targetHits) {
+          stopReason = "target-hits-reached";
+          break;
+        }
+      }
+
+      scopeStats.push({ scope, budget, rawResults: scopeRawResults, selectedHits: scopeSelectedHits });
+
+      if (hits.length > 0 && this.options.automaticRetrieval.stop.stopOnFirstScopeWithHits && scopeSelectedHits > 0) {
+        stopReason = "first-scope-hit";
+      }
+
+      if (stopReason !== "scope-order-exhausted") {
+        return renderAutomaticRetrievalContext(
+          searchedScopes,
+          hits,
+          clamp(this.options.automaticRetrieval.maxChars, 240, 4000),
+          {
+            queries: query.queries,
+            rawResults: results.length,
+            stopReason,
+            scopeStats,
+          },
+        );
+      }
+    }
+
     if (hits.length === 0) return undefined;
 
-    return this.renderAutomaticRetrievalContext(scope, hits);
+    return renderAutomaticRetrievalContext(
+      searchedScopes,
+      hits,
+      clamp(this.options.automaticRetrieval.maxChars, 240, 4000),
+      {
+        queries: query.queries,
+        rawResults: results.length,
+        stopReason,
+        scopeStats,
+      },
+    );
   }
 
   private buildAutomaticRetrievalQuery(
     anchor: ConversationMessage,
     recent: ConversationMessage[],
-  ): { query: string; tokens: string[] } | undefined {
+  ): { queries: string[]; tokens: string[] } | undefined {
     const minTokens = clamp(this.options.automaticRetrieval.minTokens, 1, AUTOMATIC_RETRIEVAL_QUERY_TOKENS);
     const tokens: string[] = [];
     const pushTokens = (value?: string) => {
@@ -1980,6 +2361,9 @@ export class SqliteLcmStore {
 
     pushTokens(guessMessageText(anchor, this.options.interop.ignoreToolPrefixes));
     for (const file of listFiles(anchor)) pushTokens(path.basename(file));
+    for (const message of recent.slice(-AUTOMATIC_RETRIEVAL_RECENT_MESSAGES)) {
+      for (const file of listFiles(message)) pushTokens(path.basename(file));
+    }
 
     const recentUsers = recent
       .filter((message) => message.info.role === "user" && message.info.id !== anchor.info.id)
@@ -1991,11 +2375,74 @@ export class SqliteLcmStore {
     }
 
     if (tokens.length < minTokens) return undefined;
-    const queryTokens = tokens.slice(0, 4);
+    const queryTokens = tokens.slice(0, 5);
     return {
-      query: queryTokens.join(" "),
+      queries: this.buildAutomaticRetrievalQueries(queryTokens, minTokens),
       tokens: queryTokens,
     };
+  }
+
+  private buildAutomaticRetrievalQueries(tokens: string[], minTokens: number): string[] {
+    const queries: string[] = [];
+    const pushQuery = (parts: string[]) => {
+      const normalized = parts.filter(Boolean);
+      if (normalized.length < minTokens) return;
+      const value = normalized.join(" ");
+      if (!queries.includes(value)) queries.push(value);
+    };
+
+    for (let size = Math.min(tokens.length, 4); size >= minTokens; size -= 1) {
+      pushQuery(tokens.slice(0, size));
+      if (queries.length >= AUTOMATIC_RETRIEVAL_QUERY_VARIANTS) return queries;
+    }
+
+    for (let size = Math.min(tokens.length, 4); size >= Math.max(2, minTokens); size -= 1) {
+      for (let start = 1; start + size <= tokens.length; start += 1) {
+        pushQuery(tokens.slice(start, start + size));
+        if (queries.length >= AUTOMATIC_RETRIEVAL_QUERY_VARIANTS) return queries;
+      }
+    }
+
+    if (tokens.length >= 5) {
+      pushQuery([tokens[0], tokens[1], tokens[4]]);
+      pushQuery([tokens[0], tokens[2], tokens[4]]);
+    }
+
+    return queries.slice(0, AUTOMATIC_RETRIEVAL_QUERY_VARIANTS);
+  }
+
+  private buildAutomaticRetrievalScopeOrder(sessionID: string): ScopeName[] {
+    const configured = this.resolveConfiguredScope("grep", undefined, sessionID);
+    const candidates = [...this.options.automaticRetrieval.scopeOrder];
+    if (configured === "all" && !candidates.includes("all")) {
+      candidates.push("all");
+    }
+
+    const ordered: ScopeName[] = [];
+    const seenScopes = new Set<string>();
+
+    for (const scope of candidates) {
+      const sessionIDs = this.resolveScopeSessionIDs(scope, sessionID);
+      const key = sessionIDs ? [...sessionIDs].sort().join(",") : "all";
+      if (seenScopes.has(key)) continue;
+      seenScopes.add(key);
+      ordered.push(scope);
+    }
+
+    return ordered;
+  }
+
+  private resolveAutomaticRetrievalScopeBudget(scope: ScopeName): number {
+    return clamp(this.options.automaticRetrieval.scopeBudgets[scope], 0, 24);
+  }
+
+  private resolveAutomaticRetrievalTargetHits(allowedHits: number): number {
+    return clamp(this.options.automaticRetrieval.stop.targetHits, 1, allowedHits);
+  }
+
+  private countNewAutomaticRetrievalHits(before: Array<{ kind: string; id: string }>, after: Array<{ kind: string; id: string }>): number {
+    const seen = new Set(before.map((hit) => `${hit.kind}:${hit.id}`));
+    return after.filter((hit) => !seen.has(`${hit.kind}:${hit.id}`)).length;
   }
 
   private selectAutomaticRetrievalHits(
@@ -2003,37 +2450,19 @@ export class SqliteLcmStore {
     recent: ConversationMessage[],
     tokens: string[],
     results: SearchResult[],
-  ): AutomaticRetrievalHit[] {
-    const freshMessageIDs = new Set(recent.map((message) => message.info.id));
-    const quotas = {
-      message: clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4),
-      summary: clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3),
-      artifact: clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3),
-    };
-    const minSnippetMatches = tokens.length >= 4 ? 2 : 1;
-    const hits: AutomaticRetrievalHit[] = [];
-
-    for (const result of results) {
-      const kind = result.type === "summary" ? "summary" : result.type.startsWith("artifact:") ? "artifact" : "message";
-      if (quotas[kind] <= 0) continue;
-      if (this.isFreshAutomaticRetrievalResult(sessionID, freshMessageIDs, result)) continue;
-
-      const lowerSnippet = result.snippet.toLowerCase();
-      const matchedTokens = tokens.filter((token) => lowerSnippet.includes(token)).length;
-      if (matchedTokens < minSnippetMatches && tokens.length > 1) continue;
-
-      hits.push({
-        kind,
-        id: result.id,
-        label: result.type,
-        sessionID: result.sessionID,
-        snippet: result.snippet,
-      });
-      quotas[kind] -= 1;
-      if (quotas.message <= 0 && quotas.summary <= 0 && quotas.artifact <= 0) break;
-    }
-
-    return hits;
+  ) {
+    return selectAutomaticRetrievalHits({
+      recent,
+      tokens,
+      results,
+      quotas: {
+        message: clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4),
+        summary: clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3),
+        artifact: clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3),
+      },
+      isFreshResult: (result, freshMessageIDs) =>
+        this.isFreshAutomaticRetrievalResult(sessionID, freshMessageIDs, result),
+    });
   }
 
   private isFreshAutomaticRetrievalResult(
@@ -2048,37 +2477,6 @@ export class SqliteLcmStore {
       return artifact ? freshMessageIDs.has(artifact.messageID) : false;
     }
     return freshMessageIDs.has(result.id);
-  }
-
-  private renderAutomaticRetrievalContext(scope: string, hits: AutomaticRetrievalHit[]): string {
-    const maxChars = clamp(this.options.automaticRetrieval.maxChars, 240, 4000);
-    const lines = [
-      "<system-reminder>",
-      `opencode-lcm automatically recalled ${hits.length} archived context hit(s) relevant to the current turn (scope=${scope}).`,
-      "Recalled context:",
-      ...hits.map((hit) => {
-        const session = hit.sessionID ? ` session=${hit.sessionID}` : "";
-        const id = hit.kind === "summary" ? shortNodeID(hit.id) : hit.id;
-        return `- ${hit.kind}${session} id=${id} (${hit.label}): ${truncate(hit.snippet, 220)}`;
-      }),
-      "Treat recalled archive as supporting context and prefer the currently visible conversation if details conflict.",
-      "</system-reminder>",
-    ];
-
-    return truncate(lines.join("\n"), maxChars);
-  }
-
-  private buildActiveSummaryFromRoots(roots: SummaryNodeData[], archivedCount: number): string {
-    const lines = [
-      "<system-reminder>",
-      `opencode-lcm compacted ${archivedCount} older conversation turns into ${roots.length} archived summary node(s).`,
-      "Archived roots:",
-      ...roots.map((node) => `- ${node.nodeID}: ${truncate(node.summaryText, 180)}`),
-      "Use lcm_expand with a node ID if older details become relevant, then lcm_artifact for externalized payloads.",
-      "</system-reminder>",
-    ];
-
-    return truncate(lines.join("\n"), this.options.summaryCharBudget);
   }
 
   private buildResumeNote(session: NormalizedSession, roots: SummaryNodeData[]): string {
@@ -2225,6 +2623,9 @@ export class SqliteLcmStore {
   }
 
   private getArchivedMessages(messages: ConversationMessage[]): ConversationMessage[] {
+    const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
+    if (window) return window.archived;
+
     const archivedCount = Math.max(0, messages.length - this.options.freshTailMessages);
     return messages.slice(0, archivedCount);
   }
@@ -2253,7 +2654,10 @@ export class SqliteLcmStore {
       state.archived_signature === archivedSignature
     ) {
       const rootIDs = parseJson<string[]>(state.root_node_ids_json);
-      return rootIDs.map((nodeID) => this.readSummaryNodeSync(nodeID)).filter((node): node is SummaryNodeData => Boolean(node));
+      const roots = rootIDs.map((nodeID) => this.readSummaryNodeSync(nodeID)).filter((node): node is SummaryNodeData => Boolean(node));
+      if (rootIDs.length > 0 && roots.length === rootIDs.length) {
+        return roots;
+      }
     }
 
     return this.rebuildSummaryGraphSync(sessionID, archivedMessages, archivedSignature);
@@ -2705,62 +3109,8 @@ export class SqliteLcmStore {
     return tokens.map((token) => `${token}*`).join(" AND ");
   }
 
-  private scoreSearchCandidate(candidate: SearchCandidate, query: string, tokens: string[]): number {
-    const content = candidate.content.toLowerCase();
-    const snippet = candidate.snippet.toLowerCase();
-    const exactPhrase = content.includes(query);
-    const base = candidate.sourceKind === "message" ? 135 : candidate.sourceKind === "artifact" ? 96 : 78;
-
-    let matchedTokens = 0;
-    let totalHits = 0;
-    let boundaryHits = 0;
-
-    for (const token of tokens) {
-      const hasToken = content.includes(token);
-      if (hasToken) matchedTokens += 1;
-
-      const boundaryPattern = new RegExp(`\\b${escapeRegExp(token)}\\b`, "g");
-      const matches = content.match(boundaryPattern)?.length ?? 0;
-      boundaryHits += matches;
-      totalHits += matches > 0 ? matches : hasToken ? 1 : 0;
-    }
-
-    const coverage = tokens.length > 0 ? matchedTokens / tokens.length : 0;
-    let score = base;
-    if (candidate.sourceKind === "message") {
-      score += candidate.type === "user" ? 22 : candidate.type === "assistant" ? 12 : 0;
-    }
-    score += exactPhrase ? 90 : 0;
-    score += coverage * 70;
-    score += matchedTokens * 12;
-    score += Math.min(totalHits, matchedTokens + 2) * 2;
-    score += Math.min(boundaryHits, matchedTokens) * 4;
-    score += snippet.includes(query) ? 24 : 0;
-    score += Math.max(0, 18 - candidate.sourceOrder);
-    return score;
-  }
-
   private rankSearchCandidates(candidates: SearchCandidate[], query: string, limit: number): SearchResult[] {
-    const exactQuery = query.toLowerCase();
-    const tokens = tokenizeQuery(query);
-    const deduped = new Map<string, SearchCandidate & { score: number }>();
-
-    for (const candidate of candidates) {
-      const score = this.scoreSearchCandidate(candidate, exactQuery, tokens);
-      const key = `${candidate.type}:${candidate.id}`;
-      const existing = deduped.get(key);
-      if (!existing || score > existing.score || (score === existing.score && candidate.timestamp > existing.timestamp)) {
-        deduped.set(key, {
-          ...candidate,
-          score,
-        });
-      }
-    }
-
-    return [...deduped.values()]
-      .sort((a, b) => b.score - a.score || b.timestamp - a.timestamp)
-      .slice(0, limit)
-      .map(({ content: _content, sourceKind: _sourceKind, sourceOrder: _sourceOrder, score: _score, ...result }) => result);
+    return rankSearchCandidates(candidates, query, limit);
   }
 
   private searchWithFts(query: string, sessionIDs?: string[], limit = 5): SearchResult[] {
@@ -2950,6 +3300,22 @@ export class SqliteLcmStore {
         content,
       );
     }
+  }
+
+  private replaceMessageSearchRowSync(sessionID: string, message: ConversationMessage): void {
+    const db = this.getDb();
+    db.prepare("DELETE FROM message_fts WHERE message_id = ?").run(message.info.id);
+
+    const content = guessMessageText(message, this.options.interop.ignoreToolPrefixes);
+    if (!content) return;
+
+    db.prepare("INSERT INTO message_fts (session_id, message_id, role, created_at, content) VALUES (?, ?, ?, ?, ?)").run(
+      sessionID,
+      message.info.id,
+      message.info.role,
+      String(message.info.time.created),
+      content,
+    );
   }
 
   private ensureSessionColumnsSync(): void {
@@ -3336,48 +3702,61 @@ export class SqliteLcmStore {
     };
   }
 
-  private persistSession(session: NormalizedSession): void {
-    const db = this.getDb();
+  private prepareSessionForPersistence(session: NormalizedSession): NormalizedSession {
     const lineage = this.resolveLineageSync(session.sessionID, session.parentSessionID);
-    const worktreeKey = normalizeWorktreeKey(session.directory);
-    const preparedSession: NormalizedSession = {
+    return {
       ...session,
       rootSessionID: lineage.rootSessionID,
       lineageDepth: lineage.lineageDepth,
     };
+  }
+
+  private persistCapturedSessionSync(session: NormalizedSession, event: CapturedEvent): void {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case "session.created":
+      case "session.updated":
+      case "session.deleted":
+      case "session.compacted":
+        this.upsertSessionRowSync(session);
+        return;
+      case "message.updated": {
+        this.upsertSessionRowSync(session);
+        const message = session.messages.find((entry) => entry.info.id === payload.properties.info.id);
+        if (message) {
+          this.upsertMessageInfoSync(session.sessionID, message);
+          this.replaceMessageSearchRowSync(session.sessionID, message);
+        }
+        return;
+      }
+      case "message.removed":
+        this.upsertSessionRowSync(session);
+        this.deleteMessageSync(session.sessionID, payload.properties.messageID);
+        return;
+      case "message.part.updated": {
+        this.upsertSessionRowSync(session);
+        const message = session.messages.find((entry) => entry.info.id === payload.properties.part.messageID);
+        if (message) this.replaceMessageSync(session.sessionID, message);
+        return;
+      }
+      case "message.part.removed": {
+        this.upsertSessionRowSync(session);
+        const message = session.messages.find((entry) => entry.info.id === payload.properties.messageID);
+        if (message) this.replaceMessageSync(session.sessionID, message);
+        return;
+      }
+      default:
+        this.persistSession(session);
+    }
+  }
+
+  private persistSession(session: NormalizedSession): void {
+    const db = this.getDb();
+    const preparedSession = this.prepareSessionForPersistence(session);
     const { storedSession, artifacts } = this.externalizeSessionSync(preparedSession);
 
-    db.prepare(
-      `INSERT INTO sessions (session_id, title, session_directory, worktree_key, parent_session_id, root_session_id, lineage_depth, pinned, pin_reason, updated_at, compacted_at, deleted, event_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(session_id) DO UPDATE SET
-         title = excluded.title,
-         session_directory = excluded.session_directory,
-         worktree_key = excluded.worktree_key,
-         parent_session_id = excluded.parent_session_id,
-         root_session_id = excluded.root_session_id,
-         lineage_depth = excluded.lineage_depth,
-         pinned = excluded.pinned,
-         pin_reason = excluded.pin_reason,
-         updated_at = excluded.updated_at,
-         compacted_at = excluded.compacted_at,
-         deleted = excluded.deleted,
-         event_count = excluded.event_count`,
-    ).run(
-      storedSession.sessionID,
-      storedSession.title ?? null,
-      storedSession.directory ?? null,
-      worktreeKey ?? null,
-      storedSession.parentSessionID ?? null,
-      lineage.rootSessionID,
-      lineage.lineageDepth,
-      storedSession.pinned ? 1 : 0,
-      storedSession.pinReason ?? null,
-      storedSession.updatedAt,
-      storedSession.compactedAt ?? null,
-      storedSession.deleted ? 1 : 0,
-      storedSession.eventCount,
-    );
+    this.upsertSessionRowSync(storedSession);
 
     db.prepare("DELETE FROM artifact_fts WHERE session_id = ?").run(storedSession.sessionID);
     db.prepare("DELETE FROM artifacts WHERE session_id = ?").run(storedSession.sessionID);
@@ -3406,6 +3785,103 @@ export class SqliteLcmStore {
 
     this.insertArtifactsSync(artifacts);
     this.replaceMessageSearchRowsSync(storedSession);
+  }
+
+  private upsertSessionRowSync(session: NormalizedSession): void {
+    const db = this.getDb();
+    const worktreeKey = normalizeWorktreeKey(session.directory);
+
+    db.prepare(
+      `INSERT INTO sessions (session_id, title, session_directory, worktree_key, parent_session_id, root_session_id, lineage_depth, pinned, pin_reason, updated_at, compacted_at, deleted, event_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         title = excluded.title,
+         session_directory = excluded.session_directory,
+         worktree_key = excluded.worktree_key,
+         parent_session_id = excluded.parent_session_id,
+         root_session_id = excluded.root_session_id,
+         lineage_depth = excluded.lineage_depth,
+         pinned = excluded.pinned,
+         pin_reason = excluded.pin_reason,
+         updated_at = excluded.updated_at,
+         compacted_at = excluded.compacted_at,
+         deleted = excluded.deleted,
+         event_count = excluded.event_count`,
+    ).run(
+      session.sessionID,
+      session.title ?? null,
+      session.directory ?? null,
+      worktreeKey ?? null,
+      session.parentSessionID ?? null,
+      session.rootSessionID ?? session.sessionID,
+      session.lineageDepth ?? 0,
+      session.pinned ? 1 : 0,
+      session.pinReason ?? null,
+      session.updatedAt,
+      session.compactedAt ?? null,
+      session.deleted ? 1 : 0,
+      session.eventCount,
+    );
+  }
+
+  private upsertMessageInfoSync(sessionID: string, message: ConversationMessage): void {
+    this.getDb()
+      .prepare(
+        `INSERT INTO messages (message_id, session_id, created_at, info_json)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(message_id) DO UPDATE SET
+           session_id = excluded.session_id,
+           created_at = excluded.created_at,
+           info_json = excluded.info_json`,
+      )
+      .run(message.info.id, sessionID, message.info.time.created, JSON.stringify(message.info));
+  }
+
+  private deleteMessageSync(sessionID: string, messageID: string): void {
+    const db = this.getDb();
+    db.prepare("DELETE FROM artifact_fts WHERE message_id = ?").run(messageID);
+    db.prepare("DELETE FROM message_fts WHERE message_id = ?").run(messageID);
+    db.prepare("DELETE FROM messages WHERE session_id = ? AND message_id = ?").run(sessionID, messageID);
+  }
+
+  private replaceMessageSync(sessionID: string, message: ConversationMessage): void {
+    const db = this.getDb();
+    const { storedMessage, artifacts } = this.externalizeMessageSync(message);
+
+    this.deleteMessageSync(sessionID, message.info.id);
+    this.upsertMessageInfoSync(sessionID, storedMessage);
+
+    const insertPart = db.prepare(
+      "INSERT INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)",
+    );
+
+    storedMessage.parts.forEach((part, index) => {
+      insertPart.run(part.id, sessionID, part.messageID, index, JSON.stringify(part));
+    });
+
+    this.insertArtifactsSync(artifacts);
+    this.replaceMessageSearchRowSync(sessionID, storedMessage);
+  }
+
+  private externalizeMessageSync(message: ConversationMessage): {
+    storedMessage: ConversationMessage;
+    artifacts: ArtifactData[];
+  } {
+    const artifacts: ArtifactData[] = [];
+    const storedInfo = parseJson<Message>(JSON.stringify(message.info));
+    const storedParts = message.parts.map((part) => {
+      const { storedPart, artifacts: nextArtifacts } = this.externalizePartSync(part, message.info.time.created);
+      artifacts.push(...nextArtifacts);
+      return storedPart;
+    });
+
+    return {
+      storedMessage: {
+        info: storedInfo,
+        parts: storedParts,
+      },
+      artifacts,
+    };
   }
 
   private createArtifactData(input: {
