@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { SqliteLcmStore } from "../dist/store.js";
 
@@ -55,6 +56,55 @@ function userInfo(sessionID, id, created) {
     model: { providerID: "openai", modelID: "gpt-4.1" },
   };
 }
+
+test("init stamps the current schema version on disk", async () => {
+  const workspace = makeWorkspace("lcm-schema-version");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    const stats = await store.stats();
+    assert.equal(stats.schemaVersion, 1);
+
+    store.close();
+    store = undefined;
+
+    const db = new DatabaseSync(path.join(workspace, ".lcm", "lcm.db"), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const versionRow = db.prepare("PRAGMA user_version").get();
+    db.close();
+
+    assert.equal(Object.values(versionRow)[0], 1);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("init rejects newer on-disk schema versions", async () => {
+  const workspace = makeWorkspace("lcm-schema-future");
+  let store;
+
+  try {
+    mkdirSync(path.join(workspace, ".lcm"), { recursive: true });
+    const db = new DatabaseSync(path.join(workspace, ".lcm", "lcm.db"), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.exec("PRAGMA user_version = 99");
+    db.close();
+
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await assert.rejects(store.init(), /Unsupported store schema version: 99/);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
 
 test("exports and imports a portable snapshot", async () => {
   const sourceDir = makeWorkspace("lcm-export-src");

@@ -107,6 +107,7 @@ type ResolvedRetentionPolicy = {
 const SUMMARY_LEAF_MESSAGES = 6;
 const SUMMARY_BRANCH_FACTOR = 3;
 const SUMMARY_NODE_CHAR_LIMIT = 260;
+const STORE_SCHEMA_VERSION = 1;
 const EXPAND_MESSAGE_LIMIT = 6;
 const AUTOMATIC_RETRIEVAL_QUERY_TOKENS = 8;
 const AUTOMATIC_RETRIEVAL_RECENT_MESSAGES = 3;
@@ -224,6 +225,17 @@ const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
+}
+
+function firstFiniteNumber(value: unknown): number | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+
+  for (const entry of Object.values(record)) {
+    if (typeof entry === "number" && Number.isFinite(entry)) return entry;
+  }
+
+  return undefined;
 }
 
 function truncate(text: string, limit: number): string {
@@ -614,6 +626,7 @@ export class SqliteLcmStore {
     this.db = await openSqliteDatabase(this.dbPath);
 
     const db = this.getDb();
+    this.assertSupportedSchemaVersionSync();
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA synchronous = NORMAL");
     db.exec(`
@@ -765,9 +778,26 @@ export class SqliteLcmStore {
     db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, updated_at DESC)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)");
     await this.migrateLegacyArtifacts();
+    this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
   }
 
   private deferredInitCompleted = false;
+
+  private readSchemaVersionSync(): number {
+    return firstFiniteNumber(this.getDb().prepare("PRAGMA user_version").get()) ?? 0;
+  }
+
+  private assertSupportedSchemaVersionSync(): void {
+    const schemaVersion = this.readSchemaVersionSync();
+    if (schemaVersion <= STORE_SCHEMA_VERSION) return;
+    throw new Error(
+      `Unsupported store schema version: ${schemaVersion}. This build supports up to ${STORE_SCHEMA_VERSION}.`,
+    );
+  }
+
+  private writeSchemaVersionSync(version: number): void {
+    this.getDb().exec(`PRAGMA user_version = ${Math.max(0, Math.trunc(version))}`);
+  }
 
   private completeDeferredInit(): void {
     if (this.deferredInitCompleted) return;
@@ -819,6 +849,7 @@ export class SqliteLcmStore {
       if (refreshed) {
         next = {
           ...next,
+          parentSessionID: refreshed.parentSessionID,
           rootSessionID: refreshed.rootSessionID,
           lineageDepth: refreshed.lineageDepth,
         };
@@ -878,6 +909,7 @@ export class SqliteLcmStore {
     };
 
     return {
+      schemaVersion: this.readSchemaVersionSync(),
       totalEvents: totalRow.count,
       sessionCount: sessionRow.count,
       latestEventAt: totalRow.latest ?? undefined,
@@ -3303,15 +3335,47 @@ export class SqliteLcmStore {
       parent_session_id: string | null;
     }>;
     const byID = new Map(rows.map((row) => [row.session_id, row]));
+
+    const invalidParentSessionIDs = new Set<string>();
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+
+    const detectInvalidParents = (sessionID: string): void => {
+      if (visited.has(sessionID)) return;
+
+      visiting.add(sessionID);
+      const row = byID.get(sessionID);
+      const parentSessionID = row?.parent_session_id ?? undefined;
+
+      if (parentSessionID) {
+        if (parentSessionID === sessionID || visiting.has(parentSessionID)) {
+          invalidParentSessionIDs.add(sessionID);
+        } else if (byID.has(parentSessionID)) {
+          detectInvalidParents(parentSessionID);
+        }
+      }
+
+      visiting.delete(sessionID);
+      visited.add(sessionID);
+    };
+
+    for (const row of rows) detectInvalidParents(row.session_id);
+
+    if (invalidParentSessionIDs.size > 0) {
+      const clearParent = db.prepare("UPDATE sessions SET parent_session_id = NULL WHERE session_id = ?");
+      for (const sessionID of invalidParentSessionIDs) {
+        clearParent.run(sessionID);
+        const row = byID.get(sessionID);
+        if (row) row.parent_session_id = null;
+      }
+    }
+
     const memo = new Map<string, { rootSessionID: string; lineageDepth: number }>();
-    const resolving = new Set<string>();
 
     const resolve = (sessionID: string): { rootSessionID: string; lineageDepth: number } => {
       const existing = memo.get(sessionID);
       if (existing) return existing;
-      if (resolving.has(sessionID)) return { rootSessionID: sessionID, lineageDepth: 0 };
 
-      resolving.add(sessionID);
       const row = byID.get(sessionID);
       let resolved: { rootSessionID: string; lineageDepth: number };
 
@@ -3325,7 +3389,6 @@ export class SqliteLcmStore {
         };
       }
 
-      resolving.delete(sessionID);
       memo.set(sessionID, resolved);
       return resolved;
     };
@@ -3613,12 +3676,31 @@ export class SqliteLcmStore {
   }
 
   private prepareSessionForPersistence(session: NormalizedSession): NormalizedSession {
-    const lineage = this.resolveLineageSync(session.sessionID, session.parentSessionID);
+    const parentSessionID = this.sanitizeParentSessionIDSync(session.sessionID, session.parentSessionID);
+    const lineage = this.resolveLineageSync(session.sessionID, parentSessionID);
     return {
       ...session,
+      parentSessionID,
       rootSessionID: lineage.rootSessionID,
       lineageDepth: lineage.lineageDepth,
     };
+  }
+
+  private sanitizeParentSessionIDSync(sessionID: string, parentSessionID?: string): string | undefined {
+    if (!parentSessionID || parentSessionID === sessionID) return undefined;
+
+    const seen = new Set<string>([sessionID]);
+    let currentSessionID: string | undefined = parentSessionID;
+    while (currentSessionID) {
+      if (seen.has(currentSessionID)) return undefined;
+      seen.add(currentSessionID);
+      const row = this.getDb()
+        .prepare("SELECT parent_session_id FROM sessions WHERE session_id = ?")
+        .get(currentSessionID) as { parent_session_id: string | null } | undefined;
+      currentSessionID = row?.parent_session_id ?? undefined;
+    }
+
+    return parentSessionID;
   }
 
   private persistCapturedSessionSync(session: NormalizedSession, event: CapturedEvent): void {

@@ -1218,3 +1218,41 @@ test("session reparenting refreshes descendant managed resume notes", async () =
     cleanupWorkspace(workspace);
   }
 });
+
+test("session updates refuse parent cycles and keep lineage stable", async () => {
+  const workspace = makeWorkspace("lcm-lineage-cycle");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await createSession(store, workspace, "root", 1);
+    await createSession(store, workspace, "branch", 2, "root");
+    await createSession(store, workspace, "leaf", 3, "branch");
+
+    await store.capture({
+      type: "session.updated",
+      properties: {
+        sessionID: "root",
+        info: sessionInfo(workspace, "root", 4, "leaf"),
+      },
+    });
+
+    const rootLineage = await store.lineage("root");
+    const branchLineage = await store.lineage("branch");
+    const leafLineage = await store.lineage("leaf");
+
+    assert.match(rootLineage, /Parent session: none/);
+    assert.match(rootLineage, /Root session: root/);
+    assert.match(branchLineage, /Parent session: root/);
+    assert.match(branchLineage, /Root session: root/);
+    assert.match(branchLineage, /Lineage depth: 1/);
+    assert.match(leafLineage, /Parent session: branch/);
+    assert.match(leafLineage, /Root session: root/);
+    assert.match(leafLineage, /Lineage depth: 2/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
