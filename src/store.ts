@@ -545,13 +545,13 @@ function fileCategoryHint(category: string): string {
 
 async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const isBunRuntime = typeof globalThis === "object" && "Bun" in globalThis;
-  const isWindows = typeof process === "object" && process.platform === "win32";
 
-  if (isBunRuntime && !isWindows) {
+  if (isBunRuntime) {
     const loadRuntimeModule = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<any>;
     const { Database } = await loadRuntimeModule("bun:sqlite");
     const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA busy_timeout = 5000");
 
     return {
       exec(sql: string) {
