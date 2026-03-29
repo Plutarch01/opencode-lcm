@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { SqliteLcmStore } from "../dist/store.js";
 
@@ -1103,6 +1105,68 @@ test("summary rebuilds when archived content changes and expand can target raw m
     assert.match(targeted, /m1/);
     assert.match(targeted, /omega revised goal/);
   } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("stale cached summary nodes are detected and rebuilt before reuse", async () => {
+  const workspace = makeWorkspace("lcm-summary-stale-cache");
+  let store;
+  let driftDb;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }));
+    await store.init();
+
+    await createSession(store, workspace, "s1", 1);
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("s1", "m1", "m1-p", "alpha archived goal")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m2",
+      created: 3,
+      parts: [textPart("s1", "m2", "m2-p", "beta archived note")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m3",
+      created: 4,
+      parts: [textPart("s1", "m3", "m3-p", "gamma archived detail")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m4",
+      created: 5,
+      parts: [textPart("s1", "m4", "m4-p", "fresh tail request")],
+    });
+
+    const initial = await store.buildCompactionContext("s1");
+    assert.match(initial, /alpha archived goal/);
+
+    driftDb = new DatabaseSync(path.join(workspace, ".lcm", "lcm.db"), {
+      enableForeignKeyConstraints: false,
+      timeout: 5000,
+    });
+    driftDb.exec("UPDATE summary_nodes SET summary_text = 'stale cached summary' WHERE session_id = 's1'");
+    driftDb.close();
+    driftDb = undefined;
+
+    const dryRun = await store.doctor({ sessionID: "s1" });
+    const rebuilt = await store.buildCompactionContext("s1");
+    const expanded = await store.expand({ sessionID: "s1" });
+
+    assert.match(dryRun, /invalid-summary-graph/);
+    assert.match(rebuilt, /alpha archived goal/);
+    assert.ok(!rebuilt.includes("stale cached summary"));
+    assert.match(expanded, /alpha archived goal/);
+    assert.ok(!expanded.includes("stale cached summary"));
+  } finally {
+    driftDb?.close();
     store?.close();
     cleanupWorkspace(workspace);
   }
