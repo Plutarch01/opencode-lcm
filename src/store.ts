@@ -545,7 +545,9 @@ function fileCategoryHint(category: string): string {
 
 async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const isBunRuntime = typeof globalThis === "object" && "Bun" in globalThis;
-  if (isBunRuntime) {
+  const isWindows = typeof process === "object" && process.platform === "win32";
+
+  if (isBunRuntime && !isWindows) {
     const loadRuntimeModule = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<any>;
     const { Database } = await loadRuntimeModule("bun:sqlite");
     const db = new Database(dbPath, { create: true });
@@ -763,11 +765,18 @@ export class SqliteLcmStore {
     db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, updated_at DESC)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)");
     await this.migrateLegacyArtifacts();
+  }
+
+  private deferredInitCompleted = false;
+
+  private completeDeferredInit(): void {
+    if (this.deferredInitCompleted) return;
     this.backfillArtifactBlobsSync();
     this.deleteOrphanArtifactBlobsSync();
     this.refreshAllLineageSync();
     this.syncAllDerivedSessionStateSync(true);
     this.rebuildSearchIndexesSync();
+    this.deferredInitCompleted = true;
   }
 
   close(): void {
@@ -784,6 +793,8 @@ export class SqliteLcmStore {
 
     if (!normalized.sessionID) return;
     if (!this.shouldPersistSessionForEvent(normalized.type)) return;
+
+    this.completeDeferredInit();
 
     const session = this.readSessionSync(normalized.sessionID);
     const previousParentSessionID = session.parentSessionID;
@@ -4116,12 +4127,15 @@ export class SqliteLcmStore {
   }
 
   private writeEvent(event: CapturedEvent): void {
+    const payloadStub = event.type.startsWith("message.") || event.type.startsWith("session.")
+      ? `[${event.type}]`
+      : "";
     this.getDb()
       .prepare(
         `INSERT OR IGNORE INTO events (id, session_id, event_type, ts, payload_json)
          VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(event.id, event.sessionID ?? null, event.type, event.timestamp, JSON.stringify(event.payload));
+      .run(event.id, event.sessionID ?? null, event.type, event.timestamp, payloadStub);
   }
 
   private clearSummaryGraphSync(sessionID: string): void {
