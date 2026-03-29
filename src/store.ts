@@ -1108,6 +1108,7 @@ export class SqliteLcmStore {
     const latestMessageCreated = archived.at(-1)?.info.time.created ?? 0;
     const archivedSignature = this.buildArchivedSignature(archived);
     const rootIDs = state ? parseJson<string[]>(state.root_node_ids_json) : [];
+    const roots = rootIDs.map((nodeID) => this.readSummaryNodeSync(nodeID)).filter((node): node is SummaryNodeData => Boolean(node));
 
     if (!state) {
       issues.push("missing-summary-state");
@@ -1116,7 +1117,11 @@ export class SqliteLcmStore {
       if (state.latest_message_created !== latestMessageCreated) issues.push("latest-message-mismatch");
       if (state.archived_signature !== archivedSignature) issues.push("archived-signature-mismatch");
       if (rootIDs.length === 0) issues.push("missing-root-node-ids");
-      if (rootIDs.some((nodeID) => !this.readSummaryNodeSync(nodeID))) issues.push("missing-root-node-record");
+      if (roots.length !== rootIDs.length) {
+        issues.push("missing-root-node-record");
+      } else if (rootIDs.length > 0 && !this.canReuseSummaryGraphSync(session.sessionID, archived, roots)) {
+        issues.push("invalid-summary-graph");
+      }
     }
 
     if (summaryNodeCount.count === 0) issues.push("missing-summary-nodes");
@@ -2492,12 +2497,69 @@ export class SqliteLcmStore {
     ) {
       const rootIDs = parseJson<string[]>(state.root_node_ids_json);
       const roots = rootIDs.map((nodeID) => this.readSummaryNodeSync(nodeID)).filter((node): node is SummaryNodeData => Boolean(node));
-      if (rootIDs.length > 0 && roots.length === rootIDs.length) {
+      if (rootIDs.length > 0 && roots.length === rootIDs.length && this.canReuseSummaryGraphSync(sessionID, archivedMessages, roots)) {
         return roots;
       }
     }
 
     return this.rebuildSummaryGraphSync(sessionID, archivedMessages, archivedSignature);
+  }
+
+  private canReuseSummaryGraphSync(
+    sessionID: string,
+    archivedMessages: ConversationMessage[],
+    roots: SummaryNodeData[],
+  ): boolean {
+    if (roots.length === 0) return false;
+
+    const expectedMessageIDs = archivedMessages.map((message) => message.info.id);
+    const seen = new Set<string>();
+
+    const validateNode = (node: SummaryNodeData): boolean => {
+      if (node.sessionID !== sessionID) return false;
+      if (seen.has(node.nodeID)) return false;
+      seen.add(node.nodeID);
+
+      if (node.startIndex < 0 || node.endIndex < node.startIndex || node.endIndex >= expectedMessageIDs.length) {
+        return false;
+      }
+
+      const expectedNodeMessageIDs = expectedMessageIDs.slice(node.startIndex, node.endIndex + 1);
+      if (node.messageIDs.length !== expectedNodeMessageIDs.length) return false;
+      for (let index = 0; index < expectedNodeMessageIDs.length; index += 1) {
+        if (node.messageIDs[index] !== expectedNodeMessageIDs[index]) return false;
+      }
+
+      const expectedSummaryText = this.summarizeMessages(archivedMessages.slice(node.startIndex, node.endIndex + 1));
+      if (node.summaryText !== expectedSummaryText) return false;
+
+      const children = this.readSummaryChildrenSync(node.nodeID);
+      if (node.nodeKind === "leaf") {
+        return children.length === 0 && node.endIndex - node.startIndex + 1 <= SUMMARY_LEAF_MESSAGES;
+      }
+      if (children.length === 0 || children.length > SUMMARY_BRANCH_FACTOR) return false;
+      if (children[0]?.startIndex !== node.startIndex) return false;
+      if (children.at(-1)?.endIndex !== node.endIndex) return false;
+
+      let nextStartIndex = node.startIndex;
+      for (const child of children) {
+        if (child.level !== node.level - 1) return false;
+        if (child.startIndex !== nextStartIndex) return false;
+        if (!validateNode(child)) return false;
+        nextStartIndex = child.endIndex + 1;
+      }
+
+      return nextStartIndex === node.endIndex + 1;
+    };
+
+    let nextStartIndex = 0;
+    for (const root of roots) {
+      if (root.startIndex !== nextStartIndex) return false;
+      if (!validateNode(root)) return false;
+      nextStartIndex = root.endIndex + 1;
+    }
+
+    return nextStartIndex === expectedMessageIDs.length;
   }
 
   private rebuildSummaryGraphSync(

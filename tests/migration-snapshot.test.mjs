@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { SqliteLcmStore } from "../dist/store.js";
@@ -112,6 +112,72 @@ test("snapshot merge import preserves existing target sessions", async () => {
     assert.equal(stats.sessionCount, 2);
     assert.equal(sourceResult[0].sessionID, "source-session");
     assert.equal(targetResult[0].sessionID, "target-session");
+  } finally {
+    source?.close();
+    target?.close();
+    cleanupWorkspace(sourceWorkspace);
+    cleanupWorkspace(targetWorkspace);
+  }
+});
+
+test("snapshot import rebuilds stale imported summary graphs before reuse", async () => {
+  const sourceWorkspace = makeWorkspace("lcm-stale-summary-src");
+  const targetWorkspace = makeWorkspace("lcm-stale-summary-dst");
+  const snapshotPath = path.join(sourceWorkspace, "stale-summary-snapshot.json");
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }));
+    await source.init();
+    await createSession(source, sourceWorkspace, "source-session", 1);
+    await captureMessage(source, {
+      sessionID: "source-session",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("source-session", "m1", "m1-p", "portable archived alpha")],
+    });
+    await captureMessage(source, {
+      sessionID: "source-session",
+      messageID: "m2",
+      created: 3,
+      parts: [textPart("source-session", "m2", "m2-p", "portable archived beta")],
+    });
+    await captureMessage(source, {
+      sessionID: "source-session",
+      messageID: "m3",
+      created: 4,
+      parts: [textPart("source-session", "m3", "m3-p", "portable archived gamma")],
+    });
+    await captureMessage(source, {
+      sessionID: "source-session",
+      messageID: "m4",
+      created: 5,
+      parts: [textPart("source-session", "m4", "m4-p", "portable fresh tail")],
+    });
+    await source.buildCompactionContext("source-session");
+    await source.exportSnapshot({ filePath: snapshotPath, scope: "all" });
+
+    const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    assert.ok(snapshot.summary_nodes.length > 0);
+    snapshot.summary_nodes[0].summary_text = "stale imported summary";
+    snapshot.summary_nodes[0].message_ids_json = JSON.stringify(["stale-message-id"]);
+    writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }));
+    await target.init();
+
+    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: "replace" });
+    const resume = await target.resume("source-session");
+    const expanded = await target.expand({ sessionID: "source-session" });
+    const doctor = await target.doctor({ sessionID: "source-session" });
+
+    assert.match(importText, /mode=replace/);
+    assert.match(resume, /portable archived alpha/);
+    assert.match(expanded, /portable archived alpha/);
+    assert.ok(!resume.includes("stale imported summary"));
+    assert.ok(!expanded.includes("stale imported summary"));
+    assert.match(doctor, /status=clean/);
   } finally {
     source?.close();
     target?.close();
