@@ -289,11 +289,13 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         args: {
           filePath: tool.schema.string().min(1),
           mode: tool.schema.string().optional(),
+          worktreeMode: tool.schema.string().optional(),
         },
         async execute(args) {
           return await store.importSnapshot({
             filePath: args.filePath,
             mode: args.mode === "merge" ? "merge" : "replace",
+            worktreeMode: args.worktreeMode === "preserve" || args.worktreeMode === "current" ? args.worktreeMode : "auto",
           });
         },
       }),

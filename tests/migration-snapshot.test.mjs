@@ -119,3 +119,248 @@ test("snapshot merge import preserves existing target sessions", async () => {
     cleanupWorkspace(targetWorkspace);
   }
 });
+
+test("snapshot paths must stay within the workspace", async () => {
+  const workspace = makeWorkspace("lcm-snapshot-paths");
+  const outsideWorkspace = makeWorkspace("lcm-snapshot-paths-outside");
+  const outsideSnapshotPath = path.join(outsideWorkspace, "snapshot.json");
+  const relativeOutsideSnapshotPath = path.relative(workspace, outsideSnapshotPath);
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    writeFileSync(
+      outsideSnapshotPath,
+      JSON.stringify(
+        {
+          version: 1,
+          exportedAt: 1,
+          scope: "all",
+          sessions: [],
+          messages: [],
+          parts: [],
+          resumes: [],
+          artifacts: [],
+          artifact_blobs: [],
+          summary_nodes: [],
+          summary_edges: [],
+          summary_state: [],
+        },
+        null,
+        2,
+      ),
+    );
+
+    await assert.rejects(
+      () => store.exportSnapshot({ filePath: relativeOutsideSnapshotPath, scope: "all" }),
+      /Path must stay within the workspace/,
+    );
+    await assert.rejects(
+      () => store.importSnapshot({ filePath: relativeOutsideSnapshotPath, mode: "replace" }),
+      /Path must stay within the workspace/,
+    );
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+    cleanupWorkspace(outsideWorkspace);
+  }
+});
+
+test("snapshot import rejects malformed payloads", async () => {
+  const workspace = makeWorkspace("lcm-snapshot-invalid");
+  const snapshotPath = path.join(workspace, "invalid-snapshot.json");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    writeFileSync(snapshotPath, JSON.stringify({ version: 1, exportedAt: 1, scope: "all" }, null, 2));
+
+    await assert.rejects(
+      () => store.importSnapshot({ filePath: snapshotPath, mode: "replace" }),
+      /Snapshot field "sessions" must be an array/,
+    );
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("snapshot replace import rehomes a single-worktree export into the target workspace", async () => {
+  const sourceWorkspace = makeWorkspace("lcm-rehome-src");
+  const targetWorkspace = makeWorkspace("lcm-rehome-dst");
+  const snapshotPath = path.join(sourceWorkspace, "rehome-snapshot.json");
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions());
+    await source.init();
+    await createSession(source, sourceWorkspace, "source-session", 1);
+    await captureMessage(source, {
+      sessionID: "source-session",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("source-session", "m1", "m1-p", "portable snapshot body")],
+    });
+    await source.exportSnapshot({ filePath: snapshotPath, scope: "all" });
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions());
+    await target.init();
+
+    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: "replace" });
+    const describe = await target.describe({ sessionID: "source-session" });
+    const grep = await target.grep({ query: "portable snapshot body", sessionID: "source-session", scope: "worktree" });
+
+    assert.match(importText, /mode=replace/);
+    assert.match(importText, /worktree_mode=auto/);
+    assert.match(importText, /effective_worktree_mode=current/);
+    assert.match(importText, /source_worktrees=1/);
+    assert.match(importText, /rehomed_sessions=1/);
+    assert.match(describe, new RegExp(`Directory: ${targetWorkspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.equal(grep[0].sessionID, "source-session");
+  } finally {
+    source?.close();
+    target?.close();
+    cleanupWorkspace(sourceWorkspace);
+    cleanupWorkspace(targetWorkspace);
+  }
+});
+
+test("snapshot replace import preserves a single-worktree export when requested", async () => {
+  const sourceWorkspace = makeWorkspace("lcm-preserve-src");
+  const targetWorkspace = makeWorkspace("lcm-preserve-dst");
+  const snapshotPath = path.join(sourceWorkspace, "preserve-snapshot.json");
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions());
+    await source.init();
+    await createSession(source, sourceWorkspace, "source-session", 1);
+    await captureMessage(source, {
+      sessionID: "source-session",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("source-session", "m1", "m1-p", "preserved snapshot body")],
+    });
+    await source.exportSnapshot({ filePath: snapshotPath, scope: "all" });
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions());
+    await target.init();
+
+    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: "replace", worktreeMode: "preserve" });
+    const describe = await target.describe({ sessionID: "source-session" });
+    const grep = await target.grep({ query: "preserved snapshot body", sessionID: "source-session", scope: "all" });
+
+    assert.match(importText, /worktree_mode=preserve/);
+    assert.match(importText, /effective_worktree_mode=preserve/);
+    assert.match(importText, /rehomed_sessions=0/);
+    assert.match(describe, new RegExp(`Directory: ${sourceWorkspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.equal(grep[0].sessionID, "source-session");
+  } finally {
+    source?.close();
+    target?.close();
+    cleanupWorkspace(sourceWorkspace);
+    cleanupWorkspace(targetWorkspace);
+  }
+});
+
+test("snapshot replace import can force current-worktree remap for multi-worktree exports", async () => {
+  const sourceWorkspace = makeWorkspace("lcm-force-current-src");
+  const targetWorkspace = makeWorkspace("lcm-force-current-dst");
+  const snapshotPath = path.join(sourceWorkspace, "force-current-snapshot.json");
+  const worktreeA = path.join(sourceWorkspace, "worktree-a");
+  const worktreeB = path.join(sourceWorkspace, "worktree-b");
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions());
+    await source.init();
+    await createSession(source, worktreeA, "session-a", 1);
+    await createSession(source, worktreeB, "session-b", 2);
+    await captureMessage(source, {
+      sessionID: "session-a",
+      messageID: "m1",
+      created: 3,
+      parts: [textPart("session-a", "m1", "m1-p", "multi worktree session a")],
+    });
+    await captureMessage(source, {
+      sessionID: "session-b",
+      messageID: "m2",
+      created: 4,
+      parts: [textPart("session-b", "m2", "m2-p", "multi worktree session b")],
+    });
+    await source.exportSnapshot({ filePath: snapshotPath, scope: "all" });
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions());
+    await target.init();
+
+    const importText = await target.importSnapshot({ filePath: snapshotPath, mode: "replace", worktreeMode: "current" });
+    const describeA = await target.describe({ sessionID: "session-a" });
+    const describeB = await target.describe({ sessionID: "session-b" });
+
+    assert.match(importText, /worktree_mode=current/);
+    assert.match(importText, /effective_worktree_mode=current/);
+    assert.match(importText, /source_worktrees=2/);
+    assert.match(importText, /rehomed_sessions=2/);
+    assert.match(describeA, new RegExp(`Directory: ${targetWorkspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(describeB, new RegExp(`Directory: ${targetWorkspace.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  } finally {
+    source?.close();
+    target?.close();
+    cleanupWorkspace(sourceWorkspace);
+    cleanupWorkspace(targetWorkspace);
+  }
+});
+
+test("snapshot merge import rejects colliding session IDs", async () => {
+  const sourceWorkspace = makeWorkspace("lcm-collision-src");
+  const targetWorkspace = makeWorkspace("lcm-collision-dst");
+  const snapshotPath = path.join(sourceWorkspace, "collision-snapshot.json");
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions());
+    await source.init();
+    await createSession(source, sourceWorkspace, "shared-session", 1);
+    await captureMessage(source, {
+      sessionID: "shared-session",
+      messageID: "m1",
+      created: 2,
+      parts: [textPart("shared-session", "m1", "m1-p", "source shared body")],
+    });
+    await source.exportSnapshot({ filePath: snapshotPath, scope: "all" });
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions());
+    await target.init();
+    await createSession(target, targetWorkspace, "shared-session", 3);
+    await captureMessage(target, {
+      sessionID: "shared-session",
+      messageID: "m2",
+      created: 4,
+      parts: [textPart("shared-session", "m2", "m2-p", "target shared body")],
+    });
+
+    await assert.rejects(
+      () => target.importSnapshot({ filePath: snapshotPath, mode: "merge" }),
+      /Snapshot merge would overwrite existing sessions: shared-session/,
+    );
+
+    const targetResult = await target.grep({ query: "target shared body", sessionID: "shared-session", scope: "session" });
+    const sourceResult = await target.grep({ query: "source shared body", scope: "all" });
+
+    assert.equal(targetResult[0].sessionID, "shared-session");
+    assert.equal(sourceResult.length, 0);
+  } finally {
+    source?.close();
+    target?.close();
+    cleanupWorkspace(sourceWorkspace);
+    cleanupWorkspace(targetWorkspace);
+  }
+});

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import type { Event, Message, Part } from "@opencode-ai/sdk";
@@ -11,6 +11,20 @@ import {
   selectAutomaticRetrievalHits,
 } from "./archive-transform.js";
 import { formatDoctorReport, type DoctorReport, type DoctorSessionIssue } from "./doctor.js";
+import {
+  exportStoreSnapshot,
+  importStoreSnapshot,
+  type ArtifactBlobRow,
+  type ArtifactRow,
+  type MessageRow,
+  type PartRow,
+  type SessionRow,
+  type SnapshotScope,
+  type SnapshotWorktreeMode,
+  type SummaryEdgeRow,
+  type SummaryNodeRow,
+  type SummaryStateRow,
+} from "./store-snapshot.js";
 import type {
   CapturedEvent,
   ConversationMessage,
@@ -22,66 +36,9 @@ import type {
 } from "./types.js";
 import { runBinaryPreviewProviders } from "./preview-providers.js";
 import { rankSearchCandidates, type SearchCandidate } from "./search-ranking.js";
+import { normalizeWorktreeKey } from "./worktree-key.js";
 
 type ResumeMap = Record<string, string>;
-
-type SessionRow = {
-  session_id: string;
-  title: string | null;
-  session_directory: string | null;
-  worktree_key: string | null;
-  parent_session_id: string | null;
-  root_session_id: string | null;
-  lineage_depth: number | null;
-  pinned: number | null;
-  pin_reason: string | null;
-  updated_at: number;
-  compacted_at: number | null;
-  deleted: number;
-  event_count: number;
-};
-
-type MessageRow = {
-  message_id: string;
-  session_id: string;
-  created_at: number;
-  info_json: string;
-};
-
-type PartRow = {
-  part_id: string;
-  session_id: string;
-  message_id: string;
-  sort_key: number;
-  part_json: string;
-};
-
-type SummaryNodeRow = {
-  node_id: string;
-  session_id: string;
-  level: number;
-  node_kind: string;
-  start_index: number;
-  end_index: number;
-  message_ids_json: string;
-  summary_text: string;
-  created_at: number;
-};
-
-type SummaryEdgeRow = {
-  parent_id: string;
-  child_id: string;
-  child_position: number;
-};
-
-type SummaryStateRow = {
-  session_id: string;
-  archived_count: number;
-  latest_message_created: number;
-  archived_signature: string | null;
-  root_node_ids_json: string;
-  updated_at: number;
-};
 
 type SummaryNodeData = {
   nodeID: string;
@@ -93,28 +50,6 @@ type SummaryNodeData = {
   messageIDs: string[];
   summaryText: string;
   createdAt: number;
-};
-
-type ArtifactRow = {
-  artifact_id: string;
-  session_id: string;
-  message_id: string;
-  part_id: string;
-  artifact_kind: string;
-  field_name: string;
-  preview_text: string;
-  content_text: string;
-  content_hash: string | null;
-  metadata_json: string;
-  char_count: number;
-  created_at: number;
-};
-
-type ArtifactBlobRow = {
-  content_hash: string;
-  content_text: string;
-  char_count: number;
-  created_at: number;
 };
 
 type ArtifactData = {
@@ -169,21 +104,6 @@ type ResolvedRetentionPolicy = {
   orphanBlobDays?: number;
 };
 
-type SnapshotPayload = {
-  version: 1;
-  exportedAt: number;
-  scope: string;
-  sessions: SessionRow[];
-  messages: MessageRow[];
-  parts: PartRow[];
-  resumes: Array<{ session_id: string; note: string; updated_at: number }>;
-  artifacts: ArtifactRow[];
-  artifact_blobs: ArtifactBlobRow[];
-  summary_nodes: SummaryNodeRow[];
-  summary_edges: Array<{ session_id: string; parent_id: string; child_id: string; child_position: number }>;
-  summary_state: SummaryStateRow[];
-};
-
 const SUMMARY_LEAF_MESSAGES = 6;
 const SUMMARY_BRANCH_FACTOR = 3;
 const SUMMARY_NODE_CHAR_LIMIT = 260;
@@ -191,6 +111,17 @@ const EXPAND_MESSAGE_LIMIT = 6;
 const AUTOMATIC_RETRIEVAL_QUERY_TOKENS = 8;
 const AUTOMATIC_RETRIEVAL_RECENT_MESSAGES = 3;
 const AUTOMATIC_RETRIEVAL_QUERY_VARIANTS = 8;
+const AUTOMATIC_RETRIEVAL_NOISE_PATTERNS = [
+  /<system-reminder>/i,
+  /system[-\s\[\]]*reminder/i,
+  /\[archived by opencode-lcm:/i,
+  /recall telemetry:/i,
+  /recalled context:/i,
+  /your operational mode has changed/i,
+  /opencode-lcm automatically recalled/i,
+  /treat recalled archive as supporting context/i,
+  /use lcm_(describe|grep|resume|expand|artifact)/i,
+];
 const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "a",
   "about",
@@ -199,6 +130,7 @@ const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "also",
   "an",
   "and",
+  "ahead",
   "any",
   "are",
   "as",
@@ -241,6 +173,8 @@ const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "or",
   "our",
   "only",
+  "ok",
+  "okay",
   "please",
   "previous",
   "recall",
@@ -250,6 +184,7 @@ const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "said",
   "show",
   "so",
+  "sure",
   "still",
   "that",
   "the",
@@ -268,6 +203,8 @@ const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "want",
   "was",
   "we",
+  "yes",
+  "yep",
   "earlier",
   "what",
   "when",
@@ -278,6 +215,10 @@ const AUTOMATIC_RETRIEVAL_STOPWORDS = new Set([
   "would",
   "you",
   "your",
+  "thank",
+  "thanks",
+  "confirm",
+  "confirmed",
 ]);
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -397,14 +338,42 @@ function buildSnippet(content: string, query?: string, limit = 280): string {
   return truncate(normalized.slice(start, end), limit);
 }
 
-function hashContent(content: string): string {
-  return createHash("sha256").update(content).digest("hex");
+function sanitizeAutomaticRetrievalSourceText(text: string): string {
+  return text
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, " ")
+    .replace(/<system-reminder>/gi, " ")
+    .replace(/<\/system-reminder>/gi, " ")
+    .replace(/\[Archived by opencode-lcm:[^\]]*\]/gi, " ")
+    .replace(/Recall telemetry:[^\n]*/gi, " ")
+    .replace(/Recalled context:/gi, " ")
+    .replace(/Archived roots:/gi, " ")
+    .replace(/Treat recalled archive as supporting context[^\n]*/gi, " ")
+    .replace(/Use lcm_(describe|grep|resume|expand|artifact)[^\n]*/gi, " ")
+    .replace(/opencode-lcm automatically recalled[^\n]*/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function normalizeWorktreeKey(directory?: string): string | undefined {
-  if (!directory) return undefined;
-  const normalized = directory.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-  return normalized || undefined;
+function isAutomaticRetrievalNoise(text: string): boolean {
+  return AUTOMATIC_RETRIEVAL_NOISE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function shouldSuppressLowSignalAutomaticRetrievalAnchor(
+  anchorText: string,
+  anchorSignalCount: number,
+  minTokens: number,
+  anchorFileCount: number,
+): boolean {
+  if (anchorSignalCount >= minTokens) return false;
+  if (anchorFileCount > 0) return false;
+  if (anchorText.includes("?")) return false;
+
+  const rawTokenCount = tokenizeQuery(anchorText).length;
+  return rawTokenCount <= 4;
+}
+
+function hashContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
 }
 
 function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: string[]): string {
@@ -1399,7 +1368,7 @@ export class SqliteLcmStore {
     return row.chars;
   }
 
-  private normalizeScope(scope?: string): "session" | "root" | "worktree" | "all" | undefined {
+  private normalizeScope(scope?: string): SnapshotScope | undefined {
     if (scope === "session" || scope === "root" || scope === "worktree" || scope === "all") return scope;
     return undefined;
   }
@@ -1528,20 +1497,15 @@ export class SqliteLcmStore {
       .all(...sessionIDs) as SummaryNodeRow[];
   }
 
-  private readScopedSummaryEdgeRowsSync(sessionIDs?: string[]): Array<{ session_id: string; parent_id: string; child_id: string; child_position: number }> {
+  private readScopedSummaryEdgeRowsSync(sessionIDs?: string[]): SummaryEdgeRow[] {
     if (!sessionIDs) {
-      return this.getDb().prepare("SELECT * FROM summary_edges ORDER BY session_id ASC, parent_id ASC, child_position ASC").all() as Array<{
-        session_id: string;
-        parent_id: string;
-        child_id: string;
-        child_position: number;
-      }>;
+      return this.getDb().prepare("SELECT * FROM summary_edges ORDER BY session_id ASC, parent_id ASC, child_position ASC").all() as SummaryEdgeRow[];
     }
     if (sessionIDs.length === 0) return [];
 
     return this.getDb()
       .prepare(`SELECT * FROM summary_edges WHERE session_id IN (${sessionIDs.map(() => "?").join(", ")}) ORDER BY session_id ASC, parent_id ASC, child_position ASC`)
-      .all(...sessionIDs) as Array<{ session_id: string; parent_id: string; child_id: string; child_position: number }>;
+      .all(...sessionIDs) as SummaryEdgeRow[];
   }
 
   private readScopedSummaryStateRowsSync(sessionIDs?: string[]): SummaryStateRow[] {
@@ -1925,184 +1889,42 @@ export class SqliteLcmStore {
     sessionID?: string;
     scope?: string;
   }): Promise<string> {
-    const scope = this.normalizeScope(input.scope) ?? "session";
-    const sessionIDs = this.resolveScopeSessionIDs(scope, input.sessionID);
-    const snapshot: SnapshotPayload = {
-      version: 1,
-      exportedAt: Date.now(),
-      scope,
-      sessions: this.readScopedSessionRowsSync(sessionIDs),
-      messages: this.readScopedMessageRowsSync(sessionIDs),
-      parts: this.readScopedPartRowsSync(sessionIDs),
-      resumes: this.readScopedResumeRowsSync(sessionIDs),
-      artifacts: this.readScopedArtifactRowsSync(sessionIDs),
-      artifact_blobs: this.readScopedArtifactBlobRowsSync(sessionIDs),
-      summary_nodes: this.readScopedSummaryRowsSync(sessionIDs),
-      summary_edges: this.readScopedSummaryEdgeRowsSync(sessionIDs),
-      summary_state: this.readScopedSummaryStateRowsSync(sessionIDs),
-    };
-
-    const targetPath = path.isAbsolute(input.filePath)
-      ? input.filePath
-      : path.resolve(this.workspaceDirectory, input.filePath);
-    await writeFile(targetPath, JSON.stringify(snapshot, null, 2), "utf8");
-    return [
-      `file=${targetPath}`,
-      `scope=${scope}`,
-      `sessions=${snapshot.sessions.length}`,
-      `messages=${snapshot.messages.length}`,
-      `parts=${snapshot.parts.length}`,
-      `artifacts=${snapshot.artifacts.length}`,
-      `artifact_blobs=${snapshot.artifact_blobs.length}`,
-      `summary_nodes=${snapshot.summary_nodes.length}`,
-    ].join("\n");
+    return exportStoreSnapshot(
+      {
+        workspaceDirectory: this.workspaceDirectory,
+        normalizeScope: this.normalizeScope.bind(this),
+        resolveScopeSessionIDs: this.resolveScopeSessionIDs.bind(this),
+        readScopedSessionRowsSync: this.readScopedSessionRowsSync.bind(this),
+        readScopedMessageRowsSync: this.readScopedMessageRowsSync.bind(this),
+        readScopedPartRowsSync: this.readScopedPartRowsSync.bind(this),
+        readScopedResumeRowsSync: this.readScopedResumeRowsSync.bind(this),
+        readScopedArtifactRowsSync: this.readScopedArtifactRowsSync.bind(this),
+        readScopedArtifactBlobRowsSync: this.readScopedArtifactBlobRowsSync.bind(this),
+        readScopedSummaryRowsSync: this.readScopedSummaryRowsSync.bind(this),
+        readScopedSummaryEdgeRowsSync: this.readScopedSummaryEdgeRowsSync.bind(this),
+        readScopedSummaryStateRowsSync: this.readScopedSummaryStateRowsSync.bind(this),
+      },
+      input,
+    );
   }
 
   async importSnapshot(input: {
     filePath: string;
     mode?: "replace" | "merge";
+    worktreeMode?: SnapshotWorktreeMode;
   }): Promise<string> {
-    const sourcePath = path.isAbsolute(input.filePath)
-      ? input.filePath
-      : path.resolve(this.workspaceDirectory, input.filePath);
-    const snapshot = JSON.parse(await readFile(sourcePath, "utf8")) as SnapshotPayload;
-    if (snapshot.version !== 1) {
-      throw new Error(`Unsupported snapshot version: ${String((snapshot as { version?: unknown }).version)}`);
-    }
-
-    const db = this.getDb();
-    const sessionIDs = [...new Set(snapshot.sessions.map((row) => row.session_id))];
-    db.exec("BEGIN");
-    try {
-      if (input.mode !== "merge") {
-        for (const sessionID of sessionIDs) this.clearSessionDataSync(sessionID);
-      }
-
-      const insertSession = db.prepare(
-        `INSERT INTO sessions (session_id, title, session_directory, worktree_key, parent_session_id, root_session_id, lineage_depth, pinned, pin_reason, updated_at, compacted_at, deleted, event_count)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET
-           title = excluded.title,
-           session_directory = excluded.session_directory,
-           worktree_key = excluded.worktree_key,
-           parent_session_id = excluded.parent_session_id,
-           root_session_id = excluded.root_session_id,
-           lineage_depth = excluded.lineage_depth,
-           pinned = excluded.pinned,
-           pin_reason = excluded.pin_reason,
-           updated_at = excluded.updated_at,
-           compacted_at = excluded.compacted_at,
-           deleted = excluded.deleted,
-           event_count = excluded.event_count`,
-      );
-      const insertMessage = db.prepare(
-        `INSERT OR REPLACE INTO messages (message_id, session_id, created_at, info_json) VALUES (?, ?, ?, ?)`,
-      );
-      const insertPart = db.prepare(
-        `INSERT OR REPLACE INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)`,
-      );
-      const insertResume = db.prepare(`INSERT OR REPLACE INTO resumes (session_id, note, updated_at) VALUES (?, ?, ?)`);
-      const insertBlob = db.prepare(
-        `INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at) VALUES (?, ?, ?, ?)`,
-      );
-      const insertArtifact = db.prepare(
-        `INSERT OR REPLACE INTO artifacts (artifact_id, session_id, message_id, part_id, artifact_kind, field_name, preview_text, content_text, content_hash, metadata_json, char_count, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      const insertNode = db.prepare(
-        `INSERT OR REPLACE INTO summary_nodes (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      const insertEdge = db.prepare(
-        `INSERT OR REPLACE INTO summary_edges (session_id, parent_id, child_id, child_position) VALUES (?, ?, ?, ?)`,
-      );
-      const insertState = db.prepare(
-        `INSERT OR REPLACE INTO summary_state (session_id, archived_count, latest_message_created, archived_signature, root_node_ids_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      );
-
-      for (const row of snapshot.sessions) {
-        insertSession.run(
-          row.session_id,
-          row.title,
-          row.session_directory,
-          row.worktree_key,
-          row.parent_session_id,
-          row.root_session_id,
-          row.lineage_depth,
-          row.pinned ?? 0,
-          row.pin_reason,
-          row.updated_at,
-          row.compacted_at,
-          row.deleted,
-          row.event_count,
-        );
-      }
-      for (const row of snapshot.messages) insertMessage.run(row.message_id, row.session_id, row.created_at, row.info_json);
-      for (const row of snapshot.parts) insertPart.run(row.part_id, row.session_id, row.message_id, row.sort_key, row.part_json);
-      for (const row of snapshot.resumes) insertResume.run(row.session_id, row.note, row.updated_at);
-      for (const row of snapshot.artifact_blobs) insertBlob.run(row.content_hash, row.content_text, row.char_count, row.created_at);
-      for (const row of snapshot.artifacts) {
-        insertArtifact.run(
-          row.artifact_id,
-          row.session_id,
-          row.message_id,
-          row.part_id,
-          row.artifact_kind,
-          row.field_name,
-          row.preview_text,
-          row.content_text,
-          row.content_hash,
-          row.metadata_json,
-          row.char_count,
-          row.created_at,
-        );
-      }
-      for (const row of snapshot.summary_nodes) {
-        insertNode.run(
-          row.node_id,
-          row.session_id,
-          row.level,
-          row.node_kind,
-          row.start_index,
-          row.end_index,
-          row.message_ids_json,
-          row.summary_text,
-          row.created_at,
-        );
-      }
-      for (const row of snapshot.summary_edges) insertEdge.run(row.session_id, row.parent_id, row.child_id, row.child_position);
-      for (const row of snapshot.summary_state) {
-        insertState.run(
-          row.session_id,
-          row.archived_count,
-          row.latest_message_created,
-          row.archived_signature ?? "",
-          row.root_node_ids_json,
-          row.updated_at,
-        );
-      }
-
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-
-    this.backfillArtifactBlobsSync();
-    this.refreshAllLineageSync();
-    this.syncAllDerivedSessionStateSync(true);
-    this.rebuildSearchIndexesSync();
-    return [
-      `file=${sourcePath}`,
-      `mode=${input.mode ?? "replace"}`,
-      `sessions=${snapshot.sessions.length}`,
-      `messages=${snapshot.messages.length}`,
-      `parts=${snapshot.parts.length}`,
-      `artifacts=${snapshot.artifacts.length}`,
-      `artifact_blobs=${snapshot.artifact_blobs.length}`,
-      `summary_nodes=${snapshot.summary_nodes.length}`,
-    ].join("\n");
+    return importStoreSnapshot(
+      {
+        workspaceDirectory: this.workspaceDirectory,
+        getDb: () => this.getDb(),
+        clearSessionDataSync: this.clearSessionDataSync.bind(this),
+        backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
+        refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
+        syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
+        rebuildSearchIndexesSync: this.rebuildSearchIndexesSync.bind(this),
+      },
+      input,
+    );
   }
 
   async resume(sessionID?: string): Promise<string> {
@@ -2350,17 +2172,27 @@ export class SqliteLcmStore {
   ): { queries: string[]; tokens: string[] } | undefined {
     const minTokens = clamp(this.options.automaticRetrieval.minTokens, 1, AUTOMATIC_RETRIEVAL_QUERY_TOKENS);
     const tokens: string[] = [];
+    const anchorText = sanitizeAutomaticRetrievalSourceText(guessMessageText(anchor, this.options.interop.ignoreToolPrefixes));
+    const anchorFiles = listFiles(anchor);
     const pushTokens = (value?: string) => {
       if (!value || tokens.length >= AUTOMATIC_RETRIEVAL_QUERY_TOKENS) return;
-      for (const token of filterIntentTokens(tokenizeQuery(value))) {
+      const sanitized = sanitizeAutomaticRetrievalSourceText(value);
+      if (!sanitized) return;
+      for (const token of filterIntentTokens(tokenizeQuery(sanitized))) {
         if (tokens.includes(token)) continue;
         tokens.push(token);
         if (tokens.length >= AUTOMATIC_RETRIEVAL_QUERY_TOKENS) break;
       }
     };
 
-    pushTokens(guessMessageText(anchor, this.options.interop.ignoreToolPrefixes));
-    for (const file of listFiles(anchor)) pushTokens(path.basename(file));
+    pushTokens(anchorText);
+    for (const file of anchorFiles) pushTokens(path.basename(file));
+    const anchorSignalCount = tokens.length;
+    if (anchorSignalCount === 0) return undefined;
+    if (shouldSuppressLowSignalAutomaticRetrievalAnchor(anchorText, anchorSignalCount, minTokens, anchorFiles.length)) {
+      return undefined;
+    }
+
     for (const message of recent.slice(-AUTOMATIC_RETRIEVAL_RECENT_MESSAGES)) {
       for (const file of listFiles(message)) pushTokens(path.basename(file));
     }
@@ -2451,10 +2283,11 @@ export class SqliteLcmStore {
     tokens: string[],
     results: SearchResult[],
   ) {
+    const filteredResults = results.filter((result) => !this.isAutomaticRetrievalNoiseResult(result));
     return selectAutomaticRetrievalHits({
       recent,
       tokens,
-      results,
+      results: filteredResults,
       quotas: {
         message: clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4),
         summary: clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3),
@@ -2463,6 +2296,10 @@ export class SqliteLcmStore {
       isFreshResult: (result, freshMessageIDs) =>
         this.isFreshAutomaticRetrievalResult(sessionID, freshMessageIDs, result),
     });
+  }
+
+  private isAutomaticRetrievalNoiseResult(result: SearchResult): boolean {
+    return isAutomaticRetrievalNoise(result.snippet);
   }
 
   private isFreshAutomaticRetrievalResult(
@@ -3841,6 +3678,8 @@ export class SqliteLcmStore {
     const db = this.getDb();
     db.prepare("DELETE FROM artifact_fts WHERE message_id = ?").run(messageID);
     db.prepare("DELETE FROM message_fts WHERE message_id = ?").run(messageID);
+    db.prepare("DELETE FROM artifacts WHERE session_id = ? AND message_id = ?").run(sessionID, messageID);
+    db.prepare("DELETE FROM parts WHERE session_id = ? AND message_id = ?").run(sessionID, messageID);
     db.prepare("DELETE FROM messages WHERE session_id = ? AND message_id = ?").run(sessionID, messageID);
   }
 

@@ -26,7 +26,8 @@ OpenCode still handles compaction the normal way: when the active conversation g
 
 - Track parent/root session lineage for branched sessions
 - Externalize oversized payloads into deduplicated artifact records with metadata
-- Expose `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_doctor`, `lcm_retention_report`, and `lcm_retention_prune`
+- Expose `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_expand`, `lcm_artifact`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, and `lcm_import_snapshot`
+- Import/export portable snapshots with safe merge collision checks, explicit restore worktree modes (`auto`, `preserve`, `current`), and relative-path traversal protection
 - SQLite FTS search across archived messages, summary nodes, and externalized artifacts
 - Configurable default retrieval scopes (session, root, worktree) with worktree profiles
 - Bounded automatic recall with configurable scope order, per-scope budgets, stop rules, recency-aware ranking, and visible recall telemetry
@@ -151,7 +152,7 @@ Three ways to turn off the plugin without removing it:
 
 ## Next milestones
 
-1. Continue hardening summary invalidation for multi-branch imports and rewrites
+1. Continue hardening summary invalidation for multi-branch imports, rewrites, and more pathological lineage changes
 2. Add richer recall debugging and tuning controls once the heuristics settle
 3. Add richer media-specific preview providers on top of the binary preview framework
-4. Add retention exemptions or pinning for important sessions
+4. Add per-worktree mapping tables for more selective multi-worktree snapshot restores
