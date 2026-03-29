@@ -164,6 +164,43 @@ test("detects PDF page estimates", () => {
   }
 });
 
+test("detects ZIP entry counts", () => {
+  const workspace = makeWorkspace("preview-providers-zip");
+
+  try {
+    const filePath = writeFixtureFile(
+      workspace,
+      "bundle.zip",
+      Buffer.from([
+        0x50, 0x4b, 0x05, 0x06,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x02, 0x00,
+        0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+      ]),
+    );
+    const output = runBinaryPreviewProviders({
+      workspaceDirectory: workspace,
+      file: makeFilePart(filePath),
+      category: "archive",
+      extension: "zip",
+      mime: "application/zip",
+      enabledProviders: ["zip-metadata"],
+      bytePeek: 4,
+    });
+
+    assert.deepEqual(output.metadata.previewProviders, ["zip-metadata"]);
+    assert.equal(output.metadata.previewZipEntryCount, 2);
+    assert.deepEqual(output.lines, ["ZIP entries: 2"]);
+    assert.deepEqual(output.summaryBits, ["2 entries"]);
+  } finally {
+    cleanupWorkspace(workspace);
+  }
+});
+
 test("ignores file paths outside the workspace", () => {
   const workspace = makeWorkspace("preview-providers-safe");
   const outside = makeWorkspace("preview-providers-outside");

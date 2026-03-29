@@ -86,6 +86,7 @@ export type SearchResult = {
 };
 
 export type StoreStats = {
+  schemaVersion: number;
   totalEvents: number;
   sessionCount: number;
   latestEventAt?: number;

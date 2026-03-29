@@ -62,7 +62,7 @@ export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   largeContentThreshold: 1200,
   artifactPreviewChars: 220,
   artifactViewChars: 4000,
-  binaryPreviewProviders: ["fingerprint", "byte-peek", "image-dimensions", "pdf-metadata"],
+  binaryPreviewProviders: ["fingerprint", "byte-peek", "image-dimensions", "pdf-metadata", "zip-metadata"],
   previewBytePeek: 16,
 };
 

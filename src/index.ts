@@ -23,6 +23,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         async execute() {
           const stats = await store.stats();
           const lines = [
+            `schema_version=${stats.schemaVersion}`,
             `total_events=${stats.totalEvents}`,
             `session_count=${stats.sessionCount}`,
             `root_sessions=${stats.rootSessionCount}`,

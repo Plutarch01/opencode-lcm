@@ -23,7 +23,7 @@ type PreviewOutput = {
   summaryBits: string[];
 };
 
-type ProviderName = "fingerprint" | "byte-peek" | "image-dimensions" | "pdf-metadata";
+type ProviderName = "fingerprint" | "byte-peek" | "image-dimensions" | "pdf-metadata" | "zip-metadata";
 
 type Provider = {
   name: ProviderName;
@@ -97,6 +97,29 @@ function estimatePdfPages(buffer: Buffer): number | undefined {
   const text = buffer.toString("latin1");
   const matches = text.match(/\/Type\s*\/Page([^s]|$)/g);
   return matches && matches.length > 0 ? matches.length : undefined;
+}
+
+function estimateZipEntries(buffer: Buffer): number | undefined {
+  if (buffer.length < 4) return undefined;
+
+  const localFileHeaderSignature = 0x04034b50;
+  const endOfCentralDirectorySignature = 0x06054b50;
+  const firstSignature = buffer.readUInt32LE(0);
+  if (firstSignature !== localFileHeaderSignature && firstSignature !== endOfCentralDirectorySignature) {
+    return undefined;
+  }
+
+  const searchStart = Math.max(0, buffer.length - 65557);
+  for (let offset = buffer.length - 22; offset >= searchStart; offset -= 1) {
+    if (buffer.readUInt32LE(offset) !== endOfCentralDirectorySignature) continue;
+    return buffer.readUInt16LE(offset + 10);
+  }
+
+  let entries = 0;
+  for (let offset = 0; offset <= buffer.length - 4; offset += 1) {
+    if (buffer.readUInt32LE(offset) === localFileHeaderSignature) entries += 1;
+  }
+  return entries > 0 ? entries : undefined;
 }
 
 const fingerprintProvider: Provider = {
@@ -177,7 +200,31 @@ const pdfMetadataProvider: Provider = {
   },
 };
 
-const PROVIDERS: Provider[] = [fingerprintProvider, bytePeekProvider, imageDimensionsProvider, pdfMetadataProvider];
+const zipMetadataProvider: Provider = {
+  name: "zip-metadata",
+  apply(_context, helpers) {
+    const bytes = helpers.readBytes();
+    if (!bytes) return { metadata: {}, lines: [], summaryBits: [] };
+    const entryCount = estimateZipEntries(bytes);
+    if (entryCount === undefined) return { metadata: {}, lines: [], summaryBits: [] };
+
+    return {
+      metadata: {
+        previewZipEntryCount: entryCount,
+      },
+      lines: [`ZIP entries: ${entryCount}`],
+      summaryBits: [`${entryCount} entr${entryCount === 1 ? "y" : "ies"}`],
+    };
+  },
+};
+
+const PROVIDERS: Provider[] = [
+  fingerprintProvider,
+  bytePeekProvider,
+  imageDimensionsProvider,
+  pdfMetadataProvider,
+  zipMetadataProvider,
+];
 
 export function runBinaryPreviewProviders(context: PreviewContext): PreviewOutput {
   let resolvedPath: string | undefined;
