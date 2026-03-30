@@ -96,32 +96,12 @@ type ArtifactData = {
   metadata: Record<string, unknown>;
 };
 
+import type {
+  ResolvedRetentionPolicy,
+  RetentionBlobCandidate,
+  RetentionSessionCandidate,
+} from './store-retention.js';
 import type { SqlDatabaseLike, SqlStatementLike } from './store-types.js';
-
-type RetentionSessionCandidate = {
-  session_id: string;
-  title: string | null;
-  session_directory: string | null;
-  root_session_id: string | null;
-  pinned: number;
-  deleted: number;
-  updated_at: number;
-  event_count: number;
-  message_count: number;
-  artifact_count: number;
-};
-
-type RetentionBlobCandidate = {
-  content_hash: string;
-  char_count: number;
-  created_at: number;
-};
-
-type ResolvedRetentionPolicy = {
-  staleSessionDays?: number;
-  deletedSessionDays?: number;
-  orphanBlobDays?: number;
-};
 
 type ReadSessionOptions = {
   artifactMessageIDs?: string[];
