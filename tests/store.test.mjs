@@ -344,6 +344,81 @@ test("message.part.delta is recorded without rewriting archived session state", 
   }
 });
 
+test("search hardening drops FTS5 reserved words and punctuation noise", async () => {
+  const workspace = makeWorkspace("lcm-fts-hardening");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "s1", time: 2, part: { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "sqlite migration planner runs nightly" } } });
+
+    const hit = await store.grep({ query: "sqlite migration", sessionID: "s1", limit: 3 });
+    assert.equal(hit[0]?.id, "m1");
+
+    const reservedOnly = await store.grep({ query: "and or not", sessionID: "s1", limit: 3 });
+    assert.ok(Array.isArray(reservedOnly));
+
+    const mixedReserved = await store.grep({ query: "sqlite and migration not planner", sessionID: "s1", limit: 3 });
+    assert.equal(mixedReserved[0]?.id, "m1");
+
+    const punctuationHeavy = await store.grep({ query: "!!!sqlite!!!", sessionID: "s1", limit: 3 });
+    assert.equal(punctuationHeavy[0]?.id, "m1");
+
+    const sqlReserved = await store.grep({ query: "select from where group by order", sessionID: "s1", limit: 3 });
+    assert.ok(Array.isArray(sqlReserved));
+
+    const emptyAfterStrip = await store.grep({ query: "!!! && || ??", sessionID: "s1", limit: 3 });
+    assert.equal(emptyAfterStrip.length, 0);
+
+    const nearKeyword = await store.grep({ query: "sqlite near migration", sessionID: "s1", limit: 3 });
+    assert.equal(nearKeyword[0]?.id, "m1");
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("synthetic text parts are excluded from grep results", async () => {
+  const workspace = makeWorkspace("lcm-synthetic");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+
+    // Message with real content
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "s1", time: 2, part: { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "real user content about migration" } } });
+
+    // Message with archive-placeholder text (elided by transform)
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m2", 3) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "s1", time: 3, part: { id: "p2", sessionID: "s1", messageID: "m2", type: "text", text: "[Archived by opencode-lcm: older text elided. Use lcm_resume, lcm_grep, or lcm_expand for details.]" } } });
+
+    // Message with externalized placeholder text
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m3", 4) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "s1", time: 4, part: { id: "p3", sessionID: "s1", messageID: "m3", type: "text", text: "[Externalized file as art_123 (400 chars). Use lcm_artifact for full content.]" } } });
+
+    // Message with retrieved-context metadata marker
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m4", 5) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "s1", time: 5, part: { id: "p4", sessionID: "s1", messageID: "m4", type: "text", text: "migration helper context retrieved from archive", metadata: { opencodeLcm: "retrieved-context" } } } });
+
+    // Grep for "migration" — should only find m1, not synthetic m2/m3/m4
+    const results = await store.grep({ query: "migration", sessionID: "s1", limit: 10 });
+    const ids = results.map((r) => r.id);
+    assert.ok(ids.includes("m1"), "real content should be found");
+    assert.ok(!ids.includes("m2"), "archive placeholder should be filtered");
+    assert.ok(!ids.includes("m3"), "externalized placeholder should be filtered");
+    assert.ok(!ids.includes("m4"), "retrieved-context marker should be filtered");
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("retention pruning skips pinned sessions and cleans orphan blobs", async () => {
   const workspace = makeWorkspace("lcm-retention");
   let store;
@@ -377,6 +452,31 @@ test("retention pruning skips pinned sessions and cleans orphan blobs", async ()
     assert.equal(stats.sessionCount, 1);
     assert.equal(stats.pinnedSessionCount, 1);
     assert.equal(stats.orphanArtifactBlobCount, 0);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("deferred init runs at startup and grep works without capture", async () => {
+  const workspace = makeWorkspace("lcm-deferred-init");
+  let store;
+
+  try {
+    // First session: capture data then close
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    await store.capture({ type: "session.created", properties: { sessionID: "s1", info: sessionInfo(workspace, "s1", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "s1", info: userInfo("s1", "m1", 2) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "s1", time: 2, part: { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "deferred init grep target content" } } });
+    store.close();
+
+    // Reopen and verify grep works BEFORE any new capture
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    const results = await store.grep({ query: "deferred init grep target", limit: 3 });
+    assert.equal(results.length, 1);
+    assert.equal(results[0].id, "m1");
   } finally {
     store?.close();
     rmSync(workspace, { recursive: true, force: true });
