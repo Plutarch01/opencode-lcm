@@ -43,7 +43,7 @@ function truncate(text: string, limit: number): string {
 }
 
 function shortNodeID(nodeID: string): string {
-  return nodeID.length <= 14 ? nodeID : nodeID.slice(0, 14);
+  return nodeID.length <= 32 ? nodeID : `${nodeID.slice(0, 20)}...${nodeID.slice(-8)}`;
 }
 
 export function resolveArchiveTransformWindow(
