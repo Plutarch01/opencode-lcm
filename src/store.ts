@@ -322,6 +322,21 @@ function tokenizeQuery(query: string): string[] {
   return [...new Set(query.toLowerCase().match(/[a-z0-9_]+/g) ?? [])];
 }
 
+/** FTS5 reserved words that would be interpreted as operators/syntax inside MATCH. */
+const FTS5_RESERVED = new Set([
+  "and", "or", "not", "near",
+  "order", "by", "asc", "desc",
+  "limit", "offset",
+  "match", "rank", "rowid", "bm25", "highlight", "snippet",
+  "replace", "delete", "insert", "update",
+  "select", "from", "where", "group", "having",
+]);
+
+/** Drop FTS5-reserved words and too-short tokens to keep MATCH queries safe. */
+function sanitizeFtsTokens(tokens: string[]): string[] {
+  return tokens.filter((t) => t.length >= 2 && !FTS5_RESERVED.has(t));
+}
+
 function isSyntheticLcmTextPart(part: Part, markers?: string[]): boolean {
   if (part.type !== "text") return false;
   const marker = part.metadata?.opencodeLcm;
@@ -787,6 +802,8 @@ export class SqliteLcmStore {
     db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)");
     await this.migrateLegacyArtifacts();
     this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
+    this.db = db;
+    this.completeDeferredInit();
   }
 
   private deferredInitCompleted = false;
@@ -831,8 +848,6 @@ export class SqliteLcmStore {
 
     if (!normalized.sessionID) return;
     if (!this.shouldPersistSessionForEvent(normalized.type)) return;
-
-    this.completeDeferredInit();
 
     const session = this.readSessionSync(normalized.sessionID, {
       artifactMessageIDs: this.captureArtifactHydrationMessageIDs(normalized),
@@ -1601,9 +1616,9 @@ export class SqliteLcmStore {
   private readScopedSessionsSync(sessionIDs?: string[]): NormalizedSession[] {
     if (!sessionIDs) return this.readAllSessionsSync();
     if (sessionIDs.length === 0) return [];
+    if (sessionIDs.length <= 1) return sessionIDs.map((id) => this.readSessionSync(id));
 
-    return sessionIDs
-      .map((sessionID) => this.readSessionSync(sessionID))
+    return this.readSessionsBatchSync(sessionIDs)
       .filter((session) => session.messages.length > 0 || session.eventCount > 0);
   }
 
@@ -3125,7 +3140,7 @@ export class SqliteLcmStore {
   }
 
   private buildFtsQuery(query: string): string | undefined {
-    const tokens = tokenizeQuery(query);
+    const tokens = sanitizeFtsTokens(tokenizeQuery(query));
     if (tokens.length === 0) return undefined;
     return tokens.map((token) => `${token}*`).join(" AND ");
   }
@@ -3651,7 +3666,168 @@ export class SqliteLcmStore {
     const rows = this.getDb()
       .prepare("SELECT session_id FROM sessions WHERE event_count > 0 OR updated_at > 0 ORDER BY updated_at DESC")
       .all() as Array<{ session_id: string }>;
-    return rows.map((row) => this.readSessionSync(row.session_id));
+    const sessionIDs = rows.map((row) => row.session_id);
+    if (sessionIDs.length <= 1) return sessionIDs.map((id) => this.readSessionSync(id));
+    return this.readSessionsBatchSync(sessionIDs);
+  }
+
+  private readSessionsBatchSync(sessionIDs: string[]): NormalizedSession[] {
+    const db = this.getDb();
+    const placeholders = sessionIDs.map(() => "?").join(", ");
+
+    // 1. Session headers (batch)
+    const sessionRows = db
+      .prepare(`SELECT * FROM sessions WHERE session_id IN (${placeholders})`)
+      .all(...sessionIDs) as SessionRow[];
+    const sessionMap = new Map<string, SessionRow>();
+    for (const row of sessionRows) sessionMap.set(row.session_id, row);
+
+    // 2. Messages (batch)
+    const messageRows = db
+      .prepare(`SELECT * FROM messages WHERE session_id IN (${placeholders}) ORDER BY session_id ASC, created_at ASC, message_id ASC`)
+      .all(...sessionIDs) as MessageRow[];
+
+    // 3. Parts (batch)
+    const partRows = db
+      .prepare(`SELECT * FROM parts WHERE session_id IN (${placeholders}) ORDER BY session_id ASC, message_id ASC, sort_key ASC, part_id ASC`)
+      .all(...sessionIDs) as PartRow[];
+
+    // 4. Artifacts (batch)
+    const artifactRows = db
+      .prepare(`SELECT * FROM artifacts WHERE session_id IN (${placeholders}) ORDER BY created_at ASC, artifact_id ASC`)
+      .all(...sessionIDs) as ArtifactRow[];
+
+    // 5. Artifact blobs (batch)
+    const contentHashes = [...new Set(artifactRows.map((r) => r.content_hash).filter(Boolean) as string[])];
+    const blobMap = new Map<string, ArtifactBlobRow>();
+    if (contentHashes.length > 0) {
+      const blobPlaceholders = contentHashes.map(() => "?").join(", ");
+      const blobRows = db
+        .prepare(`SELECT * FROM artifact_blobs WHERE content_hash IN (${blobPlaceholders})`)
+        .all(...contentHashes) as ArtifactBlobRow[];
+      for (const blob of blobRows) blobMap.set(blob.content_hash, blob);
+    }
+
+    // Group artifacts by part ID
+    const artifactsByPart = new Map<string, ArtifactData[]>();
+    for (const row of artifactRows) {
+      const contentHash = row.content_hash;
+      const blob = contentHash ? blobMap.get(contentHash) : undefined;
+      const contentText = blob?.content_text ?? row.content_text;
+      const artifact: ArtifactData = {
+        artifactID: row.artifact_id,
+        sessionID: row.session_id,
+        messageID: row.message_id,
+        partID: row.part_id,
+        artifactKind: row.artifact_kind,
+        fieldName: row.field_name,
+        previewText: row.preview_text,
+        contentText,
+        contentHash: contentHash ?? hashContent(contentText),
+        charCount: blob?.char_count ?? row.char_count,
+        createdAt: row.created_at,
+        metadata: parseJson<Record<string, unknown>>(row.metadata_json || "{}"),
+      };
+      const list = artifactsByPart.get(artifact.partID) ?? [];
+      list.push(artifact);
+      artifactsByPart.set(artifact.partID, list);
+    }
+
+    // Assemble parts per session+message
+    const partsBySessionMessage = new Map<string, Map<string, Part[]>>();
+    for (const partRow of partRows) {
+      const messageKey = `${partRow.session_id}|${partRow.message_id}`;
+      let partsByMessage = partsBySessionMessage.get(partRow.session_id);
+      if (!partsByMessage) {
+        partsByMessage = new Map();
+        partsBySessionMessage.set(partRow.session_id, partsByMessage);
+      }
+      const part = parseJson<Part>(partRow.part_json);
+      const artifacts = artifactsByPart.get(part.id) ?? [];
+      for (const artifact of artifacts) {
+        switch (part.type) {
+          case "text":
+          case "reasoning":
+            if (artifact.fieldName === "text") part.text = artifact.contentText;
+            break;
+          case "tool":
+            if (part.state.status === "completed" && artifact.fieldName === "output") part.state.output = artifact.contentText;
+            if (part.state.status === "error" && artifact.fieldName === "error") part.state.error = artifact.contentText;
+            if (part.state.status === "completed" && artifact.fieldName.startsWith("attachment_text:")) {
+              const index = Number(artifact.fieldName.split(":")[1]);
+              const attachment = part.state.attachments?.[index];
+              if (attachment?.source?.text) {
+                attachment.source.text.value = artifact.contentText;
+                attachment.source.text.start = 0;
+                attachment.source.text.end = artifact.contentText.length;
+              }
+            }
+            break;
+          case "file":
+            if (artifact.fieldName === "source" && part.source?.text) {
+              part.source.text.value = artifact.contentText;
+              part.source.text.start = 0;
+              part.source.text.end = artifact.contentText.length;
+            }
+            break;
+          case "snapshot":
+            if (artifact.fieldName === "snapshot") part.snapshot = artifact.contentText;
+            break;
+          case "agent":
+            if (artifact.fieldName === "source" && part.source) {
+              part.source.value = artifact.contentText;
+              part.source.start = 0;
+              part.source.end = artifact.contentText.length;
+            }
+            break;
+          case "subtask":
+            if (artifact.fieldName === "prompt") part.prompt = artifact.contentText;
+            if (artifact.fieldName === "description") part.description = artifact.contentText;
+            break;
+          default:
+            break;
+        }
+      }
+      const parts = partsByMessage.get(partRow.message_id) ?? [];
+      parts.push(part);
+      partsByMessage.set(partRow.message_id, parts);
+    }
+
+    // Group messages per session
+    const messagesBySession = new Map<string, Array<{ info: Message; parts: Part[] }>>();
+    for (const messageRow of messageRows) {
+      const sessionParts = partsBySessionMessage.get(messageRow.session_id);
+      const messages = messagesBySession.get(messageRow.session_id) ?? [];
+      messages.push({
+        info: parseJson<Message>(messageRow.info_json),
+        parts: sessionParts?.get(messageRow.message_id) ?? [],
+      });
+      messagesBySession.set(messageRow.session_id, messages);
+    }
+
+    // Build NormalizedSession results
+    return sessionIDs.map((sessionID) => {
+      const row = sessionMap.get(sessionID);
+      const messages = messagesBySession.get(sessionID) ?? [];
+      if (!row) {
+        return { sessionID, updatedAt: 0, eventCount: 0, messages };
+      }
+      return {
+        sessionID: row.session_id,
+        title: row.title ?? undefined,
+        directory: row.session_directory ?? undefined,
+        parentSessionID: row.parent_session_id ?? undefined,
+        rootSessionID: row.root_session_id ?? undefined,
+        lineageDepth: row.lineage_depth ?? undefined,
+        pinned: Boolean(row.pinned),
+        pinReason: row.pin_reason ?? undefined,
+        updatedAt: row.updated_at,
+        compactedAt: row.compacted_at ?? undefined,
+        deleted: Boolean(row.deleted),
+        eventCount: row.event_count,
+        messages,
+      };
+    });
   }
 
   private readSessionSync(sessionID: string, options?: ReadSessionOptions): NormalizedSession {
