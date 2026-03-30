@@ -828,6 +828,9 @@ export class SqliteLcmStore {
     if (this.deferredInitCompleted) return;
     this.backfillArtifactBlobsSync();
     this.deleteOrphanArtifactBlobsSync();
+    if (this.options.retention.staleSessionDays !== undefined || this.options.retention.deletedSessionDays !== undefined || this.options.retention.orphanBlobDays !== undefined) {
+      this.applyRetentionPruneSync({ apply: true });
+    }
     this.refreshAllLineageSync();
     this.syncAllDerivedSessionStateSync(true);
     this.rebuildSearchIndexesSync();
@@ -1408,6 +1411,59 @@ export class SqliteLcmStore {
     return Date.now() - days * 24 * 60 * 60 * 1000;
   }
 
+  private applyRetentionPruneSync(input?: {
+    staleSessionDays?: number;
+    deletedSessionDays?: number;
+    orphanBlobDays?: number;
+    apply?: boolean;
+  }): { deletedSessions: number; deletedBlobs: number; deletedBlobChars: number } {
+    const policy = this.resolveRetentionPolicy(input);
+
+    if (input?.apply === false) {
+      return { deletedSessions: 0, deletedBlobs: 0, deletedBlobChars: 0 };
+    }
+
+    const staleSessions = policy.staleSessionDays === undefined ? [] : this.readSessionRetentionCandidates(false, policy.staleSessionDays);
+    const deletedSessions = policy.deletedSessionDays === undefined ? [] : this.readSessionRetentionCandidates(true, policy.deletedSessionDays);
+    const combinedSessions = [...staleSessions, ...deletedSessions];
+    const uniqueSessionIDs = [...new Set(combinedSessions.map((row) => row.session_id))];
+    const initialOrphanBlobs = policy.orphanBlobDays === undefined ? [] : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+
+    if (uniqueSessionIDs.length === 0 && initialOrphanBlobs.length === 0) {
+      return { deletedSessions: 0, deletedBlobs: 0, deletedBlobChars: 0 };
+    }
+
+    const db = this.getDb();
+    let deletedBlobs: RetentionBlobCandidate[] = [];
+    db.exec("BEGIN");
+    try {
+      for (const sessionID of uniqueSessionIDs) {
+        this.clearSessionDataSync(sessionID);
+      }
+
+      deletedBlobs = policy.orphanBlobDays === undefined ? [] : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+      if (deletedBlobs.length > 0) {
+        const deleteBlob = db.prepare("DELETE FROM artifact_blobs WHERE content_hash = ?");
+        for (const blob of deletedBlobs) deleteBlob.run(blob.content_hash);
+      }
+
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+
+    this.refreshAllLineageSync();
+    this.syncAllDerivedSessionStateSync(true);
+    this.rebuildSearchIndexesSync();
+
+    return {
+      deletedSessions: uniqueSessionIDs.length,
+      deletedBlobs: deletedBlobs.length,
+      deletedBlobChars: deletedBlobs.reduce((sum, row) => sum + row.char_count, 0),
+    };
+  }
+
   private formatRetentionSessionCandidate(row: RetentionSessionCandidate): string {
     const title = row.title ?? "Untitled session";
     const worktree = normalizeWorktreeKey(row.session_directory ?? undefined) ?? "unknown";
@@ -1965,7 +2021,6 @@ export class SqliteLcmStore {
     const staleSessions = policy.staleSessionDays === undefined ? [] : this.readSessionRetentionCandidates(false, policy.staleSessionDays);
     const deletedSessions = policy.deletedSessionDays === undefined ? [] : this.readSessionRetentionCandidates(true, policy.deletedSessionDays);
     const combinedSessions = [...staleSessions, ...deletedSessions];
-    const uniqueSessionIDs = [...new Set(combinedSessions.map((row) => row.session_id))];
     const initialOrphanBlobs = policy.orphanBlobDays === undefined ? [] : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
 
     if (!apply) {
@@ -1984,41 +2039,32 @@ export class SqliteLcmStore {
       ].join("\n");
     }
 
-    const db = this.getDb();
-    let deletedBlobs: RetentionBlobCandidate[] = [];
-    db.exec("BEGIN");
-    try {
-      for (const sessionID of uniqueSessionIDs) {
-        this.clearSessionDataSync(sessionID);
-      }
+    const result = this.applyRetentionPruneSync({ ...input, apply: true });
 
-      deletedBlobs = policy.orphanBlobDays === undefined ? [] : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
-      if (deletedBlobs.length > 0) {
-        const deleteBlob = db.prepare("DELETE FROM artifact_blobs WHERE content_hash = ?");
-        for (const blob of deletedBlobs) deleteBlob.run(blob.content_hash);
-      }
-
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
+    let combinedPreview: string[] = [];
+    if (combinedSessions.length > 0) {
+      combinedPreview = ["deleted_sessions_preview:", ...combinedSessions.slice(0, limit).map((row) => this.formatRetentionSessionCandidate(row))];
+    } else {
+      combinedPreview = ["deleted_sessions_preview:", "- none"];
     }
 
-    this.refreshAllLineageSync();
-    this.syncAllDerivedSessionStateSync(true);
-    this.rebuildSearchIndexesSync();
+    let deletedBlobPreview: string[] = [];
+    if (initialOrphanBlobs.length > 0) {
+      deletedBlobPreview = [
+        "deleted_blobs_preview:",
+        ...initialOrphanBlobs.slice(0, limit).map((row) => `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`),
+      ];
+    } else {
+      deletedBlobPreview = ["deleted_blobs_preview:", "- none"];
+    }
 
     return [
-      `deleted_sessions=${uniqueSessionIDs.length}`,
-      `deleted_blobs=${deletedBlobs.length}`,
-      `deleted_blob_chars=${deletedBlobs.reduce((sum, row) => sum + row.char_count, 0)}`,
+      `deleted_sessions=${result.deletedSessions}`,
+      `deleted_blobs=${result.deletedBlobs}`,
+      `deleted_blob_chars=${result.deletedBlobChars}`,
       "status=applied",
-      ...(combinedSessions.length > 0
-        ? ["deleted_sessions_preview:", ...combinedSessions.slice(0, limit).map((row) => this.formatRetentionSessionCandidate(row))]
-        : ["deleted_sessions_preview:", "- none"]),
-      ...(deletedBlobs.length > 0
-        ? ["deleted_blobs_preview:", ...deletedBlobs.slice(0, limit).map((row) => `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`)]
-        : ["deleted_blobs_preview:", "- none"]),
+      ...combinedPreview,
+      ...deletedBlobPreview,
     ].join("\n");
   }
 
@@ -3634,6 +3680,7 @@ export class SqliteLcmStore {
     db.prepare("DELETE FROM resumes WHERE session_id = ?").run(sessionID);
     db.prepare("DELETE FROM parts WHERE session_id = ?").run(sessionID);
     db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionID);
+    db.prepare("DELETE FROM events WHERE session_id = ?").run(sessionID);
     db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionID);
   }
 
