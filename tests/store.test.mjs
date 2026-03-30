@@ -447,6 +447,7 @@ test("retention pruning skips pinned sessions and cleans orphan blobs", async ()
 
     const applied = await store.retentionPrune({ staleSessionDays: 0, orphanBlobDays: 0, apply: true });
     assert.match(applied, /deleted_sessions=1/);
+    assert.match(applied, /deleted_blobs_preview:/);
 
     const stats = await store.stats();
     assert.equal(stats.sessionCount, 1);
@@ -477,6 +478,40 @@ test("deferred init runs at startup and grep works without capture", async () =>
     const results = await store.grep({ query: "deferred init grep target", limit: 3 });
     assert.equal(results.length, 1);
     assert.equal(results[0].id, "m1");
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("deferred init applies retention pruning at startup", async () => {
+  const workspace = makeWorkspace("lcm-deferred-retention");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ retention: { staleSessionDays: 0, deletedSessionDays: undefined, orphanBlobDays: undefined } }),
+    );
+    await store.init();
+    await store.capture({ type: "session.created", properties: { sessionID: "drop", info: sessionInfo(workspace, "drop", 1) } });
+    await store.capture({ type: "message.updated", properties: { sessionID: "drop", info: userInfo("drop", "m1", 2) } });
+    await store.capture({ type: "message.part.updated", properties: { sessionID: "drop", time: 2, part: { id: "p1", sessionID: "drop", messageID: "m1", type: "text", text: "prune me on startup" } } });
+    const before = await store.stats();
+    assert.equal(before.sessionCount, 1);
+    assert.equal(before.totalEvents, 3);
+
+    store.close();
+
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ retention: { staleSessionDays: 0, deletedSessionDays: undefined, orphanBlobDays: undefined } }),
+    );
+    await store.init();
+
+    const stats = await store.stats();
+    assert.equal(stats.sessionCount, 0);
+    assert.equal(stats.totalEvents, 0);
   } finally {
     store?.close();
     rmSync(workspace, { recursive: true, force: true });
