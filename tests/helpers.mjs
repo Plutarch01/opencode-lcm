@@ -263,5 +263,5 @@ export function makeToolContext(directory, sessionID = "root") {
 }
 
 export function firstNodeID(text) {
-  return text.match(/sum_[a-f0-9]{12}/)?.[0];
+  return text.match(/sum_[a-f0-9]{12}_l\d+_p\d+/)?.[0];
 }

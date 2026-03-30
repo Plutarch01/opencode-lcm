@@ -1110,6 +1110,136 @@ test("summary rebuilds when archived content changes and expand can target raw m
   }
 });
 
+test("summary node IDs remain expandable after the archive grows and roots change", async () => {
+  const workspace = makeWorkspace("lcm-summary-stable-node-id");
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 4,
+        automaticRetrieval: { enabled: false },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, "s1", 1);
+
+    for (const [messageID, created, role, text] of [
+      ["m1", 2, "user", "archived note one"],
+      ["m2", 3, "assistant", "archived note two"],
+      ["m3", 4, "user", "archived note three"],
+      ["m4", 5, "assistant", "archived note four"],
+      ["m5", 6, "user", "archived note five"],
+      ["m6", 7, "assistant", "archived note six"],
+      ["m7", 8, "user", "fresh tail request"],
+    ]) {
+      await captureMessage(store, {
+        sessionID: "s1",
+        messageID,
+        created,
+        role,
+        parts: [textPart("s1", messageID, `${messageID}-p`, text)],
+      });
+    }
+
+    const initialResume = await store.buildCompactionContext("s1");
+    const stableNodeID = firstNodeID(initialResume);
+
+    assert.ok(stableNodeID);
+    assert.match(stableNodeID, /^sum_[a-f0-9]{12}_l0_p0$/);
+
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m8",
+      created: 9,
+      role: "assistant",
+      parts: [textPart("s1", "m8", "m8-p", "newest tail response")],
+    });
+    await captureMessage(store, {
+      sessionID: "s1",
+      messageID: "m9",
+      created: 10,
+      role: "user",
+      parts: [textPart("s1", "m9", "m9-p", "follow-up user request")],
+    });
+
+    const rootsAfterGrowth = await store.expand({ sessionID: "s1" });
+    const expandedOldNode = await store.expand({ nodeID: stableNodeID, includeRaw: true });
+
+    assert.match(rootsAfterGrowth, /sum_[a-f0-9]{12}_l1_p0/);
+    assert.doesNotMatch(expandedOldNode, /Unknown summary node/);
+    assert.match(expandedOldNode, /Node: sum_[a-f0-9]{12}_l0_p0/);
+    assert.match(expandedOldNode, /archived note one/);
+    assert.match(expandedOldNode, /archived note six/);
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
+test("resume refreshes managed notes instead of reusing stale stored node IDs", async () => {
+  const workspace = makeWorkspace("lcm-resume-refresh-managed");
+  let store;
+  let db;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 4,
+        automaticRetrieval: { enabled: false },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, "s1", 1);
+
+    for (const [messageID, created, text] of [
+      ["m1", 2, "resume archived one"],
+      ["m2", 3, "resume archived two"],
+      ["m3", 4, "resume archived three"],
+      ["m4", 5, "resume fresh tail"],
+    ]) {
+      await captureMessage(store, {
+        sessionID: "s1",
+        messageID,
+        created,
+        parts: [textPart("s1", messageID, `${messageID}-p`, text)],
+      });
+    }
+
+    await store.buildCompactionContext("s1");
+
+    db = new DatabaseSync(path.join(workspace, ".lcm", "lcm.db"), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.prepare("UPDATE resumes SET note = ? WHERE session_id = ?").run(
+      [
+        "LCM prototype resume note",
+        "Session: s1",
+        "Summary roots:",
+        "- sum_deadbeefcafe_l9_p9: stale managed resume id",
+      ].join("\n"),
+      "s1",
+    );
+    db.close();
+    db = undefined;
+
+    const refreshed = await store.resume("s1");
+
+    assert.doesNotMatch(refreshed, /sum_deadbeefcafe_l9_p9/);
+    assert.match(refreshed, /sum_[a-f0-9]{12}_l0_p0/);
+    assert.match(refreshed, /resume archived one/);
+  } finally {
+    db?.close();
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
 test("stale cached summary nodes are detected and rebuilt before reuse", async () => {
   const workspace = makeWorkspace("lcm-summary-stale-cache");
   let store;

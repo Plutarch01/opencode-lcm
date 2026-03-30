@@ -295,7 +295,11 @@ function compareMessages(a: ConversationMessage, b: ConversationMessage): number
 }
 
 function shortNodeID(nodeID: string): string {
-  return nodeID.length <= 14 ? nodeID : nodeID.slice(0, 14);
+  return nodeID.length <= 32 ? nodeID : `${nodeID.slice(0, 20)}...${nodeID.slice(-8)}`;
+}
+
+function buildSummaryNodeID(sessionID: string, level: number, slot: number): string {
+  return `sum_${hashContent(`summary:${sessionID}`).slice(0, 12)}_l${level}_p${slot}`;
 }
 
 function parseJson<T>(value: string): T {
@@ -1980,10 +1984,10 @@ export class SqliteLcmStore {
     if (!resolvedSessionID) return "No stored resume snapshots yet.";
 
     const existing = this.getResumeSync(resolvedSessionID);
-    if (existing) return existing;
+    if (existing && !this.isManagedResumeNote(existing)) return existing;
 
     const generated = await this.buildCompactionContext(resolvedSessionID);
-    return generated ?? "No stored resume snapshot for that session.";
+    return generated ?? existing ?? "No stored resume snapshot for that session.";
   }
 
   async expand(input: {
@@ -2558,8 +2562,9 @@ export class SqliteLcmStore {
     const expectedMessageIDs = archivedMessages.map((message) => message.info.id);
     const seen = new Set<string>();
 
-    const validateNode = (node: SummaryNodeData): boolean => {
+    const validateNode = (node: SummaryNodeData, expectedSlot: number): boolean => {
       if (node.sessionID !== sessionID) return false;
+      if (node.nodeID !== buildSummaryNodeID(sessionID, node.level, expectedSlot)) return false;
       if (seen.has(node.nodeID)) return false;
       seen.add(node.nodeID);
 
@@ -2585,10 +2590,10 @@ export class SqliteLcmStore {
       if (children.at(-1)?.endIndex !== node.endIndex) return false;
 
       let nextStartIndex = node.startIndex;
-      for (const child of children) {
+      for (const [childPosition, child] of children.entries()) {
         if (child.level !== node.level - 1) return false;
         if (child.startIndex !== nextStartIndex) return false;
-        if (!validateNode(child)) return false;
+        if (!validateNode(child, expectedSlot * SUMMARY_BRANCH_FACTOR + childPosition)) return false;
         nextStartIndex = child.endIndex + 1;
       }
 
@@ -2596,9 +2601,9 @@ export class SqliteLcmStore {
     };
 
     let nextStartIndex = 0;
-    for (const root of roots) {
+    for (const [rootSlot, root] of roots.entries()) {
       if (root.startIndex !== nextStartIndex) return false;
-      if (!validateNode(root)) return false;
+      if (!validateNode(root, rootSlot)) return false;
       nextStartIndex = root.endIndex + 1;
     }
 
@@ -2622,8 +2627,9 @@ export class SqliteLcmStore {
       messageIDs: string[];
       summaryText: string;
       level: number;
+      slot: number;
     }): SummaryNodeData => ({
-      nodeID: `sum_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
+      nodeID: buildSummaryNodeID(sessionID, input.level, input.slot),
       sessionID,
       level: input.level,
       nodeKind: input.nodeKind,
@@ -2635,7 +2641,7 @@ export class SqliteLcmStore {
     });
 
     let currentLevel: SummaryNodeData[] = [];
-    for (let start = 0; start < archivedMessages.length; start += SUMMARY_LEAF_MESSAGES) {
+    for (let start = 0, slot = 0; start < archivedMessages.length; start += SUMMARY_LEAF_MESSAGES, slot += 1) {
       const chunk = archivedMessages.slice(start, start + SUMMARY_LEAF_MESSAGES);
       const node = makeNode({
         nodeKind: "leaf",
@@ -2644,6 +2650,7 @@ export class SqliteLcmStore {
         messageIDs: chunk.map((message) => message.info.id),
         summaryText: this.summarizeMessages(chunk),
         level,
+        slot,
       });
       nodes.push(node);
       currentLevel.push(node);
@@ -2665,6 +2672,7 @@ export class SqliteLcmStore {
           messageIDs: covered.map((message) => message.info.id),
           summaryText: this.summarizeMessages(covered),
           level,
+          slot: nextLevel.length,
         });
         nodes.push(node);
         nextLevel.push(node);
