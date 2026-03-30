@@ -1,4 +1,4 @@
-import path from "node:path";
+import path from 'node:path';
 
 export function resolveWorkspacePath(workspaceDirectory: string, inputPath: string): string {
   if (path.isAbsolute(inputPath)) {
@@ -9,7 +9,7 @@ export function resolveWorkspacePath(workspaceDirectory: string, inputPath: stri
   const resolvedPath = path.resolve(workspaceRoot, inputPath);
   const relativePath = path.relative(workspaceRoot, resolvedPath);
 
-  if (relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))) {
+  if (relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))) {
     return resolvedPath;
   }
 

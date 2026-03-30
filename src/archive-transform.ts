@@ -1,7 +1,7 @@
-import type { ConversationMessage, SearchResult } from "./types.js";
+import type { ConversationMessage, SearchResult } from './types.js';
 
 export type AutomaticRetrievalHit = {
-  kind: "message" | "summary" | "artifact";
+  kind: 'message' | 'summary' | 'artifact';
   id: string;
   label: string;
   sessionID?: string;
@@ -43,7 +43,7 @@ function truncate(text: string, limit: number): string {
 }
 
 function shortNodeID(nodeID: string): string {
-  return nodeID.length <= 14 ? nodeID : nodeID.slice(0, 14);
+  return nodeID.length <= 32 ? nodeID : `${nodeID.slice(0, 20)}...${nodeID.slice(-8)}`;
 }
 
 export function resolveArchiveTransformWindow(
@@ -52,7 +52,7 @@ export function resolveArchiveTransformWindow(
 ): ArchiveTransformWindow | undefined {
   let latestUserIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.info.role === "user") {
+    if (messages[index]?.info.role === 'user') {
       latestUserIndex = index;
       break;
     }
@@ -86,7 +86,12 @@ export function selectAutomaticRetrievalHits(input: {
   const hits: AutomaticRetrievalHit[] = [];
 
   for (const result of input.results) {
-    const kind = result.type === "summary" ? "summary" : result.type.startsWith("artifact:") ? "artifact" : "message";
+    const kind =
+      result.type === 'summary'
+        ? 'summary'
+        : result.type.startsWith('artifact:')
+          ? 'artifact'
+          : 'message';
     if (quotas[kind] <= 0) continue;
     if (input.isFreshResult(result, freshMessageIDs)) continue;
 
@@ -114,47 +119,54 @@ export function renderAutomaticRetrievalContext(
   maxChars: number,
   telemetry?: AutomaticRetrievalTelemetry,
 ): string {
-  const scopeLabel = Array.isArray(scopes) ? scopes.join(" -> ") : scopes;
+  const scopeLabel = Array.isArray(scopes) ? scopes.join(' -> ') : scopes;
   const selectedByKind = {
-    message: hits.filter((hit) => hit.kind === "message").length,
-    summary: hits.filter((hit) => hit.kind === "summary").length,
-    artifact: hits.filter((hit) => hit.kind === "artifact").length,
+    message: hits.filter((hit) => hit.kind === 'message').length,
+    summary: hits.filter((hit) => hit.kind === 'summary').length,
+    artifact: hits.filter((hit) => hit.kind === 'artifact').length,
   };
   const lines = [
-    "<system-reminder>",
+    '<system-reminder>',
     `opencode-lcm automatically recalled ${hits.length} archived context hit(s) relevant to the current turn (scope=${scopeLabel}).`,
     ...(telemetry
       ? [
-          `Recall telemetry: queries=${telemetry.queries.join(" | ")}`,
+          `Recall telemetry: queries=${telemetry.queries.join(' | ')}`,
           `Recall telemetry: raw_results=${telemetry.rawResults} selected_hits=${hits.length} message_hits=${selectedByKind.message} summary_hits=${selectedByKind.summary} artifact_hits=${selectedByKind.artifact}`,
           `Recall telemetry: stop_reason=${telemetry.stopReason}`,
           `Recall telemetry: scope_stats=${telemetry.scopeStats
-            .map((stat) => `${stat.scope}:hits=${stat.selectedHits},raw=${stat.rawResults},budget=${stat.budget}`)
-            .join(" | ")}`,
+            .map(
+              (stat) =>
+                `${stat.scope}:hits=${stat.selectedHits},raw=${stat.rawResults},budget=${stat.budget}`,
+            )
+            .join(' | ')}`,
         ]
       : []),
-    "Recalled context:",
+    'Recalled context:',
     ...hits.map((hit) => {
-      const session = hit.sessionID ? ` session=${hit.sessionID}` : "";
-      const id = hit.kind === "summary" ? shortNodeID(hit.id) : hit.id;
+      const session = hit.sessionID ? ` session=${hit.sessionID}` : '';
+      const id = hit.kind === 'summary' ? shortNodeID(hit.id) : hit.id;
       return `- ${hit.kind}${session} id=${id} (${hit.label}): ${truncate(hit.snippet, 220)}`;
     }),
-    "Treat recalled archive as supporting context and prefer the currently visible conversation if details conflict.",
-    "</system-reminder>",
+    'Treat recalled archive as supporting context and prefer the currently visible conversation if details conflict.',
+    '</system-reminder>',
   ];
 
-  return truncate(lines.join("\n"), maxChars);
+  return truncate(lines.join('\n'), maxChars);
 }
 
-export function buildActiveSummaryText(roots: ArchiveSummaryRoot[], archivedCount: number, maxChars: number): string {
+export function buildActiveSummaryText(
+  roots: ArchiveSummaryRoot[],
+  archivedCount: number,
+  maxChars: number,
+): string {
   const lines = [
-    "<system-reminder>",
+    '<system-reminder>',
     `opencode-lcm compacted ${archivedCount} older conversation turns into ${roots.length} archived summary node(s).`,
-    "Archived roots:",
+    'Archived roots:',
     ...roots.map((node) => `- ${node.nodeID}: ${truncate(node.summaryText, 180)}`),
-    "Use lcm_expand with a node ID if older details become relevant, then lcm_artifact for externalized payloads.",
-    "</system-reminder>",
+    'Use lcm_expand with a node ID if older details become relevant, then lcm_artifact for externalized payloads.',
+    '</system-reminder>',
   ];
 
-  return truncate(lines.join("\n"), maxChars);
+  return truncate(lines.join('\n'), maxChars);
 }
