@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -53,6 +53,49 @@ function summarizeFailure(result) {
   return stdoutLine || stderrLine || result.error?.message || "no output";
 }
 
+function readTraceEntries(tracePath) {
+  if (!existsSync(tracePath)) return [];
+  return readFileSync(tracePath, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function cleanupProjectDir(projectDir, keep) {
+  if (!keep) rmSync(projectDir, { recursive: true, force: true });
+}
+
+function validateResults(results) {
+  const errors = [];
+
+  for (const result of results) {
+    const mode = result.enabled ? "automatic retrieval ON" : "automatic retrieval OFF";
+    if (!result.ok) {
+      errors.push(`${mode}: ${result.reason}`);
+      continue;
+    }
+    if (!result.pluginLoaded) errors.push(`${mode}: plugin did not emit an init trace`);
+    if (!result.toolKeys.includes("lcm_status")) errors.push(`${mode}: plugin tools did not include lcm_status`);
+    if (result.transformCount === 0) errors.push(`${mode}: message transform hook never ran`);
+  }
+
+  const enabledResult = results.find((result) => result.enabled && result.ok);
+  const disabledResult = results.find((result) => !result.enabled && result.ok);
+  if (enabledResult) {
+    if (!enabledResult.markers.includes("retrieved-context")) {
+      errors.push("automatic retrieval ON: missing retrieved-context marker");
+    }
+    if (!enabledResult.retrievedContext?.includes("ZX-729-ALBATROSS")) {
+      errors.push("automatic retrieval ON: retrieved context did not contain the expected marker");
+    }
+  }
+  if (disabledResult?.markers.includes("retrieved-context")) {
+    errors.push("automatic retrieval OFF: unexpectedly injected retrieved-context");
+  }
+
+  return errors;
+}
+
 function runScenario(enabled) {
   const projectDir = mkdtempSync(path.join(tmpdir(), enabled ? "lcm-dogfood-on-" : "lcm-dogfood-off-"));
   const pluginDir = path.join(projectDir, ".opencode", "plugins");
@@ -62,6 +105,7 @@ function runScenario(enabled) {
   const pluginSource = [
     `import { appendFileSync } from "node:fs";`,
     `import OpencodeLcmPlugin from ${JSON.stringify(distUrl)};`,
+    `const record = (entry) => appendFileSync(${JSON.stringify(tracePath)}, JSON.stringify(entry) + "\\n");`,
     `export const DogfoodPlugin = async (ctx) => {`,
     `  const hooks = await OpencodeLcmPlugin(ctx, {`,
     `    freshTailMessages: 1,`,
@@ -76,6 +120,7 @@ function runScenario(enabled) {
     `      maxArtifactHits: 0,`,
     `    },`,
     `  });`,
+    `  record({ type: "plugin-init", toolKeys: Object.keys(hooks.tool ?? {}).sort() });`,
     `  const original = hooks["experimental.chat.messages.transform"];`,
     `  return {`,
     `    ...hooks,`,
@@ -86,7 +131,7 @@ function runScenario(enabled) {
     `          .filter((part) => part.type === "text" && part.metadata && part.metadata.opencodeLcm)`,
     `          .map((part) => ({ marker: part.metadata.opencodeLcm, text: part.text })),`,
     `      );`,
-    `      appendFileSync(${JSON.stringify(tracePath)}, JSON.stringify({ count: output.messages.length, synthetic }) + "\\n");`,
+    `      record({ type: "message-transform", count: output.messages.length, synthetic });`,
     `    },`,
     `  };`,
     `};`,
@@ -139,20 +184,27 @@ function runScenario(enabled) {
     };
   }
 
-  const traceLines = existsSync(tracePath) ? readFileSync(tracePath, "utf8").split(/\r?\n/).filter(Boolean) : [];
-  const lastTrace = traceLines.length > 0 ? JSON.parse(traceLines.at(-1)) : { synthetic: [] };
+  const traceEntries = readTraceEntries(tracePath);
+  const pluginInit = traceEntries.find((entry) => entry.type === "plugin-init");
+  const transforms = traceEntries.filter((entry) => entry.type === "message-transform");
+  const lastTrace = transforms.at(-1) ?? { synthetic: [] };
 
   return {
     enabled,
     ok: true,
     projectDir,
     answer: extractText(second.stdout ?? ""),
+    pluginLoaded: Boolean(pluginInit),
+    toolKeys: pluginInit?.toolKeys ?? [],
+    transformCount: transforms.length,
     markers: lastTrace.synthetic.map((entry) => entry.marker),
     retrievedContext: lastTrace.synthetic.find((entry) => entry.marker === "retrieved-context")?.text,
   };
 }
 
 const results = [runScenario(false), runScenario(true)];
+const keepProjects = process.env.OPENCODE_LCM_DOGFOOD_KEEP === "1";
+const validationErrors = validateResults(results);
 
 console.log(`Model: ${model}`);
 for (const result of results) {
@@ -166,6 +218,9 @@ for (const result of results) {
 
   console.log(`${mode}:`);
   console.log(`- answer: ${result.answer || "(empty)"}`);
+  console.log(`- plugin loaded: ${result.pluginLoaded}`);
+  console.log(`- transform count: ${result.transformCount}`);
+  console.log(`- tool keys include lcm_status: ${result.toolKeys.includes("lcm_status")}`);
   console.log(`- markers: ${result.markers.join(", ") || "none"}`);
   if (result.retrievedContext) {
     console.log(`- retrieved context: ${result.retrievedContext.split("\n")[0]}`);
@@ -178,4 +233,16 @@ if (enabledResult && disabledResult) {
   const enabledHit = enabledResult.markers.includes("retrieved-context");
   const disabledHit = disabledResult.markers.includes("retrieved-context");
   console.log(`Verdict: enabled_hit=${enabledHit} disabled_hit=${disabledHit}`);
+}
+
+if (validationErrors.length > 0) {
+  console.log("Smoke test FAILED:");
+  for (const error of validationErrors) console.log(`- ${error}`);
+  process.exit(1);
+}
+
+console.log("Smoke test passed.");
+for (const result of results) {
+  if (!result.ok || keepProjects) continue;
+  cleanupProjectDir(result.projectDir, keepProjects);
 }

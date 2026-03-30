@@ -1,9 +1,9 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import test from 'node:test';
 
-import { SqliteLcmStore } from "../dist/store.js";
+import { SqliteLcmStore } from '../dist/store.js';
 
 import {
   captureMessage,
@@ -12,10 +12,10 @@ import {
   makeOptions,
   makeWorkspace,
   textPart,
-} from "./helpers.mjs";
+} from './helpers.mjs';
 
-test("doctor reports and repairs summary drift, FTS drift, and orphan blobs", async () => {
-  const workspace = makeWorkspace("lcm-doctor");
+test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', async () => {
+  const workspace = makeWorkspace('lcm-doctor');
   let store;
 
   try {
@@ -27,33 +27,33 @@ test("doctor reports and repairs summary drift, FTS drift, and orphan blobs", as
 
     store = new SqliteLcmStore(workspace, options);
     await store.init();
-    await createSession(store, workspace, "s1", 1);
+    await createSession(store, workspace, 's1', 1);
 
     for (const [messageID, created, text] of [
-      ["m1", 2, "alpha archived note"],
-      ["m2", 3, "large blob repeated ".repeat(8)],
-      ["m3", 4, "bridge archived note"],
-      ["m4", 5, "fresh tail request"],
+      ['m1', 2, 'alpha archived note'],
+      ['m2', 3, 'large blob repeated '.repeat(8)],
+      ['m3', 4, 'bridge archived note'],
+      ['m4', 5, 'fresh tail request'],
     ]) {
       await captureMessage(store, {
-        sessionID: "s1",
+        sessionID: 's1',
         messageID,
         created,
-        parts: [textPart("s1", messageID, `${messageID}-p`, text)],
+        parts: [textPart('s1', messageID, `${messageID}-p`, text)],
       });
     }
 
-    await store.buildCompactionContext("s1");
+    await store.buildCompactionContext('s1');
     await store.capture({
-      type: "message.part.updated",
+      type: 'message.part.updated',
       properties: {
-        sessionID: "s1",
+        sessionID: 's1',
         time: 6,
-        part: textPart("s1", "m2", "m2-p", "short replacement"),
+        part: textPart('s1', 'm2', 'm2-p', 'short replacement'),
       },
     });
 
-    const healthyBeforeCorruption = await store.doctor({ sessionID: "s1" });
+    const healthyBeforeCorruption = await store.doctor({ sessionID: 's1' });
     const preCorruptionStats = await store.stats();
 
     assert.match(healthyBeforeCorruption, /status=clean/);
@@ -64,7 +64,7 @@ test("doctor reports and repairs summary drift, FTS drift, and orphan blobs", as
     store = new SqliteLcmStore(workspace, options);
     await store.init();
 
-    const driftDb = new DatabaseSync(path.join(workspace, ".lcm", "lcm.db"), {
+    const driftDb = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
       enableForeignKeyConstraints: false,
       timeout: 5000,
     });
@@ -75,7 +75,7 @@ test("doctor reports and repairs summary drift, FTS drift, and orphan blobs", as
     );
     driftDb.close();
 
-    const dryRun = await store.doctor({ sessionID: "s1" });
+    const dryRun = await store.doctor({ sessionID: 's1' });
 
     assert.match(dryRun, /status=issues-found/);
     assert.match(dryRun, /summary_sessions_needing_rebuild=1/);
@@ -83,15 +83,15 @@ test("doctor reports and repairs summary drift, FTS drift, and orphan blobs", as
     assert.match(dryRun, /summary_fts_delta=-1/);
     assert.match(dryRun, /orphan_artifact_blobs=1/);
 
-    const repaired = await store.doctor({ sessionID: "s1", apply: true });
-    const clean = await store.doctor({ sessionID: "s1" });
-    const grep = await store.grep({ query: "alpha archived note", sessionID: "s1", limit: 3 });
+    const repaired = await store.doctor({ sessionID: 's1', apply: true });
+    const clean = await store.doctor({ sessionID: 's1' });
+    const grep = await store.grep({ query: 'alpha archived note', sessionID: 's1', limit: 3 });
 
     assert.match(repaired, /status=repaired/);
     assert.match(repaired, /applied_actions:/);
     assert.match(clean, /status=clean/);
     assert.match(clean, /issues=0/);
-    assert.equal(grep[0]?.id, "m1");
+    assert.equal(grep[0]?.id, 'm1');
   } finally {
     store?.close();
     cleanupWorkspace(workspace);
