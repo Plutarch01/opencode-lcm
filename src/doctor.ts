@@ -18,7 +18,7 @@ export type DoctorReport = {
   summaryFts: DoctorCountCheck;
   artifactFts: DoctorCountCheck;
   orphanArtifactBlobs: number;
-  status: "clean" | "issues-found" | "repaired";
+  status: 'clean' | 'issues-found' | 'repaired';
   appliedActions?: string[];
 };
 
@@ -46,9 +46,9 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
     `summary_sessions_needing_rebuild=${report.summarySessionsNeedingRebuild.length}`,
     `lineage_sessions_needing_refresh=${report.lineageSessionsNeedingRefresh.length}`,
     `orphan_summary_edges=${report.orphanSummaryEdges}`,
-    ...formatCountCheck("message_fts", report.messageFts),
-    ...formatCountCheck("summary_fts", report.summaryFts),
-    ...formatCountCheck("artifact_fts", report.artifactFts),
+    ...formatCountCheck('message_fts', report.messageFts),
+    ...formatCountCheck('summary_fts', report.summaryFts),
+    ...formatCountCheck('artifact_fts', report.artifactFts),
     `orphan_artifact_blobs=${report.orphanArtifactBlobs}`,
     `issues=${issueCount}`,
     `status=${report.status}`,
@@ -56,27 +56,28 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
 
   if (report.summarySessionsNeedingRebuild.length > 0) {
     lines.push(
-      "summary_session_preview:",
+      'summary_session_preview:',
       ...report.summarySessionsNeedingRebuild
         .slice(0, limit)
-        .map((issue) => `- ${issue.sessionID}: ${issue.issues.join(", ")}`),
+        .map((issue) => `- ${issue.sessionID}: ${issue.issues.join(', ')}`),
     );
   }
 
   if (report.lineageSessionsNeedingRefresh.length > 0) {
     lines.push(
-      "lineage_session_preview:",
-      ...report.lineageSessionsNeedingRefresh
-        .slice(0, limit)
-        .map((sessionID) => `- ${sessionID}`),
+      'lineage_session_preview:',
+      ...report.lineageSessionsNeedingRefresh.slice(0, limit).map((sessionID) => `- ${sessionID}`),
     );
   }
 
   if (report.appliedActions && report.appliedActions.length > 0) {
-    lines.push("applied_actions:", ...report.appliedActions.slice(0, limit).map((action) => `- ${action}`));
-  } else if (report.status === "issues-found") {
-    lines.push("Re-run with apply=true to repair the issues above.");
+    lines.push(
+      'applied_actions:',
+      ...report.appliedActions.slice(0, limit).map((action) => `- ${action}`),
+    );
+  } else if (report.status === 'issues-found') {
+    lines.push('Re-run with apply=true to repair the issues above.');
   }
 
-  return lines.join("\n");
+  return lines.join('\n');
 }
