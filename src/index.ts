@@ -1,7 +1,7 @@
-import { type Hooks, type PluginInput, tool } from "@opencode-ai/plugin";
+import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
 
-import { resolveOptions } from "./options.js";
-import { SqliteLcmStore } from "./store.js";
+import { resolveOptions } from './options.js';
+import { SqliteLcmStore } from './store.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
 
@@ -18,7 +18,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
 
     tool: {
       lcm_status: tool({
-        description: "Show archived LCM capture stats",
+        description: 'Show archived LCM capture stats',
         args: {},
         async execute() {
           const stats = await store.stats();
@@ -30,7 +30,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `branched_sessions=${stats.branchedSessionCount}`,
             `pinned_sessions=${stats.pinnedSessionCount}`,
             `worktrees=${stats.worktreeCount}`,
-            `latest_event_at=${stats.latestEventAt ?? "n/a"}`,
+            `latest_event_at=${stats.latestEventAt ?? 'n/a'}`,
             `summary_nodes=${stats.summaryNodeCount}`,
             `summary_states=${stats.summaryStateCount}`,
             `artifacts=${stats.artifactCount}`,
@@ -40,35 +40,35 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `default_grep_scope=${options.scopeDefaults.grep}`,
             `default_describe_scope=${options.scopeDefaults.describe}`,
             `scope_profiles=${options.scopeProfiles.length}`,
-            `retention_stale_session_days=${options.retention.staleSessionDays ?? "disabled"}`,
-            `retention_deleted_session_days=${options.retention.deletedSessionDays ?? "disabled"}`,
-            `retention_orphan_blob_days=${options.retention.orphanBlobDays ?? "disabled"}`,
+            `retention_stale_session_days=${options.retention.staleSessionDays ?? 'disabled'}`,
+            `retention_deleted_session_days=${options.retention.deletedSessionDays ?? 'disabled'}`,
+            `retention_orphan_blob_days=${options.retention.orphanBlobDays ?? 'disabled'}`,
             `automatic_retrieval_enabled=${options.automaticRetrieval.enabled}`,
             `automatic_retrieval_max_chars=${options.automaticRetrieval.maxChars}`,
             `automatic_retrieval_min_tokens=${options.automaticRetrieval.minTokens}`,
             `automatic_retrieval_message_hits=${options.automaticRetrieval.maxMessageHits}`,
             `automatic_retrieval_summary_hits=${options.automaticRetrieval.maxSummaryHits}`,
             `automatic_retrieval_artifact_hits=${options.automaticRetrieval.maxArtifactHits}`,
-            `automatic_retrieval_scope_order=${options.automaticRetrieval.scopeOrder.join(",")}`,
+            `automatic_retrieval_scope_order=${options.automaticRetrieval.scopeOrder.join(',')}`,
             `automatic_retrieval_scope_budgets=session:${options.automaticRetrieval.scopeBudgets.session},root:${options.automaticRetrieval.scopeBudgets.root},worktree:${options.automaticRetrieval.scopeBudgets.worktree},all:${options.automaticRetrieval.scopeBudgets.all}`,
             `automatic_retrieval_stop_target_hits=${options.automaticRetrieval.stop.targetHits}`,
             `automatic_retrieval_stop_on_first_scope_with_hits=${options.automaticRetrieval.stop.stopOnFirstScopeWithHits}`,
             `fresh_tail_messages=${options.freshTailMessages}`,
             `min_messages_for_transform=${options.minMessagesForTransform}`,
             `large_content_threshold=${options.largeContentThreshold}`,
-            `binary_preview_providers=${options.binaryPreviewProviders.join(",")}`,
+            `binary_preview_providers=${options.binaryPreviewProviders.join(',')}`,
             `preview_byte_peek=${options.previewBytePeek}`,
             ...Object.entries(stats.eventTypes)
               .sort((a, b) => b[1] - a[1])
               .slice(0, 10)
               .map(([type, count]) => `${type}=${count}`),
           ];
-          return lines.join("\n");
+          return lines.join('\n');
         },
       }),
 
       lcm_resume: tool({
-        description: "Show the latest archived resume note",
+        description: 'Show the latest archived resume note',
         args: {
           sessionID: tool.schema.string().optional(),
         },
@@ -78,7 +78,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_grep: tool({
-        description: "Search archived LCM capture with scope",
+        description: 'Search archived LCM capture with scope',
         args: {
           query: tool.schema.string().min(1),
           sessionID: tool.schema.string().optional(),
@@ -92,19 +92,19 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             scope: args.scope,
             limit: args.limit ?? 5,
           });
-          if (results.length === 0) return "No archived matches found.";
+          if (results.length === 0) return 'No archived matches found.';
 
           return results
             .map((result) => {
-              const suffix = result.sessionID ? ` session=${result.sessionID}` : "";
+              const suffix = result.sessionID ? ` session=${result.sessionID}` : '';
               return `[${result.type}]${suffix} ${result.snippet}`;
             })
-            .join("\n\n");
+            .join('\n\n');
         },
       }),
 
       lcm_describe: tool({
-        description: "Summarize archived session capture with scope",
+        description: 'Summarize archived session capture with scope',
         args: {
           sessionID: tool.schema.string().optional(),
           scope: tool.schema.string().optional(),
@@ -118,7 +118,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_lineage: tool({
-        description: "Show archived branch lineage for a session",
+        description: 'Show archived branch lineage for a session',
         args: {
           sessionID: tool.schema.string().optional(),
         },
@@ -128,7 +128,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_pin_session: tool({
-        description: "Pin a session so retention pruning will skip it",
+        description: 'Pin a session so retention pruning will skip it',
         args: {
           sessionID: tool.schema.string().optional(),
           reason: tool.schema.string().optional(),
@@ -142,7 +142,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_unpin_session: tool({
-        description: "Remove a session retention pin",
+        description: 'Remove a session retention pin',
         args: {
           sessionID: tool.schema.string().optional(),
         },
@@ -154,7 +154,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_expand: tool({
-        description: "Expand archived summary nodes into targeted descendants or raw messages",
+        description: 'Expand archived summary nodes into targeted descendants or raw messages',
         args: {
           sessionID: tool.schema.string().optional(),
           nodeID: tool.schema.string().optional(),
@@ -176,7 +176,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_artifact: tool({
-        description: "View externalized archived content by artifact ID",
+        description: 'View externalized archived content by artifact ID',
         args: {
           artifactID: tool.schema.string().min(1),
           chars: tool.schema.number().int().min(200).max(20000).optional(),
@@ -190,7 +190,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_blob_stats: tool({
-        description: "Show deduplicated artifact blob stats",
+        description: 'Show deduplicated artifact blob stats',
         args: {
           limit: tool.schema.number().int().min(1).max(20).optional(),
         },
@@ -202,7 +202,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_blob_gc: tool({
-        description: "Preview or delete orphaned artifact blobs",
+        description: 'Preview or delete orphaned artifact blobs',
         args: {
           apply: tool.schema.boolean().optional(),
           limit: tool.schema.number().int().min(1).max(50).optional(),
@@ -216,7 +216,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_doctor: tool({
-        description: "Inspect or repair archive summaries and indexes",
+        description: 'Inspect or repair archive summaries and indexes',
         args: {
           apply: tool.schema.boolean().optional(),
           sessionID: tool.schema.string().optional(),
@@ -232,7 +232,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_retention_report: tool({
-        description: "Preview stale-session and orphan-blob retention candidates",
+        description: 'Preview stale-session and orphan-blob retention candidates',
         args: {
           staleSessionDays: tool.schema.number().min(0).optional(),
           deletedSessionDays: tool.schema.number().min(0).optional(),
@@ -250,7 +250,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_retention_prune: tool({
-        description: "Preview or apply stale-session and orphan-blob retention pruning",
+        description: 'Preview or apply stale-session and orphan-blob retention pruning',
         args: {
           apply: tool.schema.boolean().optional(),
           staleSessionDays: tool.schema.number().min(0).optional(),
@@ -270,7 +270,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_export_snapshot: tool({
-        description: "Export a portable long-memory snapshot to a JSON file",
+        description: 'Export a portable long-memory snapshot to a JSON file',
         args: {
           filePath: tool.schema.string().min(1),
           sessionID: tool.schema.string().optional(),
@@ -286,7 +286,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
       }),
 
       lcm_import_snapshot: tool({
-        description: "Import a portable long-memory snapshot from a JSON file",
+        description: 'Import a portable long-memory snapshot from a JSON file',
         args: {
           filePath: tool.schema.string().min(1),
           mode: tool.schema.string().optional(),
@@ -295,27 +295,30 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         async execute(args) {
           return await store.importSnapshot({
             filePath: args.filePath,
-            mode: args.mode === "merge" ? "merge" : "replace",
-            worktreeMode: args.worktreeMode === "preserve" || args.worktreeMode === "current" ? args.worktreeMode : "auto",
+            mode: args.mode === 'merge' ? 'merge' : 'replace',
+            worktreeMode:
+              args.worktreeMode === 'preserve' || args.worktreeMode === 'current'
+                ? args.worktreeMode
+                : 'auto',
           });
         },
       }),
     },
 
-    "experimental.chat.messages.transform": async (_input, output) => {
+    'experimental.chat.messages.transform': async (_input, output) => {
       await store.transformMessages(output.messages);
     },
 
-    "experimental.chat.system.transform": async (_input, output) => {
+    'experimental.chat.system.transform': async (_input, output) => {
       const hint = store.systemHint();
       if (!hint) return;
       output.system.push(hint);
     },
 
-    "experimental.session.compacting": async (input, output) => {
+    'experimental.session.compacting': async (input, output) => {
       const note = await store.buildCompactionContext(input.sessionID);
       if (!note) return;
-      if (output.context.some((entry) => entry.includes("LCM prototype resume note"))) return;
+      if (output.context.some((entry) => entry.includes('LCM prototype resume note'))) return;
       output.context.push(note);
     },
   };

@@ -1,4 +1,4 @@
-import type { SearchResult } from "./types.js";
+import type { SearchResult } from './types.js';
 
 export type SearchCandidate = {
   id: string;
@@ -7,12 +7,12 @@ export type SearchCandidate = {
   timestamp: number;
   snippet: string;
   content: string;
-  sourceKind: "message" | "summary" | "artifact";
+  sourceKind: 'message' | 'summary' | 'artifact';
   sourceOrder: number;
 };
 
 function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function tokenizeQuery(query: string): string[] {
@@ -44,7 +44,8 @@ function scoreSearchCandidate(
   const content = candidate.content.toLowerCase();
   const snippet = candidate.snippet.toLowerCase();
   const exactPhrase = content.includes(query);
-  const base = candidate.sourceKind === "message" ? 135 : candidate.sourceKind === "artifact" ? 96 : 78;
+  const base =
+    candidate.sourceKind === 'message' ? 135 : candidate.sourceKind === 'artifact' ? 96 : 78;
 
   let matchedTokens = 0;
   let totalHits = 0;
@@ -54,7 +55,7 @@ function scoreSearchCandidate(
     const hasToken = content.includes(token);
     if (hasToken) matchedTokens += 1;
 
-    const boundaryPattern = new RegExp(`\\b${escapeRegExp(token)}\\b`, "g");
+    const boundaryPattern = new RegExp(`\\b${escapeRegExp(token)}\\b`, 'g');
     const matches = content.match(boundaryPattern)?.length ?? 0;
     boundaryHits += matches;
     totalHits += matches > 0 ? matches : hasToken ? 1 : 0;
@@ -62,8 +63,8 @@ function scoreSearchCandidate(
 
   const coverage = tokens.length > 0 ? matchedTokens / tokens.length : 0;
   let score = base;
-  if (candidate.sourceKind === "message") {
-    score += candidate.type === "user" ? 22 : candidate.type === "assistant" ? 12 : 0;
+  if (candidate.sourceKind === 'message') {
+    score += candidate.type === 'user' ? 22 : candidate.type === 'assistant' ? 12 : 0;
   }
   score += exactPhrase ? 90 : 0;
   score += coverage * 70;
@@ -73,13 +74,18 @@ function scoreSearchCandidate(
   score += snippet.includes(query) ? 24 : 0;
   score += Math.max(0, 18 - candidate.sourceOrder);
   if (recencyRange.newest > recencyRange.oldest) {
-    const recencyRatio = (candidate.timestamp - recencyRange.oldest) / (recencyRange.newest - recencyRange.oldest);
+    const recencyRatio =
+      (candidate.timestamp - recencyRange.oldest) / (recencyRange.newest - recencyRange.oldest);
     score += recencyRatio * 28;
   }
   return score;
 }
 
-export function rankSearchCandidates(candidates: SearchCandidate[], query: string, limit: number): SearchResult[] {
+export function rankSearchCandidates(
+  candidates: SearchCandidate[],
+  query: string,
+  limit: number,
+): SearchResult[] {
   const exactQuery = query.toLowerCase();
   const tokens = tokenizeQuery(query);
   const deduped = new Map<string, SearchCandidate & { score: number }>();
@@ -89,7 +95,11 @@ export function rankSearchCandidates(candidates: SearchCandidate[], query: strin
     const score = scoreSearchCandidate(candidate, exactQuery, tokens, recencyRange);
     const key = `${candidate.type}:${candidate.id}`;
     const existing = deduped.get(key);
-    if (!existing || score > existing.score || (score === existing.score && candidate.timestamp > existing.timestamp)) {
+    if (
+      !existing ||
+      score > existing.score ||
+      (score === existing.score && candidate.timestamp > existing.timestamp)
+    ) {
       deduped.set(key, {
         ...candidate,
         score,
@@ -100,5 +110,13 @@ export function rankSearchCandidates(candidates: SearchCandidate[], query: strin
   return [...deduped.values()]
     .sort((a, b) => b.score - a.score || b.timestamp - a.timestamp)
     .slice(0, limit)
-    .map(({ content: _content, sourceKind: _sourceKind, sourceOrder: _sourceOrder, score: _score, ...result }) => result);
+    .map(
+      ({
+        content: _content,
+        sourceKind: _sourceKind,
+        sourceOrder: _sourceOrder,
+        score: _score,
+        ...result
+      }) => result,
+    );
 }

@@ -1,4 +1,4 @@
-import type { Message, Part } from "@opencode-ai/sdk";
+import type { Message, Part } from '@opencode-ai/sdk';
 
 export type InteropOptions = {
   contextMode: boolean;
@@ -6,7 +6,7 @@ export type InteropOptions = {
   ignoreToolPrefixes: string[];
 };
 
-export type ScopeName = "session" | "root" | "worktree" | "all";
+export type ScopeName = 'session' | 'root' | 'worktree' | 'all';
 
 export type ScopeDefaults = {
   grep: ScopeName;
