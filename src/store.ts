@@ -104,6 +104,10 @@ type ResolvedRetentionPolicy = {
   orphanBlobDays?: number;
 };
 
+type ReadSessionOptions = {
+  artifactMessageIDs?: string[];
+};
+
 const SUMMARY_LEAF_MESSAGES = 6;
 const SUMMARY_BRANCH_FACTOR = 3;
 const SUMMARY_NODE_CHAR_LIMIT = 260;
@@ -830,12 +834,15 @@ export class SqliteLcmStore {
 
     this.completeDeferredInit();
 
-    const session = this.readSessionSync(normalized.sessionID);
+    const session = this.readSessionSync(normalized.sessionID, {
+      artifactMessageIDs: this.captureArtifactHydrationMessageIDs(normalized),
+    });
     const previousParentSessionID = session.parentSessionID;
     let next = this.applyEvent(session, normalized);
     next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
     next.eventCount += 1;
     next = this.prepareSessionForPersistence(next);
+    const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(session, next, normalized);
 
     const db = this.getDb();
     db.exec("BEGIN");
@@ -860,7 +867,9 @@ export class SqliteLcmStore {
       }
     }
 
-    this.syncDerivedSessionStateSync(next);
+    if (shouldSyncDerivedState) {
+      this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
+    }
 
     if (this.shouldSyncDerivedLineageSubtree(normalized.type, previousParentSessionID, next.parentSessionID)) {
       this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
@@ -1248,6 +1257,68 @@ export class SqliteLcmStore {
 
   private shouldCleanupOrphanBlobsForEvent(eventType: string): boolean {
     return eventType === "message.removed" || eventType === "message.part.updated" || eventType === "message.part.removed";
+  }
+
+  private captureArtifactHydrationMessageIDs(event: CapturedEvent): string[] {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case "message.updated":
+        return [payload.properties.info.id];
+      case "message.part.updated":
+        return [payload.properties.part.messageID];
+      case "message.part.removed":
+        return [payload.properties.messageID];
+      default:
+        return [];
+    }
+  }
+
+  private archivedMessageIDs(messages: ConversationMessage[]): string[] {
+    return this.getArchivedMessages(messages).map((message) => message.info.id);
+  }
+
+  private didArchivedMessagesChange(before: ConversationMessage[], after: ConversationMessage[]): boolean {
+    const beforeIDs = this.archivedMessageIDs(before);
+    const afterIDs = this.archivedMessageIDs(after);
+    if (beforeIDs.length !== afterIDs.length) return true;
+    return beforeIDs.some((messageID, index) => messageID !== afterIDs[index]);
+  }
+
+  private isArchivedMessage(messages: ConversationMessage[], messageID?: string): boolean {
+    if (!messageID) return false;
+    return this.archivedMessageIDs(messages).includes(messageID);
+  }
+
+  private shouldSyncDerivedSessionStateForEvent(
+    previous: NormalizedSession,
+    next: NormalizedSession,
+    event: CapturedEvent,
+  ): boolean {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case "message.updated": {
+        const messageID = payload.properties.info.id;
+        return (
+          this.didArchivedMessagesChange(previous.messages, next.messages) ||
+          this.isArchivedMessage(previous.messages, messageID) ||
+          this.isArchivedMessage(next.messages, messageID)
+        );
+      }
+      case "message.removed":
+        return this.didArchivedMessagesChange(previous.messages, next.messages);
+      case "message.part.updated": {
+        const messageID = payload.properties.part.messageID;
+        return this.isArchivedMessage(previous.messages, messageID) || this.isArchivedMessage(next.messages, messageID);
+      }
+      case "message.part.removed": {
+        const messageID = payload.properties.messageID;
+        return this.isArchivedMessage(previous.messages, messageID) || this.isArchivedMessage(next.messages, messageID);
+      }
+      default:
+        return false;
+    }
   }
 
   private syncAllDerivedSessionStateSync(preserveExistingResume = false): void {
@@ -3583,7 +3654,7 @@ export class SqliteLcmStore {
     return rows.map((row) => this.readSessionSync(row.session_id));
   }
 
-  private readSessionSync(sessionID: string): NormalizedSession {
+  private readSessionSync(sessionID: string, options?: ReadSessionOptions): NormalizedSession {
     const db = this.getDb();
     const row = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionID) as SessionRow | undefined;
     const messageRows = db
@@ -3593,7 +3664,12 @@ export class SqliteLcmStore {
       .prepare("SELECT * FROM parts WHERE session_id = ? ORDER BY message_id ASC, sort_key ASC, part_id ASC")
       .all(sessionID) as PartRow[];
     const artifactsByPart = new Map<string, ArtifactData[]>();
-    for (const artifact of this.readArtifactsForSessionSync(sessionID)) {
+    const artifactMessageIDs = options?.artifactMessageIDs;
+    const artifacts =
+      artifactMessageIDs === undefined
+        ? this.readArtifactsForSessionSync(sessionID)
+        : [...new Set(artifactMessageIDs)].flatMap((messageID) => this.readArtifactsForMessageSync(messageID));
+    for (const artifact of artifacts) {
       const list = artifactsByPart.get(artifact.partID) ?? [];
       list.push(artifact);
       artifactsByPart.set(artifact.partID, list);
