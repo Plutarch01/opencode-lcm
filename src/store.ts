@@ -21,7 +21,7 @@ import {
   SUMMARY_NODE_CHAR_LIMIT,
 } from './constants.js';
 import { type DoctorReport, type DoctorSessionIssue, formatDoctorReport } from './doctor.js';
-import { getLogger } from './logging.js';
+import { getLogger, isStartupLoggingEnabled } from './logging.js';
 import { safeQuery, safeQueryOne, validateRow, withTransaction } from './sql-utils.js';
 import {
   type ArtifactData,
@@ -504,6 +504,11 @@ function archivePlaceholder(label: string): string {
   return `[Archived by opencode-lcm: ${label}. Use lcm_resume, lcm_grep, or lcm_expand for details.]`;
 }
 
+function logStartupPhase(phase: string, context?: Record<string, unknown>): void {
+  if (!isStartupLoggingEnabled()) return;
+  getLogger().info(`startup phase: ${phase}`, context);
+}
+
 async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const isBunRuntime = typeof globalThis === 'object' && 'Bun' in globalThis;
 
@@ -603,14 +608,20 @@ export class SqliteLcmStore {
   }
 
   private async openAndInitializeDb(): Promise<void> {
+    logStartupPhase('open-db:start', { dbPath: this.dbPath });
     await mkdir(this.baseDir, { recursive: true });
+    logStartupPhase('open-db:connect', {
+      runtime: typeof globalThis === 'object' && 'Bun' in globalThis ? 'bun' : 'node',
+    });
     const db = await openSqliteDatabase(this.dbPath);
     this.db = db;
 
     try {
+      logStartupPhase('open-db:schema-check');
       this.assertSupportedSchemaVersionSync();
       db.exec('PRAGMA journal_mode = WAL');
       db.exec('PRAGMA synchronous = NORMAL');
+      logStartupPhase('open-db:create-tables');
       db.exec(`
       CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY,
@@ -755,6 +766,7 @@ export class SqliteLcmStore {
       this.ensureSessionColumnsSync();
       this.ensureSummaryStateColumnsSync();
       this.ensureArtifactColumnsSync();
+      logStartupPhase('open-db:create-indexes');
       db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)');
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id, updated_at DESC)',
@@ -765,10 +777,17 @@ export class SqliteLcmStore {
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)',
       );
+      logStartupPhase('open-db:migrate-legacy-artifacts');
       await this.migrateLegacyArtifacts();
+      logStartupPhase('open-db:write-schema-version', { schemaVersion: STORE_SCHEMA_VERSION });
       this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
+      logStartupPhase('open-db:deferred-init:start');
       this.completeDeferredInit();
+      logStartupPhase('open-db:ready');
     } catch (error) {
+      logStartupPhase('open-db:error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
       db.close();
       this.db = undefined;
       this.dbReadyPromise = undefined;
@@ -796,19 +815,44 @@ export class SqliteLcmStore {
 
   private completeDeferredInit(): void {
     if (this.deferredInitCompleted) return;
-    this.backfillArtifactBlobsSync();
+    if (this.hasPendingArtifactBlobBackfillSync()) {
+      logStartupPhase('deferred-init:artifact-backfill');
+      this.backfillArtifactBlobsSync();
+    }
+    logStartupPhase('deferred-init:orphan-blob-cleanup');
     this.deleteOrphanArtifactBlobsSync();
     if (
       this.options.retention.staleSessionDays !== undefined ||
       this.options.retention.deletedSessionDays !== undefined ||
       this.options.retention.orphanBlobDays !== undefined
     ) {
+      logStartupPhase('deferred-init:retention-prune');
       this.applyRetentionPruneSync({ apply: true });
     }
-    this.refreshAllLineageSync();
-    this.syncAllDerivedSessionStateSync(true);
-    this.rebuildSearchIndexesSync();
+    if (this.hasPendingLineageRefreshSync()) {
+      logStartupPhase('deferred-init:lineage-refresh');
+      this.refreshAllLineageSync();
+    }
+    logStartupPhase('deferred-init:done');
     this.deferredInitCompleted = true;
+  }
+
+  private hasPendingArtifactBlobBackfillSync(): boolean {
+    const row = this.getDb()
+      .prepare(
+        "SELECT COUNT(*) AS count FROM artifacts WHERE content_hash IS NULL OR content_text != ''",
+      )
+      .get() as { count: number };
+    return row.count > 0;
+  }
+
+  private hasPendingLineageRefreshSync(): boolean {
+    const row = this.getDb()
+      .prepare(
+        'SELECT COUNT(*) AS count FROM sessions WHERE root_session_id IS NULL OR lineage_depth IS NULL',
+      )
+      .get() as { count: number };
+    return row.count > 0;
   }
 
   close(): void {
@@ -1570,9 +1614,11 @@ export class SqliteLcmStore {
       }
     });
 
-    this.refreshAllLineageSync();
-    this.syncAllDerivedSessionStateSync(true);
-    this.refreshSearchIndexesSync();
+    if (uniqueSessionIDs.length > 0) {
+      this.refreshAllLineageSync();
+      this.syncAllDerivedSessionStateSync(true);
+      this.refreshSearchIndexesSync();
+    }
 
     return {
       deletedSessions: uniqueSessionIDs.length,

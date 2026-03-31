@@ -826,3 +826,216 @@ test('deferred init applies retention pruning at startup', async () => {
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+test('deferred init preserves existing summary and FTS state on reopen', async () => {
+  const workspace = makeWorkspace('lcm-deferred-reopen-preserve');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 3 }),
+    );
+    await store.init();
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'p1',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'first archived message for reopen coverage',
+        },
+      },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm2', 3) },
+    });
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 3,
+        part: {
+          id: 'p2',
+          sessionID: 's1',
+          messageID: 'm2',
+          type: 'text',
+          text: 'second archived message for reopen coverage',
+        },
+      },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm3', 4) },
+    });
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 4,
+        part: {
+          id: 'p3',
+          sessionID: 's1',
+          messageID: 'm3',
+          type: 'text',
+          text: 'fresh tail message for reopen coverage',
+        },
+      },
+    });
+
+    const initialResults = await store.grep({ query: 'second archived message reopen', limit: 3 });
+    assert.ok(initialResults.some((result) => result.id === 'm2'));
+    const initialResume = await store.resume('s1');
+    assert.match(initialResume, /LCM prototype resume note/);
+
+    store.close();
+
+    const db = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const before = {
+      messageFts: db.prepare('SELECT COUNT(*) AS count FROM message_fts').get().count,
+      summaryFts: db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get().count,
+      artifactFts: db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get().count,
+      summaryNodes: db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get().count,
+      summaryState: db.prepare('SELECT COUNT(*) AS count FROM summary_state').get().count,
+      resumes: db.prepare('SELECT COUNT(*) AS count FROM resumes').get().count,
+    };
+    db.close();
+
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 3 }),
+    );
+    await store.init();
+
+    const reopenedResults = await store.grep({ query: 'second archived message reopen', limit: 3 });
+    assert.ok(reopenedResults.some((result) => result.id === 'm2'));
+    const reopenedResume = await store.resume('s1');
+    assert.match(reopenedResume, /LCM prototype resume note/);
+
+    const reopenedDb = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const after = {
+      messageFts: reopenedDb.prepare('SELECT COUNT(*) AS count FROM message_fts').get().count,
+      summaryFts: reopenedDb.prepare('SELECT COUNT(*) AS count FROM summary_fts').get().count,
+      artifactFts: reopenedDb.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get().count,
+      summaryNodes: reopenedDb.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get().count,
+      summaryState: reopenedDb.prepare('SELECT COUNT(*) AS count FROM summary_state').get().count,
+      resumes: reopenedDb.prepare('SELECT COUNT(*) AS count FROM resumes').get().count,
+    };
+    reopenedDb.close();
+
+    assert.deepEqual(after, before);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('startup orphan blob cleanup does not trigger unrelated session rebuilds', async () => {
+  const workspace = makeWorkspace('lcm-startup-orphan-cleanup');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'p1',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'orphan cleanup baseline content',
+        },
+      },
+    });
+    const baseline = await store.stats();
+    assert.equal(baseline.sessionCount, 1);
+
+    store.close();
+
+    const db = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.prepare(
+      'INSERT INTO artifact_blobs (content_hash, content_text, char_count, created_at) VALUES (?, ?, ?, ?)',
+    ).run('orphan-test-hash', 'orphaned startup blob', 19, 1);
+    const before = {
+      summaryNodes: db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get().count,
+      summaryState: db.prepare('SELECT COUNT(*) AS count FROM summary_state').get().count,
+      messageFts: db.prepare('SELECT COUNT(*) AS count FROM message_fts').get().count,
+      summaryFts: db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get().count,
+      artifactFts: db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get().count,
+      orphanBlobs: db
+        .prepare(
+          'SELECT COUNT(*) AS count FROM artifact_blobs b WHERE NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash)',
+        )
+        .get().count,
+    };
+    assert.equal(before.orphanBlobs, 1);
+    db.close();
+
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    const stats = await store.stats();
+    assert.equal(stats.sessionCount, 1);
+
+    const reopenedDb = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const after = {
+      summaryNodes: reopenedDb.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get().count,
+      summaryState: reopenedDb.prepare('SELECT COUNT(*) AS count FROM summary_state').get().count,
+      messageFts: reopenedDb.prepare('SELECT COUNT(*) AS count FROM message_fts').get().count,
+      summaryFts: reopenedDb.prepare('SELECT COUNT(*) AS count FROM summary_fts').get().count,
+      artifactFts: reopenedDb.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get().count,
+      orphanBlobs: reopenedDb
+        .prepare(
+          'SELECT COUNT(*) AS count FROM artifact_blobs b WHERE NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash)',
+        )
+        .get().count,
+    };
+    reopenedDb.close();
+
+    assert.equal(after.orphanBlobs, 0);
+    assert.equal(after.summaryNodes, before.summaryNodes);
+    assert.equal(after.summaryState, before.summaryState);
+    assert.equal(after.messageFts, before.messageFts);
+    assert.equal(after.summaryFts, before.summaryFts);
+    assert.equal(after.artifactFts, before.artifactFts);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

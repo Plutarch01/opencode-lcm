@@ -12,6 +12,12 @@ export interface Logger {
   error(message: string, context?: Record<string, unknown>): void;
 }
 
+function isTruthyEnvFlag(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
 let currentLogger: Logger = {
   debug(message: string, context?: Record<string, unknown>) {
     if (context) {
@@ -49,4 +55,9 @@ export function setLogger(logger: Logger): void {
 
 export function getLogger(): Logger {
   return currentLogger;
+}
+
+export function isStartupLoggingEnabled(): boolean {
+  if (typeof process !== 'object' || !process?.env) return false;
+  return isTruthyEnvFlag(process.env.OPENCODE_LCM_STARTUP_LOG);
 }
