@@ -35,6 +35,20 @@ function buildRecencyRange(candidates: SearchCandidate[]): { oldest: number; new
   return { oldest, newest };
 }
 
+const MESSAGE_BASE_SCORE = 135;
+const ARTIFACT_BASE_SCORE = 96;
+const SUMMARY_BASE_SCORE = 78;
+const USER_ROLE_BONUS = 22;
+const ASSISTANT_ROLE_BONUS = 12;
+const EXACT_PHRASE_BONUS = 90;
+const COVERAGE_MULTIPLIER = 70;
+const TOKEN_MATCH_MULTIPLIER = 12;
+const TOTAL_HIT_MULTIPLIER = 2;
+const BOUNDARY_HIT_MULTIPLIER = 4;
+const SNIPPET_EXACT_BONUS = 24;
+const SOURCE_ORDER_DECAY_BASE = 18;
+const RECENCY_MULTIPLIER = 28;
+
 function scoreSearchCandidate(
   candidate: SearchCandidate,
   query: string,
@@ -45,7 +59,11 @@ function scoreSearchCandidate(
   const snippet = candidate.snippet.toLowerCase();
   const exactPhrase = content.includes(query);
   const base =
-    candidate.sourceKind === 'message' ? 135 : candidate.sourceKind === 'artifact' ? 96 : 78;
+    candidate.sourceKind === 'message'
+      ? MESSAGE_BASE_SCORE
+      : candidate.sourceKind === 'artifact'
+        ? ARTIFACT_BASE_SCORE
+        : SUMMARY_BASE_SCORE;
 
   let matchedTokens = 0;
   let totalHits = 0;
@@ -64,19 +82,24 @@ function scoreSearchCandidate(
   const coverage = tokens.length > 0 ? matchedTokens / tokens.length : 0;
   let score = base;
   if (candidate.sourceKind === 'message') {
-    score += candidate.type === 'user' ? 22 : candidate.type === 'assistant' ? 12 : 0;
+    score +=
+      candidate.type === 'user'
+        ? USER_ROLE_BONUS
+        : candidate.type === 'assistant'
+          ? ASSISTANT_ROLE_BONUS
+          : 0;
   }
-  score += exactPhrase ? 90 : 0;
-  score += coverage * 70;
-  score += matchedTokens * 12;
-  score += Math.min(totalHits, matchedTokens + 2) * 2;
-  score += Math.min(boundaryHits, matchedTokens) * 4;
-  score += snippet.includes(query) ? 24 : 0;
-  score += Math.max(0, 18 - candidate.sourceOrder);
+  score += exactPhrase ? EXACT_PHRASE_BONUS : 0;
+  score += coverage * COVERAGE_MULTIPLIER;
+  score += matchedTokens * TOKEN_MATCH_MULTIPLIER;
+  score += Math.min(totalHits, matchedTokens + 2) * TOTAL_HIT_MULTIPLIER;
+  score += Math.min(boundaryHits, matchedTokens) * BOUNDARY_HIT_MULTIPLIER;
+  score += snippet.includes(query) ? SNIPPET_EXACT_BONUS : 0;
+  score += Math.max(0, SOURCE_ORDER_DECAY_BASE - candidate.sourceOrder);
   if (recencyRange.newest > recencyRange.oldest) {
     const recencyRatio =
       (candidate.timestamp - recencyRange.oldest) / (recencyRange.newest - recencyRange.oldest);
-    score += recencyRatio * 28;
+    score += recencyRatio * RECENCY_MULTIPLIER;
   }
   return score;
 }

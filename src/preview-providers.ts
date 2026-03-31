@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import type { Part } from '@opencode-ai/sdk';
 
+import { getLogger } from './logging.js';
 import { resolveWorkspacePath } from './workspace-path.js';
 
 type FilePart = Extract<Part, { type: 'file' }>;
@@ -46,7 +47,8 @@ function inferLocalPath(workspaceDirectory: string, file: FilePart): string | un
 
   try {
     return resolveWorkspacePath(workspaceDirectory, sourcePath);
-  } catch {
+  } catch (error) {
+    getLogger().debug('Failed to resolve workspace path', { sourcePath, error });
     return undefined;
   }
 }
@@ -260,7 +262,8 @@ export function runBinaryPreviewProviders(context: PreviewContext): PreviewOutpu
       if (!filePath) return undefined;
       try {
         resolvedBytes = readFileSync(filePath);
-      } catch {
+      } catch (error) {
+        getLogger().debug('Failed to read file bytes for preview', { filePath, error });
         resolvedBytes = undefined;
       }
       return resolvedBytes;
