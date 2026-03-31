@@ -34,7 +34,14 @@ export function shortNodeID(nodeID: string): string {
 }
 
 export function parseJson<T>(value: string): T {
-  return JSON.parse(value) as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Failed to parse JSON: ${message}\nInput: ${value.slice(0, 120)}${value.length > 120 ? '...' : ''}`,
+    );
+  }
 }
 
 // --- Number utilities ---

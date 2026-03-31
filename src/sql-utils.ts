@@ -76,3 +76,32 @@ export function withTransaction(db: SqlDatabaseLike, operation: string, fn: () =
     throw new Error(`${operation} transaction failed: ${message}`);
   }
 }
+
+/**
+ * Lightweight runtime validator for SQL row results.
+ * Checks that required keys exist and have the expected types.
+ * Returns the row as-is if valid, throws if not.
+ */
+export function validateRow<T extends Record<string, unknown>>(
+  row: unknown,
+  schema: Record<keyof T, 'string' | 'number' | 'boolean' | 'object' | 'nullable'>,
+  operation: string,
+): T {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) {
+    throw new Error(`${operation}: expected an object row, got ${typeof row}`);
+  }
+  const record = row as Record<string, unknown>;
+  for (const [key, expectedType] of Object.entries(schema) as Array<[string, string]>) {
+    const value = record[key];
+    if (expectedType === 'nullable') continue;
+    if (value === null || value === undefined) {
+      throw new Error(`${operation}: missing required column "${key}"`);
+    }
+    if (typeof value !== expectedType) {
+      throw new Error(
+        `${operation}: column "${key}" expected ${expectedType}, got ${typeof value}`,
+      );
+    }
+  }
+  return record as T;
+}

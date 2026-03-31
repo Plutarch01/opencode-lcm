@@ -1,4 +1,6 @@
+import { getLogger } from './logging.js';
 import { rankSearchCandidates, type SearchCandidate } from './search-ranking.js';
+import type { ArtifactRow, SummaryNodeRow } from './store-snapshot.js';
 import type { SqlDatabaseLike } from './store-types.js';
 import type { NormalizedSession, SearchResult } from './types.js';
 import { buildSnippet, sanitizeFtsTokens, tokenizeQuery } from './utils.js';
@@ -6,23 +8,8 @@ import { buildSnippet, sanitizeFtsTokens, tokenizeQuery } from './utils.js';
 type FtsDeps = {
   getDb(): SqlDatabaseLike;
   readScopedSessionsSync(sessionIDs?: string[]): NormalizedSession[];
-  readScopedSummaryRowsSync(sessionIDs?: string[]): Array<{
-    node_id: string;
-    session_id: string;
-    level: number;
-    summary_text: string;
-    created_at: number;
-  }>;
-  readScopedArtifactRowsSync(sessionIDs?: string[]): Array<{
-    artifact_id: string;
-    session_id: string;
-    message_id: string;
-    part_id: string;
-    artifact_kind: string;
-    created_at: number;
-    content_text: string;
-    preview_text: string;
-  }>;
+  readScopedSummaryRowsSync(sessionIDs?: string[]): SummaryNodeRow[];
+  readScopedArtifactRowsSync(sessionIDs?: string[]): ArtifactRow[];
   ignoreToolPrefixes: string[];
   guessMessageText(
     message: NormalizedSession['messages'][number],
@@ -75,8 +62,8 @@ export function computeTfidfWeights(
         .prepare('SELECT COUNT(*) AS count FROM message_fts WHERE message_fts MATCH ?')
         .get(query) as { count: number } | undefined;
       docFreq += msgFreq?.count ?? 0;
-    } catch {
-      // Token may be an FTS5 reserved word or malformed — skip
+    } catch (error) {
+      getLogger().debug('TF-IDF message_fts query failed for token', { token, error });
     }
 
     try {
@@ -84,8 +71,8 @@ export function computeTfidfWeights(
         .prepare('SELECT COUNT(*) AS count FROM summary_fts WHERE summary_fts MATCH ?')
         .get(query) as { count: number } | undefined;
       docFreq += sumFreq?.count ?? 0;
-    } catch {
-      // Skip
+    } catch (error) {
+      getLogger().debug('TF-IDF summary_fts query failed for token', { token, error });
     }
 
     try {
@@ -93,8 +80,8 @@ export function computeTfidfWeights(
         .prepare('SELECT COUNT(*) AS count FROM artifact_fts WHERE artifact_fts MATCH ?')
         .get(query) as { count: number } | undefined;
       docFreq += artFreq?.count ?? 0;
-    } catch {
-      // Skip
+    } catch (error) {
+      getLogger().debug('TF-IDF artifact_fts query failed for token', { token, error });
     }
 
     // Smoothed IDF: log(N / (df + 1)) + 1
@@ -268,7 +255,8 @@ export function searchWithFts(
     ];
 
     return rankSearchCandidates(candidates, query, limit);
-  } catch {
+  } catch (error) {
+    getLogger().debug('FTS search failed, returning empty results', { query, error });
     return [];
   }
 }
@@ -385,13 +373,7 @@ export function rebuildSearchIndexesSync(deps: FtsDeps): void {
 
   const summaryRows = db
     .prepare('SELECT * FROM summary_nodes ORDER BY created_at ASC')
-    .all() as Array<{
-    session_id: string;
-    node_id: string;
-    level: number;
-    created_at: number;
-    summary_text: string;
-  }>;
+    .all() as SummaryNodeRow[];
   const insert = db.prepare(
     'INSERT INTO summary_fts (session_id, node_id, level, created_at, content) VALUES (?, ?, ?, ?, ?)',
   );

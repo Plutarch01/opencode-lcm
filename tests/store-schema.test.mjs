@@ -6,7 +6,7 @@ import {
   assertSupportedSchemaVersionSync,
   readSchemaVersionSync,
   writeSchemaVersionSync,
-} from '../dist/store-schema.js';
+} from '../dist/store.js';
 
 test('readSchemaVersionSync returns 0 for fresh database', () => {
   const db = new DatabaseSync(':memory:');

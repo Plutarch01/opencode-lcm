@@ -13,7 +13,7 @@ import {
   readMessagesForSession,
   readSessionHeader,
   readSessionStats,
-} from '../dist/store-session-read.js';
+} from '../dist/store.js';
 
 function initSchema(db) {
   db.exec(`
