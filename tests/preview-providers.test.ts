@@ -50,12 +50,12 @@ function makeFilePart(filePath: string): FilePart {
   };
 }
 
-test('runs fingerprint and byte peek preview providers', () => {
+test('runs fingerprint and byte peek preview providers', async () => {
   const workspace = makeWorkspace('preview-providers-text');
 
   try {
     const filePath = writeFixtureFile(workspace, 'note.txt', 'hello world');
-    const output = runBinaryPreviewProviders({
+    const output = await runBinaryPreviewProviders({
       workspaceDirectory: workspace,
       file: makeFilePart(filePath),
       category: 'document',
@@ -80,7 +80,7 @@ test('runs fingerprint and byte peek preview providers', () => {
   }
 });
 
-test('detects PNG image dimensions', () => {
+test('detects PNG image dimensions', async () => {
   const workspace = makeWorkspace('preview-providers-png');
 
   try {
@@ -89,7 +89,7 @@ test('detects PNG image dimensions', () => {
       0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x05, 0x08, 0x06, 0x00, 0x00, 0x00,
     ]);
     const filePath = writeFixtureFile(workspace, 'image.png', bytes);
-    const output = runBinaryPreviewProviders({
+    const output = await runBinaryPreviewProviders({
       workspaceDirectory: workspace,
       file: makeFilePart(filePath),
       category: 'image',
@@ -109,7 +109,7 @@ test('detects PNG image dimensions', () => {
   }
 });
 
-test('detects JPEG image dimensions', () => {
+test('detects JPEG image dimensions', async () => {
   const workspace = makeWorkspace('preview-providers-jpeg');
 
   try {
@@ -118,7 +118,7 @@ test('detects JPEG image dimensions', () => {
       0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
     ]);
     const filePath = writeFixtureFile(workspace, 'image.jpg', bytes);
-    const output = runBinaryPreviewProviders({
+    const output = await runBinaryPreviewProviders({
       workspaceDirectory: workspace,
       file: makeFilePart(filePath),
       category: 'image',
@@ -138,7 +138,7 @@ test('detects JPEG image dimensions', () => {
   }
 });
 
-test('detects PDF page estimates', () => {
+test('detects PDF page estimates', async () => {
   const workspace = makeWorkspace('preview-providers-pdf');
 
   try {
@@ -150,7 +150,7 @@ test('detects PDF page estimates', () => {
         'ascii',
       ),
     );
-    const output = runBinaryPreviewProviders({
+    const output = await runBinaryPreviewProviders({
       workspaceDirectory: workspace,
       file: makeFilePart(filePath),
       category: 'pdf',
@@ -169,7 +169,7 @@ test('detects PDF page estimates', () => {
   }
 });
 
-test('detects ZIP entry counts', () => {
+test('detects ZIP entry counts', async () => {
   const workspace = makeWorkspace('preview-providers-zip');
 
   try {
@@ -181,7 +181,7 @@ test('detects ZIP entry counts', () => {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       ]),
     );
-    const output = runBinaryPreviewProviders({
+    const output = await runBinaryPreviewProviders({
       workspaceDirectory: workspace,
       file: makeFilePart(filePath),
       category: 'archive',
@@ -200,7 +200,7 @@ test('detects ZIP entry counts', () => {
   }
 });
 
-test('ignores file paths outside the workspace', () => {
+test('ignores file paths outside the workspace', async () => {
   const workspace = makeWorkspace('preview-providers-safe');
   const outside = makeWorkspace('preview-providers-outside');
 
@@ -208,7 +208,7 @@ test('ignores file paths outside the workspace', () => {
     const outsideFile = writeFixtureFile(outside, 'secret.txt', 'top secret bytes');
     const relativeOutsidePath = path.relative(workspace, outsideFile);
     const filePart = makeFilePart(outsideFile);
-    const output = runBinaryPreviewProviders({
+    const output = await runBinaryPreviewProviders({
       workspaceDirectory: workspace,
       file: {
         ...filePart,

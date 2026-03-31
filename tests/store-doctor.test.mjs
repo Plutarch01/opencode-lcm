@@ -94,6 +94,6 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
     assert.equal(grep[0]?.id, 'm1');
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });

@@ -76,7 +76,7 @@ test('init migrates legacy session, resume, and event files into SQLite', async 
     assert.equal(grep[0].id, 'm1');
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -121,8 +121,8 @@ test('snapshot merge import preserves existing target sessions', async () => {
   } finally {
     source?.close();
     target?.close();
-    cleanupWorkspace(sourceWorkspace);
-    cleanupWorkspace(targetWorkspace);
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
   }
 });
 
@@ -193,8 +193,8 @@ test('snapshot import rebuilds stale imported summary graphs before reuse', asyn
   } finally {
     source?.close();
     target?.close();
-    cleanupWorkspace(sourceWorkspace);
-    cleanupWorkspace(targetWorkspace);
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
   }
 });
 
@@ -240,8 +240,8 @@ test('snapshot paths can be outside the workspace (portable snapshots)', async (
     assert.match(importResult, /file=/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
-    cleanupWorkspace(outsideWorkspace);
+    await cleanupWorkspace(workspace);
+    await cleanupWorkspace(outsideWorkspace);
   }
 });
 
@@ -292,7 +292,7 @@ test('snapshot relative paths resolve from the workspace and still block travers
     );
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -316,7 +316,7 @@ test('snapshot import rejects malformed payloads', async () => {
     );
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -363,8 +363,8 @@ test('snapshot replace import rehomes a single-worktree export into the target w
   } finally {
     source?.close();
     target?.close();
-    cleanupWorkspace(sourceWorkspace);
-    cleanupWorkspace(targetWorkspace);
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
   }
 });
 
@@ -413,8 +413,8 @@ test('snapshot replace import preserves a single-worktree export when requested'
   } finally {
     source?.close();
     target?.close();
-    cleanupWorkspace(sourceWorkspace);
-    cleanupWorkspace(targetWorkspace);
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
   }
 });
 
@@ -472,8 +472,60 @@ test('snapshot replace import can force current-worktree remap for multi-worktre
   } finally {
     source?.close();
     target?.close();
-    cleanupWorkspace(sourceWorkspace);
-    cleanupWorkspace(targetWorkspace);
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
+  }
+});
+
+test('snapshot replace import clears stale FTS rows from replaced sessions', async () => {
+  const sourceWorkspace = makeWorkspace('lcm-replace-fts-src');
+  const targetWorkspace = makeWorkspace('lcm-replace-fts-dst');
+  const snapshotPath = path.join(sourceWorkspace, 'replace-fts-snapshot.json');
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions());
+    await source.init();
+    await createSession(source, sourceWorkspace, 'replace-session', 1);
+    await captureMessage(source, {
+      sessionID: 'replace-session',
+      messageID: 'm-new',
+      created: 2,
+      parts: [textPart('replace-session', 'm-new', 'm-new-p', 'replacement body only')],
+    });
+    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions());
+    await target.init();
+    await createSession(target, targetWorkspace, 'replace-session', 3);
+    await captureMessage(target, {
+      sessionID: 'replace-session',
+      messageID: 'm-old',
+      created: 4,
+      parts: [textPart('replace-session', 'm-old', 'm-old-p', 'stale target body')],
+    });
+
+    await target.importSnapshot({ filePath: snapshotPath, mode: 'replace' });
+
+    const fresh = await target.grep({
+      query: 'replacement body only',
+      sessionID: 'replace-session',
+      scope: 'session',
+    });
+    const stale = await target.grep({
+      query: 'stale target body',
+      sessionID: 'replace-session',
+      scope: 'session',
+    });
+
+    assert.equal(fresh[0]?.id, 'm-new');
+    assert.equal(stale.length, 0);
+  } finally {
+    source?.close();
+    target?.close();
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
   }
 });
 
@@ -523,7 +575,7 @@ test('snapshot merge import rejects colliding session IDs', async () => {
   } finally {
     source?.close();
     target?.close();
-    cleanupWorkspace(sourceWorkspace);
-    cleanupWorkspace(targetWorkspace);
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
   }
 });

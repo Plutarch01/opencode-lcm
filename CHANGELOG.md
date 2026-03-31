@@ -1,0 +1,65 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- `CHANGELOG.md` for tracking release history
+- Direct regression coverage for scoped FTS refresh and snapshot replace-import stale-row cleanup
+
+### Changed
+- `parseJson()` now wraps errors with input preview and original message for easier debugging
+- Silent `catch {}` blocks in `store-search.ts` replaced with `getLogger().debug()` logging
+- Bun SQLite import replaced with direct `await import('bun:sqlite')` + ambient type declaration (`bun-sqlite.d.ts`)
+- Duplicated artifact hydration switch/case extracted into `hydratePartFromArtifacts()` helper
+- All manual `BEGIN/COMMIT/ROLLBACK` blocks replaced with `withTransaction()` helper
+- Row type definitions unified — `store-snapshot.ts` is the canonical source
+- `validateRow()` added to `sql-utils.ts` for runtime SQL result validation; applied to all `stats()` method queries
+- Dead modules (`store-schema.ts`, `store-session-read.ts`) folded into `store.ts` as private functions with re-exports for test compatibility
+- TF-IDF `filterTokensByTfidf()` doc-frequency ratio fixed to use actual `docFreq/totalDocs`
+- `computeTfidfWeights()` return type extended with `docFreq` field
+- `buildFtsQuery()` now preserves quoted phrases as FTS5 phrase clauses
+- `resolveWorkspacePath()` absolute-path bypass fixed — absolute paths now validated against workspace root
+- Duplicate `COUNT(*)` queries in TF-IDF eliminated — extracted `getTotalDocCount()` helper
+- `importStoreSnapshot()` manual transaction replaced with `withTransaction()`
+- Deduplicated `truncate()`, `shortNodeID()` from `archive-transform.ts` → imported from `utils.ts`
+- Deduplicated `clamp()` from `store.ts` → imported from `utils.ts`
+- Snapshot paths now support absolute paths (portable snapshots) and relative paths resolved from workspace with traversal guard
+- `resolveWorkspacePath()` false-positive fix: names like `..hidden` no longer rejected
+- Search index maintenance can now refresh only selected sessions instead of always rebuilding every FTS table
+- Binary preview providers now use async file reads, and session/message externalization awaits preview generation before writing transactionally
+- Test workspace cleanup now retries transient Windows SQLite file-lock races
+
+### Fixed
+- TF-IDF retrieval filtering bug where document frequency ratio was computed incorrectly
+- Phrase query support broken in FTS5 — quoted strings now passed through as phrase clauses
+- Workspace path security bypass where absolute paths skipped containment check
+- Snapshot path resolution broke portable snapshot imports
+- `store-retention.ts` module recreated after accidental deletion
+- Snapshot replace-import left stale FTS rows behind for replaced sessions
+
+### Security
+- Fixed workspace path validation bypass that allowed absolute paths to escape the workspace root
+- Added `validateRow()` runtime validation for all SQL query results in `stats()` method
+
+## [0.1.0] - 2026-03-31
+
+### Added
+- Initial release of opencode-lcm plugin
+- SQLite-based session storage with FTS5 full-text search
+- Hierarchical summary graph for message archiving
+- Artifact deduplication via content hashing
+- Snapshot export/import for portable session data
+- Automatic retrieval with TF-IDF query weighting
+- Session lineage tracking (parent/child/root relationships)
+- Retention policy enforcement (stale sessions, deleted sessions, orphan blobs)
+- Resume notes for session continuation
+- Doctor command for diagnosing and repairing store integrity
+- Binary preview providers for file artifacts (image dimensions, PDF metadata, ZIP entries)
+- Context-mode interop for sandboxed command execution
+- Worktree-aware scoping for multi-workspace projects
+- 141 tests covering core functionality

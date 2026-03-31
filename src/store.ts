@@ -28,6 +28,7 @@ import {
   buildFtsQuery,
   filterTokensByTfidf,
   rebuildSearchIndexesSync as rebuildSearchIndexesModule,
+  refreshSearchIndexesSync as refreshSearchIndexesModule,
   replaceMessageSearchRowSync as replaceMessageSearchRowModule,
   replaceMessageSearchRowsSync as replaceMessageSearchRowsModule,
   searchByScan as searchByScanModule,
@@ -104,6 +105,16 @@ type ArtifactData = {
   charCount: number;
   createdAt: number;
   metadata: Record<string, unknown>;
+};
+
+type ExternalizedMessage = {
+  storedMessage: ConversationMessage;
+  artifacts: ArtifactData[];
+};
+
+type ExternalizedSession = {
+  storedSession: NormalizedSession;
+  artifacts: ArtifactData[];
 };
 
 export type SessionReadRow = {
@@ -867,9 +878,7 @@ export class SqliteLcmStore {
       normalized,
     );
 
-    withTransaction(this.getDb(), 'capture', () => {
-      this.persistCapturedSessionSync(next, normalized);
-    });
+    await this.persistCapturedSession(next, normalized);
 
     if (this.shouldRefreshLineageForEvent(normalized.type)) {
       this.refreshAllLineageSync();
@@ -996,7 +1005,7 @@ export class SqliteLcmStore {
     );
 
     return {
-      schemaVersion: this.readSchemaVersionSync(),
+      schemaVersion: readSchemaVersionSync(db),
       totalEvents: totalRow.count,
       sessionCount: sessionRow.count,
       latestEventAt: totalRow.latest ?? undefined,
@@ -1168,7 +1177,7 @@ export class SqliteLcmStore {
       before.summarySessionsNeedingRebuild.length > 0 ||
       before.orphanSummaryEdges > 0
     ) {
-      this.rebuildSearchIndexesSync();
+      this.refreshSearchIndexesSync(checkedSessions);
       appliedActions.push('rebuilt FTS indexes');
     }
 
@@ -1594,7 +1603,7 @@ export class SqliteLcmStore {
 
     this.refreshAllLineageSync();
     this.syncAllDerivedSessionStateSync(true);
-    this.rebuildSearchIndexesSync();
+    this.refreshSearchIndexesSync();
 
     return {
       deletedSessions: uniqueSessionIDs.length,
@@ -2393,7 +2402,7 @@ export class SqliteLcmStore {
         backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
         refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
         syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
-        rebuildSearchIndexesSync: this.rebuildSearchIndexesSync.bind(this),
+        refreshSearchIndexesSync: this.refreshSearchIndexesSync.bind(this),
       },
       input,
     );
@@ -3651,6 +3660,8 @@ export class SqliteLcmStore {
         this.readScopedSummaryRowsSync(sessionIDs),
       readScopedArtifactRowsSync: (sessionIDs?: string[]) =>
         this.readScopedArtifactRowsSync(sessionIDs),
+      buildArtifactSearchContent: (row: ArtifactRow) =>
+        this.buildArtifactSearchContent(this.materializeArtifactRow(row)),
       ignoreToolPrefixes: this.options.interop.ignoreToolPrefixes,
       guessMessageText: (message: ConversationMessage, ignorePrefixes: string[]) =>
         guessMessageText(message, ignorePrefixes),
@@ -3675,6 +3686,10 @@ export class SqliteLcmStore {
 
   private rebuildSearchIndexesSync(): void {
     rebuildSearchIndexesModule(this.searchDeps());
+  }
+
+  private refreshSearchIndexesSync(sessionIDs?: string[]): void {
+    refreshSearchIndexesModule(this.searchDeps(), sessionIDs);
   }
 
   private ensureSessionColumnsSync(): void {
@@ -3939,6 +3954,8 @@ export class SqliteLcmStore {
 
   private clearSessionDataSync(sessionID: string): void {
     const db = this.getDb();
+    db.prepare('DELETE FROM message_fts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_fts WHERE session_id = ?').run(sessionID);
     db.prepare('DELETE FROM artifact_fts WHERE session_id = ?').run(sessionID);
     db.prepare('DELETE FROM artifacts WHERE session_id = ?').run(sessionID);
     db.prepare('DELETE FROM summary_edges WHERE session_id = ?').run(sessionID);
@@ -4219,7 +4236,10 @@ export class SqliteLcmStore {
     return parentSessionID;
   }
 
-  private persistCapturedSessionSync(session: NormalizedSession, event: CapturedEvent): void {
+  private async persistCapturedSession(
+    session: NormalizedSession,
+    event: CapturedEvent,
+  ): Promise<void> {
     const payload = event.payload as Event;
 
     switch (payload.type) {
@@ -4227,49 +4247,86 @@ export class SqliteLcmStore {
       case 'session.updated':
       case 'session.deleted':
       case 'session.compacted':
-        this.upsertSessionRowSync(session);
+        withTransaction(this.getDb(), 'capture', () => {
+          this.upsertSessionRowSync(session);
+        });
         return;
       case 'message.updated': {
-        this.upsertSessionRowSync(session);
         const message = session.messages.find(
           (entry) => entry.info.id === payload.properties.info.id,
         );
-        if (message) {
-          this.upsertMessageInfoSync(session.sessionID, message);
-          this.replaceMessageSearchRowSync(session.sessionID, message);
-        }
+        withTransaction(this.getDb(), 'capture', () => {
+          this.upsertSessionRowSync(session);
+          if (message) {
+            this.upsertMessageInfoSync(session.sessionID, message);
+            this.replaceMessageSearchRowSync(session.sessionID, message);
+          }
+        });
         return;
       }
       case 'message.removed':
-        this.upsertSessionRowSync(session);
-        this.deleteMessageSync(session.sessionID, payload.properties.messageID);
+        withTransaction(this.getDb(), 'capture', () => {
+          this.upsertSessionRowSync(session);
+          this.deleteMessageSync(session.sessionID, payload.properties.messageID);
+        });
         return;
       case 'message.part.updated': {
-        this.upsertSessionRowSync(session);
         const message = session.messages.find(
           (entry) => entry.info.id === payload.properties.part.messageID,
         );
-        if (message) this.replaceMessageSync(session.sessionID, message);
+        const externalized = message ? await this.externalizeMessage(message) : undefined;
+        withTransaction(this.getDb(), 'capture', () => {
+          this.upsertSessionRowSync(session);
+          if (externalized) {
+            this.replaceStoredMessageSync(
+              session.sessionID,
+              externalized.storedMessage,
+              externalized.artifacts,
+            );
+          }
+        });
         return;
       }
       case 'message.part.removed': {
-        this.upsertSessionRowSync(session);
         const message = session.messages.find(
           (entry) => entry.info.id === payload.properties.messageID,
         );
-        if (message) this.replaceMessageSync(session.sessionID, message);
+        const externalized = message ? await this.externalizeMessage(message) : undefined;
+        withTransaction(this.getDb(), 'capture', () => {
+          this.upsertSessionRowSync(session);
+          if (externalized) {
+            this.replaceStoredMessageSync(
+              session.sessionID,
+              externalized.storedMessage,
+              externalized.artifacts,
+            );
+          }
+        });
         return;
       }
-      default:
-        this.persistSession(session);
+      default: {
+        const externalized = await this.externalizeSession(session);
+        withTransaction(this.getDb(), 'capture', () => {
+          this.persistStoredSessionSync(externalized.storedSession, externalized.artifacts);
+        });
+      }
     }
   }
 
-  private persistSession(session: NormalizedSession): void {
-    const db = this.getDb();
+  private async persistSession(session: NormalizedSession): Promise<void> {
     const preparedSession = this.prepareSessionForPersistence(session);
-    const { storedSession, artifacts } = this.externalizeSessionSync(preparedSession);
+    const { storedSession, artifacts } = await this.externalizeSession(preparedSession);
 
+    withTransaction(this.getDb(), 'persistSession', () => {
+      this.persistStoredSessionSync(storedSession, artifacts);
+    });
+  }
+
+  private persistStoredSessionSync(
+    storedSession: NormalizedSession,
+    artifacts: ArtifactData[],
+  ): void {
+    const db = this.getDb();
     this.upsertSessionRowSync(storedSession);
 
     db.prepare('DELETE FROM artifact_fts WHERE session_id = ?').run(storedSession.sessionID);
@@ -4375,11 +4432,14 @@ export class SqliteLcmStore {
     );
   }
 
-  private replaceMessageSync(sessionID: string, message: ConversationMessage): void {
+  private replaceStoredMessageSync(
+    sessionID: string,
+    storedMessage: ConversationMessage,
+    artifacts: ArtifactData[],
+  ): void {
     const db = this.getDb();
-    const { storedMessage, artifacts } = this.externalizeMessageSync(message);
 
-    this.deleteMessageSync(sessionID, message.info.id);
+    this.deleteMessageSync(sessionID, storedMessage.info.id);
     this.upsertMessageInfoSync(sessionID, storedMessage);
 
     const insertPart = db.prepare(
@@ -4394,20 +4454,19 @@ export class SqliteLcmStore {
     this.replaceMessageSearchRowSync(sessionID, storedMessage);
   }
 
-  private externalizeMessageSync(message: ConversationMessage): {
-    storedMessage: ConversationMessage;
-    artifacts: ArtifactData[];
-  } {
+  private async externalizeMessage(message: ConversationMessage): Promise<ExternalizedMessage> {
     const artifacts: ArtifactData[] = [];
     const storedInfo = parseJson<Message>(JSON.stringify(message.info));
-    const storedParts = message.parts.map((part) => {
-      const { storedPart, artifacts: nextArtifacts } = this.externalizePartSync(
+    const storedParts: Part[] = [];
+
+    for (const part of message.parts) {
+      const { storedPart, artifacts: nextArtifacts } = await this.externalizePart(
         part,
         message.info.time.created,
       );
       artifacts.push(...nextArtifacts);
-      return storedPart;
-    });
+      storedParts.push(storedPart);
+    }
 
     return {
       storedMessage: {
@@ -4492,13 +4551,13 @@ export class SqliteLcmStore {
     };
   }
 
-  private buildBinaryPreviewArtifact(
+  private async buildBinaryPreviewArtifact(
     file: Extract<Part, { type: 'file' }>,
     fieldName: string,
     label: string,
     createdAt: number,
     extras: Record<string, unknown> = {},
-  ): ArtifactData {
+  ): Promise<ArtifactData> {
     const baseMetadata = this.buildFileArtifactMetadata(file, extras);
     const category = typeof baseMetadata.category === 'string' ? baseMetadata.category : 'binary';
     const extension =
@@ -4508,7 +4567,7 @@ export class SqliteLcmStore {
       (typeof baseMetadata.sourcePath === 'string' ? baseMetadata.sourcePath : undefined) ??
       file.url ??
       'unknown file';
-    const previewDetails = runBinaryPreviewProviders({
+    const previewDetails = await runBinaryPreviewProviders({
       workspaceDirectory: this.workspaceDirectory,
       file,
       category,
@@ -4550,27 +4609,28 @@ export class SqliteLcmStore {
     });
   }
 
-  private externalizeSessionSync(session: NormalizedSession): {
-    storedSession: NormalizedSession;
-    artifacts: ArtifactData[];
-  } {
+  private async externalizeSession(session: NormalizedSession): Promise<ExternalizedSession> {
     const artifacts: ArtifactData[] = [];
-    const storedMessages = session.messages.map((message) => {
+    const storedMessages: ConversationMessage[] = [];
+
+    for (const message of session.messages) {
       const storedInfo = parseJson<Message>(JSON.stringify(message.info));
-      const storedParts = message.parts.map((part) => {
-        const { storedPart, artifacts: nextArtifacts } = this.externalizePartSync(
+      const storedParts: Part[] = [];
+
+      for (const part of message.parts) {
+        const { storedPart, artifacts: nextArtifacts } = await this.externalizePart(
           part,
           message.info.time.created,
         );
         artifacts.push(...nextArtifacts);
-        return storedPart;
-      });
+        storedParts.push(storedPart);
+      }
 
-      return {
+      storedMessages.push({
         info: storedInfo,
         parts: storedParts,
-      };
-    });
+      });
+    }
 
     return {
       storedSession: {
@@ -4581,13 +4641,13 @@ export class SqliteLcmStore {
     };
   }
 
-  private externalizePartSync(
+  private async externalizePart(
     part: Part,
     createdAt: number,
-  ): {
+  ): Promise<{
     storedPart: Part;
     artifacts: ArtifactData[];
-  } {
+  }> {
     const storedPart = parseJson<Part>(JSON.stringify(part));
     const artifacts: ArtifactData[] = [];
 
@@ -4643,37 +4703,36 @@ export class SqliteLcmStore {
         if (storedPart.state.status === 'completed') {
           storedPart.state.output = externalize('tool', 'output', storedPart.state.output);
           if (storedPart.state.attachments) {
-            storedPart.state.attachments = storedPart.state.attachments.map(
-              (attachment: Extract<Part, { type: 'file' }>, index: number) => {
-                const previewMetadata = {
-                  attachmentIndex: index,
-                  tool: storedPart.tool,
-                  title:
-                    storedPart.state.status === 'completed' ? storedPart.state.title : undefined,
-                };
-                artifacts.push(
-                  this.buildBinaryPreviewArtifact(
-                    attachment,
-                    `attachment:${index}`,
-                    `Tool attachment for ${storedPart.tool}`,
-                    createdAt,
-                    previewMetadata,
-                  ),
-                );
+            const storedAttachments: Extract<Part, { type: 'file' }>[] = [];
+            for (const [index, attachment] of storedPart.state.attachments.entries()) {
+              const previewMetadata = {
+                attachmentIndex: index,
+                tool: storedPart.tool,
+                title: storedPart.state.status === 'completed' ? storedPart.state.title : undefined,
+              };
+              artifacts.push(
+                await this.buildBinaryPreviewArtifact(
+                  attachment,
+                  `attachment:${index}`,
+                  `Tool attachment for ${storedPart.tool}`,
+                  createdAt,
+                  previewMetadata,
+                ),
+              );
 
-                if (attachment.source?.text?.value) {
-                  attachment.source.text.value = externalize(
-                    'file',
-                    `attachment_text:${index}`,
-                    attachment.source.text.value,
-                    this.buildFileArtifactMetadata(attachment, previewMetadata),
-                  );
-                  attachment.source.text.start = 0;
-                  attachment.source.text.end = attachment.source.text.value.length;
-                }
-                return attachment;
-              },
-            );
+              if (attachment.source?.text?.value) {
+                attachment.source.text.value = externalize(
+                  'file',
+                  `attachment_text:${index}`,
+                  attachment.source.text.value,
+                  this.buildFileArtifactMetadata(attachment, previewMetadata),
+                );
+                attachment.source.text.start = 0;
+                attachment.source.text.end = attachment.source.text.value.length;
+              }
+              storedAttachments.push(attachment);
+            }
+            storedPart.state.attachments = storedAttachments;
           }
         }
         if (storedPart.state.status === 'error') {
@@ -4682,7 +4741,12 @@ export class SqliteLcmStore {
         break;
       case 'file':
         artifacts.push(
-          this.buildBinaryPreviewArtifact(storedPart, 'reference', 'File reference', createdAt),
+          await this.buildBinaryPreviewArtifact(
+            storedPart,
+            'reference',
+            'File reference',
+            createdAt,
+          ),
         );
         if (storedPart.source?.text?.value) {
           storedPart.source.text.value = externalize(
@@ -4809,7 +4873,7 @@ export class SqliteLcmStore {
       for (const entry of entries.filter((item) => item.endsWith('.json'))) {
         const content = await readFile(path.join(sessionsDir, entry), 'utf8');
         const session = parseJson<NormalizedSession>(content);
-        this.persistSession(session);
+        await this.persistSession(session);
       }
     } catch (error) {
       getLogger().debug('Legacy session snapshot migration skipped', { error });
@@ -4849,7 +4913,11 @@ export class SqliteLcmStore {
   }
 
   private getDb(): SqlDatabaseLike {
-    if (!this.db) throw new Error('LCM store not initialized');
+    if (!this.db) {
+      throw new Error(
+        'LCM store database not ready. Call store.init() before any store operation.',
+      );
+    }
     return this.db;
   }
 }
