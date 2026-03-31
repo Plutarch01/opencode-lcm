@@ -58,6 +58,7 @@ import type {
 } from './types.js';
 import {
   asRecord,
+  clamp,
   classifyFileCategory,
   filterIntentTokens,
   firstFiniteNumber,
@@ -362,10 +363,6 @@ function compareMessages(a: ConversationMessage, b: ConversationMessage): number
 
 function buildSummaryNodeID(sessionID: string, level: number, slot: number): string {
   return `sum_${hashContent(`summary:${sessionID}`).slice(0, 12)}_l${level}_p${slot}`;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }
 
 function hydratePartFromArtifacts(part: Part, artifacts: ArtifactData[]): void {

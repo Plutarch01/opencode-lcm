@@ -198,47 +198,46 @@ test('snapshot import rebuilds stale imported summary graphs before reuse', asyn
   }
 });
 
-test('snapshot paths must stay within the workspace', async () => {
+test('snapshot paths can be outside the workspace (portable snapshots)', async () => {
   const workspace = makeWorkspace('lcm-snapshot-paths');
   const outsideWorkspace = makeWorkspace('lcm-snapshot-paths-outside');
   const outsideSnapshotPath = path.join(outsideWorkspace, 'snapshot.json');
-  const relativeOutsideSnapshotPath = path.relative(workspace, outsideSnapshotPath);
   let store;
 
   try {
     store = new SqliteLcmStore(workspace, makeOptions());
     await store.init();
 
-    writeFileSync(
-      outsideSnapshotPath,
-      JSON.stringify(
-        {
-          version: 1,
-          exportedAt: 1,
-          scope: 'all',
-          sessions: [],
-          messages: [],
-          parts: [],
-          resumes: [],
-          artifacts: [],
-          artifact_blobs: [],
-          summary_nodes: [],
-          summary_edges: [],
-          summary_state: [],
-        },
-        null,
-        2,
-      ),
-    );
+    const snapshot = {
+      version: 1,
+      exportedAt: 1,
+      scope: 'all',
+      sessions: [],
+      messages: [],
+      parts: [],
+      resumes: [],
+      artifacts: [],
+      artifact_blobs: [],
+      summary_nodes: [],
+      summary_edges: [],
+      summary_state: [],
+    };
 
-    await assert.rejects(
-      () => store.exportSnapshot({ filePath: relativeOutsideSnapshotPath, scope: 'all' }),
-      /Path must stay within the workspace/,
-    );
-    await assert.rejects(
-      () => store.importSnapshot({ filePath: relativeOutsideSnapshotPath, mode: 'replace' }),
-      /Path must stay within the workspace/,
-    );
+    writeFileSync(outsideSnapshotPath, JSON.stringify(snapshot, null, 2));
+
+    // Export to outside workspace should work (portable snapshots)
+    const exportResult = await store.exportSnapshot({
+      filePath: outsideSnapshotPath,
+      scope: 'all',
+    });
+    assert.match(exportResult, /file=/);
+
+    // Import from outside workspace should also work
+    const importResult = await store.importSnapshot({
+      filePath: outsideSnapshotPath,
+      mode: 'replace',
+    });
+    assert.match(importResult, /file=/);
   } finally {
     store?.close();
     cleanupWorkspace(workspace);

@@ -1,4 +1,5 @@
 import type { ConversationMessage, SearchResult } from './types.js';
+import { shortNodeID, truncate } from './utils.js';
 
 export type AutomaticRetrievalHit = {
   kind: 'message' | 'summary' | 'artifact';
@@ -37,14 +38,6 @@ type AutomaticRetrievalQuotas = {
   summary: number;
   artifact: number;
 };
-
-function truncate(text: string, limit: number): string {
-  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 3))}...`;
-}
-
-function shortNodeID(nodeID: string): string {
-  return nodeID.length <= 32 ? nodeID : `${nodeID.slice(0, 20)}...${nodeID.slice(-8)}`;
-}
 
 export function resolveArchiveTransformWindow(
   messages: ConversationMessage[],
