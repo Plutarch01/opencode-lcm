@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { withTransaction } from './sql-utils.js';
 import type { SqlDatabaseLike } from './store-types.js';
+import { resolveWorkspacePath } from './workspace-path.js';
 import { normalizeWorktreeKey } from './worktree-key.js';
 
 export type SnapshotScope = 'session' | 'root' | 'worktree' | 'all';
@@ -171,7 +172,9 @@ export async function exportStoreSnapshot(
     summary_state: bindings.readScopedSummaryStateRowsSync(sessionIDs),
   };
 
-  const targetPath = path.resolve(input.filePath);
+  const targetPath = path.isAbsolute(input.filePath)
+    ? path.normalize(input.filePath)
+    : resolveWorkspacePath(bindings.workspaceDirectory, input.filePath);
   await writeFile(targetPath, JSON.stringify(snapshot, null, 2), 'utf8');
   return [
     `file=${targetPath}`,
@@ -190,7 +193,9 @@ export async function importStoreSnapshot(
   bindings: SnapshotImportBindings,
   input: ImportSnapshotInput,
 ): Promise<string> {
-  const sourcePath = path.resolve(input.filePath);
+  const sourcePath = path.isAbsolute(input.filePath)
+    ? path.normalize(input.filePath)
+    : resolveWorkspacePath(bindings.workspaceDirectory, input.filePath);
   const snapshot = parseSnapshotPayload(await readFile(sourcePath, 'utf8'));
   const db = bindings.getDb();
   const sessionIDs = [...new Set(snapshot.sessions.map((row) => row.session_id))];
