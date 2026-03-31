@@ -245,6 +245,57 @@ test('snapshot paths can be outside the workspace (portable snapshots)', async (
   }
 });
 
+test('snapshot relative paths resolve from the workspace and still block traversal', async () => {
+  const workspace = makeWorkspace('lcm-snapshot-relative');
+  const relativeSnapshotPath = path.join('.lcm', 'portable-snapshot.json');
+  const absoluteSnapshotPath = path.join(workspace, relativeSnapshotPath);
+  const traversalPath = path.join('..', 'outside-snapshot.json');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await createSession(store, workspace, 'relative-session', 1);
+    await captureMessage(store, {
+      sessionID: 'relative-session',
+      messageID: 'm1',
+      created: 2,
+      parts: [textPart('relative-session', 'm1', 'm1-p', 'relative snapshot body')],
+    });
+
+    const exportText = await store.exportSnapshot({
+      filePath: relativeSnapshotPath,
+      scope: 'all',
+    });
+    const importText = await store.importSnapshot({
+      filePath: relativeSnapshotPath,
+      mode: 'replace',
+    });
+
+    assert.match(
+      exportText,
+      new RegExp(`file=${absoluteSnapshotPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+    );
+    assert.match(
+      importText,
+      new RegExp(`file=${absoluteSnapshotPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+    );
+
+    await assert.rejects(
+      () => store.exportSnapshot({ filePath: traversalPath, scope: 'all' }),
+      /Path must stay within the workspace/,
+    );
+    await assert.rejects(
+      () => store.importSnapshot({ filePath: traversalPath, mode: 'replace' }),
+      /Path must stay within the workspace/,
+    );
+  } finally {
+    store?.close();
+    cleanupWorkspace(workspace);
+  }
+});
+
 test('snapshot import rejects malformed payloads', async () => {
   const workspace = makeWorkspace('lcm-snapshot-invalid');
   const snapshotPath = path.join(workspace, 'invalid-snapshot.json');

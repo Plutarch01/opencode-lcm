@@ -7,7 +7,12 @@ export function resolveWorkspacePath(workspaceDirectory: string, inputPath: stri
     : path.resolve(workspaceRoot, inputPath);
   const relativePath = path.relative(workspaceRoot, resolvedPath);
 
-  if (relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))) {
+  const escapesWorkspace =
+    relativePath === '..' ||
+    relativePath.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativePath);
+
+  if (!escapesWorkspace) {
     return resolvedPath;
   }
 

@@ -47,6 +47,13 @@ test('accepts absolute paths within workspace', () => {
   assert.equal(result, absPath);
 });
 
+test('accepts relative paths whose segment names start with two dots', () => {
+  const { ws } = makeWorkspace();
+  const input = path.join('..hidden', 'file.txt');
+  const result = resolveWorkspacePath(ws, input);
+  assert.equal(result, path.join(ws, '..hidden', 'file.txt'));
+});
+
 test('rejects absolute paths outside workspace', () => {
   const { ws, base } = makeWorkspace();
   assert.throws(() => resolveWorkspacePath(ws, base), /Path must stay within the workspace/);
