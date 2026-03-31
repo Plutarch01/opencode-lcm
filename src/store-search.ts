@@ -18,9 +18,15 @@ type FtsDeps = {
 };
 
 export function buildFtsQuery(query: string): string | undefined {
-  const tokens = sanitizeFtsTokens(tokenizeQuery(query));
-  if (tokens.length === 0) return undefined;
-  return tokens.map((token) => `${token}*`).join(' AND ');
+  const phrases = [...query.matchAll(/"([^"]+)"/g)]
+    .map((match) => sanitizeFtsTokens(tokenizeQuery(match[1])).join(' '))
+    .filter(Boolean)
+    .map((phrase) => `"${phrase}"`);
+  const remainder = query.replace(/"[^"]+"/g, ' ');
+  const tokens = sanitizeFtsTokens(tokenizeQuery(remainder)).map((token) => `${token}*`);
+  const parts = [...phrases, ...tokens];
+  if (parts.length === 0) return undefined;
+  return parts.join(' AND ');
 }
 
 /**
@@ -34,7 +40,7 @@ export function buildFtsQuery(query: string): string | undefined {
 export function computeTfidfWeights(
   db: SqlDatabaseLike,
   candidateTokens: string[],
-): Array<{ token: string; idf: number }> {
+): Array<{ token: string; idf: number; docFreq: number }> {
   if (candidateTokens.length === 0) return [];
 
   // Get total document counts from each FTS table
@@ -49,7 +55,7 @@ export function computeTfidfWeights(
   }) ?? { count: 0 };
   const totalDocs = Math.max(1, messageCount.count + summaryCount.count + artifactCount.count);
 
-  const results: Array<{ token: string; idf: number }> = [];
+  const results: Array<{ token: string; idf: number; docFreq: number }> = [];
 
   for (const token of candidateTokens) {
     // Query document frequency across all FTS tables
@@ -87,7 +93,7 @@ export function computeTfidfWeights(
     // Smoothed IDF: log(N / (df + 1)) + 1
     // Smoothing prevents division by zero and ensures non-zero weights
     const idf = Math.log(totalDocs / (docFreq + 1)) + 1;
-    results.push({ token, idf });
+    results.push({ token, idf, docFreq });
   }
 
   // Sort by descending IDF — most informative tokens first
@@ -134,7 +140,7 @@ export function filterTokensByTfidf(
   // Filter: keep tokens with IDF >= median AND below common-ratio threshold
   // Always keep at least minTokens tokens (the highest-IDF ones)
   const filtered = weights.filter((w) => {
-    const docRatio = 1 - Math.exp(w.idf - 1) / totalDocs;
+    const docRatio = w.docFreq / totalDocs;
     return w.idf >= medianIdf && docRatio <= maxCommonRatio;
   });
 
