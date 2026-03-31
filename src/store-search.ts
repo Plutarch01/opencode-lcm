@@ -37,13 +37,7 @@ export function buildFtsQuery(query: string): string | undefined {
  * Uses a single FTS5 query per token to get document frequency, which is
  * acceptable since automatic retrieval works with ≤10 candidate tokens.
  */
-export function computeTfidfWeights(
-  db: SqlDatabaseLike,
-  candidateTokens: string[],
-): Array<{ token: string; idf: number; docFreq: number }> {
-  if (candidateTokens.length === 0) return [];
-
-  // Get total document counts from each FTS table
+function getTotalDocCount(db: SqlDatabaseLike): number {
   const messageCount = (db.prepare('SELECT COUNT(*) AS count FROM message_fts').get() as {
     count: number;
   }) ?? { count: 0 };
@@ -53,7 +47,16 @@ export function computeTfidfWeights(
   const artifactCount = (db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get() as {
     count: number;
   }) ?? { count: 0 };
-  const totalDocs = Math.max(1, messageCount.count + summaryCount.count + artifactCount.count);
+  return Math.max(1, messageCount.count + summaryCount.count + artifactCount.count);
+}
+
+export function computeTfidfWeights(
+  db: SqlDatabaseLike,
+  candidateTokens: string[],
+): Array<{ token: string; idf: number; docFreq: number }> {
+  if (candidateTokens.length === 0) return [];
+
+  const totalDocs = getTotalDocCount(db);
 
   const results: Array<{ token: string; idf: number; docFreq: number }> = [];
 
@@ -118,17 +121,8 @@ export function filterTokensByTfidf(
   const weights = computeTfidfWeights(db, candidateTokens);
   if (weights.length === 0) return candidateTokens;
 
-  // Get total docs for common-ratio threshold
-  const messageCount = (db.prepare('SELECT COUNT(*) AS count FROM message_fts').get() as {
-    count: number;
-  }) ?? { count: 0 };
-  const summaryCount = (db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get() as {
-    count: number;
-  }) ?? { count: 0 };
-  const artifactCount = (db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get() as {
-    count: number;
-  }) ?? { count: 0 };
-  const totalDocs = Math.max(1, messageCount.count + summaryCount.count + artifactCount.count);
+  // Get total docs for common-ratio threshold (already computed inside computeTfidfWeights, but needed here for ratio)
+  const totalDocs = getTotalDocCount(db);
 
   // Compute median IDF
   const sortedIdfs = weights.map((w) => w.idf).sort((a, b) => a - b);

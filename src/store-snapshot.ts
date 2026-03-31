@@ -1,6 +1,8 @@
 import { readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
-import { resolveWorkspacePath } from './workspace-path.js';
+import { withTransaction } from './sql-utils.js';
+import type { SqlDatabaseLike } from './store-types.js';
 import { normalizeWorktreeKey } from './worktree-key.js';
 
 export type SnapshotScope = 'session' | 'root' | 'worktree' | 'all';
@@ -147,11 +149,6 @@ type SqlStatementLike = {
   all(...args: unknown[]): unknown;
 };
 
-type SqlDatabaseLike = {
-  exec(sql: string): unknown;
-  prepare(sql: string): SqlStatementLike;
-};
-
 export async function exportStoreSnapshot(
   bindings: SnapshotExportBindings,
   input: ExportSnapshotInput,
@@ -174,7 +171,7 @@ export async function exportStoreSnapshot(
     summary_state: bindings.readScopedSummaryStateRowsSync(sessionIDs),
   };
 
-  const targetPath = resolveWorkspacePath(bindings.workspaceDirectory, input.filePath);
+  const targetPath = path.resolve(input.filePath);
   await writeFile(targetPath, JSON.stringify(snapshot, null, 2), 'utf8');
   return [
     `file=${targetPath}`,
@@ -193,7 +190,7 @@ export async function importStoreSnapshot(
   bindings: SnapshotImportBindings,
   input: ImportSnapshotInput,
 ): Promise<string> {
-  const sourcePath = resolveWorkspacePath(bindings.workspaceDirectory, input.filePath);
+  const sourcePath = path.resolve(input.filePath);
   const snapshot = parseSnapshotPayload(await readFile(sourcePath, 'utf8'));
   const db = bindings.getDb();
   const sessionIDs = [...new Set(snapshot.sessions.map((row) => row.session_id))];
@@ -218,8 +215,7 @@ export async function importStoreSnapshot(
       )
     : snapshot.sessions;
 
-  db.exec('BEGIN');
-  try {
+  withTransaction(db, 'importSnapshot', () => {
     if (input.mode !== 'merge') {
       for (const sessionID of sessionIDs) bindings.clearSessionDataSync(sessionID);
     }
@@ -334,12 +330,7 @@ export async function importStoreSnapshot(
         row.updated_at,
       );
     }
-
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
+  });
 
   bindings.backfillArtifactBlobsSync();
   bindings.refreshAllLineageSync();
