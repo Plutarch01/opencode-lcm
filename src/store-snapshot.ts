@@ -142,7 +142,7 @@ export type SnapshotImportBindings = {
   backfillArtifactBlobsSync(): void;
   refreshAllLineageSync(): void;
   syncAllDerivedSessionStateSync(force: boolean): void;
-  rebuildSearchIndexesSync(): void;
+  refreshSearchIndexesSync(sessionIDs?: string[]): void;
 };
 
 type SqlStatementLike = {
@@ -340,7 +340,7 @@ export async function importStoreSnapshot(
   bindings.backfillArtifactBlobsSync();
   bindings.refreshAllLineageSync();
   bindings.syncAllDerivedSessionStateSync(true);
-  bindings.rebuildSearchIndexesSync();
+  bindings.refreshSearchIndexesSync(sessionIDs);
   return [
     `file=${sourcePath}`,
     `mode=${input.mode ?? 'replace'}`,

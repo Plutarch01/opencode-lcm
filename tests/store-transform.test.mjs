@@ -57,7 +57,7 @@ test('transformMessages is a no-op below the configured threshold', async () => 
     assert.equal(messages[2].parts[0].text, 'latest message');
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -144,7 +144,7 @@ test('transformMessages automatically injects relevant archived memory snippets'
     assert.ok(!retrievalPart.text.includes('id=m4'));
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -253,7 +253,7 @@ test('automatic retrieval ignores framing words like "say" and recalls the archi
     assert.ok(!retrievalPart.text.includes('session=s1 id=m4'));
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -348,7 +348,7 @@ test('automatic retrieval can build recall queries from later intent tokens', as
     assert.match(retrievalPart.text, /queries=.*tenant mapping sqlite/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -459,7 +459,7 @@ test('automatic retrieval ignores pasted system reminders on low-signal confirma
     assert.ok(summaryPart);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -586,7 +586,7 @@ test('automatic retrieval ignores low-signal commit turns even with noisy nearby
     assert.ok(summaryPart);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -697,7 +697,7 @@ test('automatic retrieval ignores meta-heavy artifact snippets when real message
     assert.ok(!retrievalPart.text.includes('artifact:tool'));
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -783,7 +783,7 @@ test('automatic retrieval escalates from session to worktree when nearby archive
     assert.match(retrievalPart.text, /billing cache/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -858,7 +858,7 @@ test('automatic retrieval respects configured scope order', async () => {
     assert.match(retrievalPart.text, /message session=older id=om1/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -941,7 +941,7 @@ test('automatic retrieval can skip a scope with a zero budget', async () => {
     assert.match(retrievalPart.text, /message session=older id=om1/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1049,7 +1049,7 @@ test('automatic retrieval can stop after the first scope with hits', async () =>
     assert.ok(!retrievalPart.text.includes('session=older id=om1'));
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1111,7 +1111,7 @@ test('transformMessages can disable automatic archived retrieval', async () => {
     );
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1179,7 +1179,7 @@ test('transformMessages anchors synthetic context on the latest user when the re
     assert.equal(messages[3].parts[0].state.output, 'first tool output');
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1226,7 +1226,7 @@ test('buildCompactionContext keeps the latest user outside the archived summary 
     assert.ok(!expanded.includes('current user request'));
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1300,7 +1300,7 @@ test('summary rebuilds when archived content changes and expand can target raw m
     assert.match(targeted, /omega revised goal/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1369,7 +1369,7 @@ test('summary node IDs remain expandable after the archive grows and roots chang
     assert.match(expandedOldNode, /archived note six/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1430,7 +1430,7 @@ test('resume refreshes managed notes instead of reusing stale stored node IDs', 
   } finally {
     db?.close();
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1497,7 +1497,7 @@ test('stale cached summary nodes are detected and rebuilt before reuse', async (
   } finally {
     driftDb?.close();
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1547,7 +1547,7 @@ test('session reparenting refreshes descendant managed resume notes', async () =
     assert.match(lineage, /Parent session: branch/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1585,6 +1585,6 @@ test('session updates refuse parent cycles and keep lineage stable', async () =>
     assert.match(leafLineage, /Lineage depth: 2/);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });

@@ -37,8 +37,21 @@ export function makeWorkspace(prefix) {
   return mkdtempSync(path.join(tmpdir(), `${prefix}-`));
 }
 
-export function cleanupWorkspace(workspace) {
-  rmSync(workspace, { recursive: true, force: true });
+export async function cleanupWorkspace(workspace) {
+  // On Windows, SQLite may hold file handles briefly after close().
+  // Retry with exponential backoff to avoid EBUSY failures.
+  let attempt = 0;
+  while (attempt < 8) {
+    try {
+      rmSync(workspace, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (err.code !== 'EBUSY' && err.code !== 'EPERM') throw err;
+      attempt++;
+      if (attempt >= 8) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** (attempt - 1)));
+    }
+  }
 }
 
 export function makeOptions(overrides = {}) {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 
 import type { Part } from '@opencode-ai/sdk';
 
@@ -148,7 +148,7 @@ const fingerprintProvider: Provider = {
     if (!filePath || !bytes) return { metadata: {}, lines: [], summaryBits: [] };
 
     const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const sizeBytes = statSync(filePath).size;
+    const sizeBytes = bytes.length;
     return {
       metadata: {
         previewLocalPath: filePath,
@@ -245,27 +245,25 @@ const PROVIDERS: Provider[] = [
   zipMetadataProvider,
 ];
 
-export function runBinaryPreviewProviders(context: PreviewContext): PreviewOutput {
+export async function runBinaryPreviewProviders(context: PreviewContext): Promise<PreviewOutput> {
+  const localPath = inferLocalPath(context.workspaceDirectory, context.file);
   let resolvedPath: string | undefined;
   let resolvedBytes: Buffer | undefined;
 
+  if (localPath) {
+    try {
+      resolvedBytes = await readFile(localPath);
+      resolvedPath = localPath;
+    } catch (error) {
+      getLogger().debug('Failed to read file bytes for preview', { filePath: localPath, error });
+    }
+  }
+
   const helpers: ProviderHelpers = {
     resolvePath() {
-      if (resolvedPath !== undefined) return resolvedPath;
-      const localPath = inferLocalPath(context.workspaceDirectory, context.file);
-      resolvedPath = localPath && existsSync(localPath) ? localPath : undefined;
       return resolvedPath;
     },
     readBytes() {
-      if (resolvedBytes !== undefined) return resolvedBytes;
-      const filePath = helpers.resolvePath();
-      if (!filePath) return undefined;
-      try {
-        resolvedBytes = readFileSync(filePath);
-      } catch (error) {
-        getLogger().debug('Failed to read file bytes for preview', { filePath, error });
-        resolvedBytes = undefined;
-      }
       return resolvedBytes;
     },
   };

@@ -82,7 +82,7 @@ test('large repeated content is externalized, deduplicated, and capture cleanup 
     assert.equal(after.orphanArtifactBlobCount, 0);
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -172,6 +172,6 @@ test('search prefers direct message hits, indexes artifact metadata, and falls b
     assert.equal(fallback[0].id, 'm5');
   } finally {
     store?.close();
-    cleanupWorkspace(workspace);
+    await cleanupWorkspace(workspace);
   }
 });

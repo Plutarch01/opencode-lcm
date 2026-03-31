@@ -10,12 +10,29 @@ type FtsDeps = {
   readScopedSessionsSync(sessionIDs?: string[]): NormalizedSession[];
   readScopedSummaryRowsSync(sessionIDs?: string[]): SummaryNodeRow[];
   readScopedArtifactRowsSync(sessionIDs?: string[]): ArtifactRow[];
+  buildArtifactSearchContent(row: ArtifactRow): string;
   ignoreToolPrefixes: string[];
   guessMessageText(
     message: NormalizedSession['messages'][number],
     ignorePrefixes: string[],
   ): string;
 };
+
+function deleteScopedFtsRows(
+  db: SqlDatabaseLike,
+  table: 'message_fts' | 'summary_fts' | 'artifact_fts',
+  sessionIDs?: string[],
+): void {
+  if (!sessionIDs) {
+    db.prepare(`DELETE FROM ${table}`).run();
+    return;
+  }
+  if (sessionIDs.length === 0) return;
+
+  db.prepare(
+    `DELETE FROM ${table} WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')})`,
+  ).run(...sessionIDs);
+}
 
 export function buildFtsQuery(query: string): string | undefined {
   const phrases = [...query.matchAll(/"([^"]+)"/g)]
@@ -328,6 +345,11 @@ export function searchByScan(
 export function replaceMessageSearchRowsSync(deps: FtsDeps, session: NormalizedSession): void {
   const db = deps.getDb();
   db.prepare('DELETE FROM message_fts WHERE session_id = ?').run(session.sessionID);
+  insertMessageSearchRowsSync(deps, session);
+}
+
+function insertMessageSearchRowsSync(deps: FtsDeps, session: NormalizedSession): void {
+  const db = deps.getDb();
   const insert = db.prepare(
     'INSERT INTO message_fts (session_id, message_id, role, created_at, content) VALUES (?, ?, ?, ?, ?)',
   );
@@ -361,19 +383,11 @@ export function replaceMessageSearchRowSync(
   ).run(sessionID, message.info.id, message.info.role, String(message.info.time.created), content);
 }
 
-export function rebuildSearchIndexesSync(deps: FtsDeps): void {
+export function replaceSummarySearchRowsSync(deps: FtsDeps, sessionIDs?: string[]): void {
   const db = deps.getDb();
-  db.prepare('DELETE FROM message_fts').run();
-  db.prepare('DELETE FROM summary_fts').run();
-  db.prepare('DELETE FROM artifact_fts').run();
+  deleteScopedFtsRows(db, 'summary_fts', sessionIDs);
 
-  for (const session of deps.readScopedSessionsSync()) {
-    replaceMessageSearchRowsSync(deps, session);
-  }
-
-  const summaryRows = db
-    .prepare('SELECT * FROM summary_nodes ORDER BY created_at ASC')
-    .all() as SummaryNodeRow[];
+  const summaryRows = deps.readScopedSummaryRowsSync(sessionIDs);
   const insert = db.prepare(
     'INSERT INTO summary_fts (session_id, node_id, level, created_at, content) VALUES (?, ?, ?, ?, ?)',
   );
@@ -386,30 +400,41 @@ export function rebuildSearchIndexesSync(deps: FtsDeps): void {
       row.summary_text,
     );
   }
+}
 
-  const artifactRows = db
-    .prepare('SELECT * FROM artifacts ORDER BY created_at ASC')
-    .all() as Array<{
-    session_id: string;
-    artifact_id: string;
-    message_id: string;
-    part_id: string;
-    artifact_kind: string;
-    created_at: number;
-  }>;
-  const insertArtifact = db.prepare(
+export function replaceArtifactSearchRowsSync(deps: FtsDeps, sessionIDs?: string[]): void {
+  const db = deps.getDb();
+  deleteScopedFtsRows(db, 'artifact_fts', sessionIDs);
+
+  const artifactRows = deps.readScopedArtifactRowsSync(sessionIDs);
+  const insert = db.prepare(
     'INSERT INTO artifact_fts (session_id, artifact_id, message_id, part_id, artifact_kind, created_at, content) VALUES (?, ?, ?, ?, ?, ?, ?)',
   );
   for (const row of artifactRows) {
-    const artifactContent = [row.artifact_id, row.artifact_kind].join(' ');
-    insertArtifact.run(
+    insert.run(
       row.session_id,
       row.artifact_id,
       row.message_id,
       row.part_id,
       row.artifact_kind,
       String(row.created_at),
-      artifactContent,
+      deps.buildArtifactSearchContent(row),
     );
   }
+}
+
+export function refreshSearchIndexesSync(deps: FtsDeps, sessionIDs?: string[]): void {
+  const db = deps.getDb();
+  deleteScopedFtsRows(db, 'message_fts', sessionIDs);
+
+  for (const session of deps.readScopedSessionsSync(sessionIDs)) {
+    insertMessageSearchRowsSync(deps, session);
+  }
+
+  replaceSummarySearchRowsSync(deps, sessionIDs);
+  replaceArtifactSearchRowsSync(deps, sessionIDs);
+}
+
+export function rebuildSearchIndexesSync(deps: FtsDeps): void {
+  refreshSearchIndexesSync(deps);
 }
