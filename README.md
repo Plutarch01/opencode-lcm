@@ -4,7 +4,7 @@ A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode)
 
 ## Status
 
-MVP, plugin-first, tested with OpenCode and SQLite. Designed for long-session recall across compaction boundaries. Tested primarily on Windows with Node 22 and OpenCode's plugin system.
+Production-ready, plugin-first, tested with OpenCode and SQLite. Designed for long-session recall across compaction boundaries. Tested primarily on Windows with Node 22 and OpenCode's plugin system.
 
 ## Recommended Companion: context-mode
 
@@ -31,6 +31,8 @@ OpenCode still handles compaction the normal way: when the active conversation g
 - SQLite FTS search across archived messages, summary nodes, and externalized artifacts
 - Configurable default retrieval scopes (session, root, worktree) with worktree profiles
 - Bounded automatic recall with configurable scope order, per-scope budgets, stop rules, recency-aware ranking, and visible recall telemetry
+- TF-IDF weighted automatic retrieval that queries FTS5 for document frequency to drop corpus-common noise tokens, replacing static stopword lists with corpus-aware scoring
+- Bigram phrase queries for better adjacency matching in automatic retrieval
 - Configurable binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata)
 - Auto-migrate legacy `.lcm/events.jsonl`, `.lcm/resume.json`, and `.lcm/sessions/*.json`
 
@@ -147,14 +149,19 @@ Three ways to turn off the plugin without removing it:
 - `src/index.ts` - plugin entrypoint and OpenCode hooks
 - `src/options.ts` - option normalization and defaults
 - `src/types.ts` - shared types
-- `src/store.ts` - SQLite store, FTS search, summary DAG, artifact externalization, and archive repair
+- `src/store.ts` - SQLite store with event-driven state machine, FTS integration, summary DAG, artifact externalization, and archive repair
+- `src/store-search.ts` - extracted FTS5 search module with TF-IDF token weighting, query building, and index management
 - `src/store-snapshot.ts` - portable snapshot export/import with worktree-mode controls and path-safety guards
 - `src/workspace-path.ts` - safe workspace-relative path resolution
 - `src/worktree-key.ts` - worktree key normalization
-- `src/archive-transform.ts` - archive window selection and synthetic context rendering
-- `src/search-ranking.ts` - cross-source search ranking
+- `src/archive-transform.ts` - archive window selection, automatic retrieval with TF-IDF filtering, and synthetic context rendering
+- `src/search-ranking.ts` - cross-source search ranking with named scoring constants
+- `src/sql-utils.ts` - safe SQL query wrappers that replace raw `as` type assertions
+- `src/logging.ts` - structured debug logger for plugin diagnostics
 - `src/doctor.ts` - archive health report formatting (includes `invalid-summary-graph` diagnosis)
 - `src/preview-providers.ts` - configurable binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata)
+- `src/utils.ts` - shared utilities including tokenization, snippet building, and TF-IDF helpers
+- `src/constants.ts` - shared constants and thresholds
 - `docs/interop-mvp.md` - hook ownership, conflict rules, and next milestones
 
 ## Next milestones
