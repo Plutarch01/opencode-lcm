@@ -36,6 +36,129 @@ export function buildFtsQuery(query: string): string | undefined {
   return tokens.map((token) => `${token}*`).join(' AND ');
 }
 
+/**
+ * Compute TF-IDF weights for candidate query tokens against the FTS5 corpus.
+ * Returns tokens sorted by descending IDF score (most informative first).
+ * Tokens that appear in >80% of documents are dropped as corpus-common noise.
+ *
+ * Uses a single FTS5 query per token to get document frequency, which is
+ * acceptable since automatic retrieval works with ≤10 candidate tokens.
+ */
+export function computeTfidfWeights(
+  db: SqlDatabaseLike,
+  candidateTokens: string[],
+): Array<{ token: string; idf: number }> {
+  if (candidateTokens.length === 0) return [];
+
+  // Get total document counts from each FTS table
+  const messageCount = (db.prepare('SELECT COUNT(*) AS count FROM message_fts').get() as {
+    count: number;
+  }) ?? { count: 0 };
+  const summaryCount = (db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get() as {
+    count: number;
+  }) ?? { count: 0 };
+  const artifactCount = (db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get() as {
+    count: number;
+  }) ?? { count: 0 };
+  const totalDocs = Math.max(1, messageCount.count + summaryCount.count + artifactCount.count);
+
+  const results: Array<{ token: string; idf: number }> = [];
+
+  for (const token of candidateTokens) {
+    // Query document frequency across all FTS tables
+    // FTS5 MATCH 'token*' finds all documents containing terms with this prefix
+    const query = `${token}*`;
+    let docFreq = 0;
+
+    try {
+      const msgFreq = db
+        .prepare('SELECT COUNT(*) AS count FROM message_fts WHERE message_fts MATCH ?')
+        .get(query) as { count: number } | undefined;
+      docFreq += msgFreq?.count ?? 0;
+    } catch {
+      // Token may be an FTS5 reserved word or malformed — skip
+    }
+
+    try {
+      const sumFreq = db
+        .prepare('SELECT COUNT(*) AS count FROM summary_fts WHERE summary_fts MATCH ?')
+        .get(query) as { count: number } | undefined;
+      docFreq += sumFreq?.count ?? 0;
+    } catch {
+      // Skip
+    }
+
+    try {
+      const artFreq = db
+        .prepare('SELECT COUNT(*) AS count FROM artifact_fts WHERE artifact_fts MATCH ?')
+        .get(query) as { count: number } | undefined;
+      docFreq += artFreq?.count ?? 0;
+    } catch {
+      // Skip
+    }
+
+    // Smoothed IDF: log(N / (df + 1)) + 1
+    // Smoothing prevents division by zero and ensures non-zero weights
+    const idf = Math.log(totalDocs / (docFreq + 1)) + 1;
+    results.push({ token, idf });
+  }
+
+  // Sort by descending IDF — most informative tokens first
+  results.sort((a, b) => b.idf - a.idf);
+
+  return results;
+}
+
+/**
+ * Filter candidate tokens using TF-IDF weights.
+ * Drops tokens whose IDF is below the median (corpus-common terms)
+ * and tokens that appear in >80% of documents.
+ * Returns tokens sorted by descending IDF.
+ */
+export function filterTokensByTfidf(
+  db: SqlDatabaseLike,
+  candidateTokens: string[],
+  options?: { maxCommonRatio?: number; minTokens?: number },
+): string[] {
+  const { maxCommonRatio = 0.8, minTokens = 1 } = options ?? {};
+
+  const weights = computeTfidfWeights(db, candidateTokens);
+  if (weights.length === 0) return candidateTokens;
+
+  // Get total docs for common-ratio threshold
+  const messageCount = (db.prepare('SELECT COUNT(*) AS count FROM message_fts').get() as {
+    count: number;
+  }) ?? { count: 0 };
+  const summaryCount = (db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get() as {
+    count: number;
+  }) ?? { count: 0 };
+  const artifactCount = (db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get() as {
+    count: number;
+  }) ?? { count: 0 };
+  const totalDocs = Math.max(1, messageCount.count + summaryCount.count + artifactCount.count);
+
+  // Compute median IDF
+  const sortedIdfs = weights.map((w) => w.idf).sort((a, b) => a - b);
+  const medianIdf =
+    sortedIdfs.length % 2 === 0
+      ? (sortedIdfs[sortedIdfs.length / 2 - 1] + sortedIdfs[sortedIdfs.length / 2]) / 2
+      : sortedIdfs[Math.floor(sortedIdfs.length / 2)];
+
+  // Filter: keep tokens with IDF >= median AND below common-ratio threshold
+  // Always keep at least minTokens tokens (the highest-IDF ones)
+  const filtered = weights.filter((w) => {
+    const docRatio = 1 - Math.exp(w.idf - 1) / totalDocs;
+    return w.idf >= medianIdf && docRatio <= maxCommonRatio;
+  });
+
+  // Ensure minimum token count
+  if (filtered.length < minTokens) {
+    return weights.slice(0, minTokens).map((w) => w.token);
+  }
+
+  return filtered.map((w) => w.token);
+}
+
 export function searchWithFts(
   deps: FtsDeps,
   query: string,
