@@ -26,6 +26,7 @@ import { runBinaryPreviewProviders } from './preview-providers.js';
 import { safeQuery, safeQueryOne } from './sql-utils.js';
 import {
   buildFtsQuery,
+  filterTokensByTfidf,
   rebuildSearchIndexesSync as rebuildSearchIndexesModule,
   replaceMessageSearchRowSync as replaceMessageSearchRowModule,
   replaceMessageSearchRowsSync as replaceMessageSearchRowsModule,
@@ -2473,9 +2474,15 @@ export class SqliteLcmStore {
 
     if (tokens.length < minTokens) return undefined;
     const queryTokens = tokens.slice(0, 5);
+
+    // Apply TF-IDF weighting to filter corpus-common noise tokens
+    const weightedTokens = filterTokensByTfidf(this.getDb(), queryTokens, {
+      minTokens,
+    });
+
     return {
-      queries: this.buildAutomaticRetrievalQueries(queryTokens, minTokens),
-      tokens: queryTokens,
+      queries: this.buildAutomaticRetrievalQueries(weightedTokens, minTokens),
+      tokens: weightedTokens,
     };
   }
 
