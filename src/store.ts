@@ -23,7 +23,7 @@ import {
 import { type DoctorReport, type DoctorSessionIssue, formatDoctorReport } from './doctor.js';
 import { getLogger } from './logging.js';
 import { runBinaryPreviewProviders } from './preview-providers.js';
-import { safeQuery, safeQueryOne } from './sql-utils.js';
+import { safeQuery, safeQueryOne, validateRow, withTransaction } from './sql-utils.js';
 import {
   buildFtsQuery,
   filterTokensByTfidf,
@@ -67,6 +67,7 @@ import {
   inferFileExtension,
   inferUrlScheme,
   isAutomaticRetrievalNoise,
+  parseJson,
   sanitizeAutomaticRetrievalSourceText,
   shortNodeID,
   shouldSuppressLowSignalAutomaticRetrievalAnchor,
@@ -104,12 +105,204 @@ type ArtifactData = {
   metadata: Record<string, unknown>;
 };
 
+export type SessionReadRow = {
+  session_id: string;
+  title: string | null;
+  parent_session_id: string | null;
+  root_session_id: string | null;
+  lineage_depth: number | null;
+  session_directory: string | null;
+  worktree_key: string | null;
+  pinned: number;
+  pin_reason: string | null;
+  deleted: number;
+  updated_at: number;
+  created_at: number;
+  event_count: number;
+};
+
+export type MessageReadRow = {
+  session_id: string;
+  message_id: string;
+  role: string;
+  created_at: number;
+};
+
+export type PartReadRow = {
+  session_id: string;
+  message_id: string;
+  part_id: string;
+  part_type: string;
+  sort_key: number;
+  state_json: string;
+  created_at: number;
+};
+
+export type ArtifactReadRow = {
+  artifact_id: string;
+  session_id: string;
+  message_id: string;
+  part_id: string;
+  artifact_kind: string;
+  field_name: string;
+  content_hash: string | null;
+  preview_text: string;
+  metadata_json: string;
+  char_count: number;
+  created_at: number;
+};
+
+export type ArtifactBlobReadRow = {
+  content_hash: string;
+  content_text: string;
+  char_count: number;
+  created_at: number;
+};
+
 import type {
   ResolvedRetentionPolicy,
   RetentionBlobCandidate,
   RetentionSessionCandidate,
 } from './store-retention.js';
 import type { SqlDatabaseLike, SqlStatementLike } from './store-types.js';
+
+function readSchemaVersionSync(db: SqlDatabaseLike): number {
+  const result = db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined;
+  if (!result || typeof result !== 'object') return 0;
+  for (const value of Object.values(result)) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function assertSupportedSchemaVersionSync(db: SqlDatabaseLike, maxVersion: number): void {
+  const schemaVersion = readSchemaVersionSync(db);
+  if (schemaVersion <= maxVersion) return;
+  throw new Error(
+    `Unsupported store schema version: ${schemaVersion}. This build supports up to ${maxVersion}.`,
+  );
+}
+
+function writeSchemaVersionSync(db: SqlDatabaseLike, version: number): void {
+  db.exec(`PRAGMA user_version = ${Math.max(0, Math.trunc(version))}`);
+}
+
+function readSessionHeader(db: SqlDatabaseLike, sessionID: string): SessionReadRow | undefined {
+  return db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionID) as
+    | SessionReadRow
+    | undefined;
+}
+
+function readAllSessions(db: SqlDatabaseLike): SessionReadRow[] {
+  return db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC').all() as SessionReadRow[];
+}
+
+function readChildSessions(db: SqlDatabaseLike, parentSessionID: string): SessionReadRow[] {
+  return db
+    .prepare('SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY updated_at DESC')
+    .all(parentSessionID) as SessionReadRow[];
+}
+
+function readLineageChain(db: SqlDatabaseLike, sessionID: string): SessionReadRow[] {
+  const chain: SessionReadRow[] = [];
+  let current = readSessionHeader(db, sessionID);
+  while (current) {
+    chain.unshift(current);
+    const parentID = current.parent_session_id;
+    if (!parentID) break;
+    current = readSessionHeader(db, parentID);
+  }
+  return chain;
+}
+
+function readMessagesForSession(db: SqlDatabaseLike, sessionID: string): MessageReadRow[] {
+  return db
+    .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC')
+    .all(sessionID) as MessageReadRow[];
+}
+
+function readPartsForSession(db: SqlDatabaseLike, sessionID: string): PartReadRow[] {
+  return db
+    .prepare('SELECT * FROM parts WHERE session_id = ? ORDER BY message_id ASC, sort_key ASC')
+    .all(sessionID) as PartReadRow[];
+}
+
+function readArtifactsForSession(db: SqlDatabaseLike, sessionID: string): ArtifactReadRow[] {
+  return db
+    .prepare('SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at DESC')
+    .all(sessionID) as ArtifactReadRow[];
+}
+
+function readArtifact(db: SqlDatabaseLike, artifactID: string): ArtifactReadRow | undefined {
+  return db.prepare('SELECT * FROM artifacts WHERE artifact_id = ?').get(artifactID) as
+    | ArtifactReadRow
+    | undefined;
+}
+
+function readArtifactBlob(
+  db: SqlDatabaseLike,
+  contentHash: string,
+): ArtifactBlobReadRow | undefined {
+  return db.prepare('SELECT * FROM artifact_blobs WHERE content_hash = ?').get(contentHash) as
+    | ArtifactBlobReadRow
+    | undefined;
+}
+
+function readOrphanArtifactBlobRows(db: SqlDatabaseLike): ArtifactBlobReadRow[] {
+  return db
+    .prepare(
+      `SELECT b.* FROM artifact_blobs b
+       WHERE NOT EXISTS (
+         SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+       )
+       ORDER BY b.created_at ASC`,
+    )
+    .all() as ArtifactBlobReadRow[];
+}
+
+function readLatestSessionID(db: SqlDatabaseLike): string | undefined {
+  const row = db
+    .prepare('SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 1')
+    .get() as { session_id: string } | undefined;
+  return row?.session_id;
+}
+
+function readSessionStats(db: SqlDatabaseLike): {
+  sessionCount: number;
+  messageCount: number;
+  artifactCount: number;
+  summaryNodeCount: number;
+  blobCount: number;
+  orphanBlobCount: number;
+  orphanBlobChars: number;
+} {
+  const sessions = db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number };
+  const messages = db.prepare('SELECT COUNT(*) AS count FROM messages').get() as { count: number };
+  const artifacts = db.prepare('SELECT COUNT(*) AS count FROM artifacts').get() as {
+    count: number;
+  };
+  const summaryNodes = db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get() as {
+    count: number;
+  };
+  const blobs = db
+    .prepare(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(char_count), 0) AS chars
+       FROM artifact_blobs b
+       WHERE NOT EXISTS (
+         SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+       )`,
+    )
+    .get() as { count: number; chars: number };
+  return {
+    sessionCount: sessions.count,
+    messageCount: messages.count,
+    artifactCount: artifacts.count,
+    summaryNodeCount: summaryNodes.count,
+    blobCount: blobs.count,
+    orphanBlobCount: blobs.count,
+    orphanBlobChars: blobs.chars,
+  };
+}
 
 type ReadSessionOptions = {
   artifactMessageIDs?: string[];
@@ -171,12 +364,60 @@ function buildSummaryNodeID(sessionID: string, level: number, slot: number): str
   return `sum_${hashContent(`summary:${sessionID}`).slice(0, 12)}_l${level}_p${slot}`;
 }
 
-function parseJson<T>(value: string): T {
-  return JSON.parse(value) as T;
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function hydratePartFromArtifacts(part: Part, artifacts: ArtifactData[]): void {
+  for (const artifact of artifacts) {
+    switch (part.type) {
+      case 'text':
+      case 'reasoning':
+        if (artifact.fieldName === 'text') part.text = artifact.contentText;
+        break;
+      case 'tool':
+        if (part.state.status === 'completed' && artifact.fieldName === 'output')
+          part.state.output = artifact.contentText;
+        if (part.state.status === 'error' && artifact.fieldName === 'error')
+          part.state.error = artifact.contentText;
+        if (
+          part.state.status === 'completed' &&
+          artifact.fieldName.startsWith('attachment_text:')
+        ) {
+          const index = Number(artifact.fieldName.split(':')[1]);
+          const attachment = part.state.attachments?.[index];
+          if (attachment?.source?.text) {
+            attachment.source.text.value = artifact.contentText;
+            attachment.source.text.start = 0;
+            attachment.source.text.end = artifact.contentText.length;
+          }
+        }
+        break;
+      case 'file':
+        if (artifact.fieldName === 'source' && part.source?.text) {
+          part.source.text.value = artifact.contentText;
+          part.source.text.start = 0;
+          part.source.text.end = artifact.contentText.length;
+        }
+        break;
+      case 'snapshot':
+        if (artifact.fieldName === 'snapshot') part.snapshot = artifact.contentText;
+        break;
+      case 'agent':
+        if (artifact.fieldName === 'source' && part.source) {
+          part.source.value = artifact.contentText;
+          part.source.start = 0;
+          part.source.end = artifact.contentText.length;
+        }
+        break;
+      case 'subtask':
+        if (artifact.fieldName === 'prompt') part.prompt = artifact.contentText;
+        if (artifact.fieldName === 'description') part.description = artifact.contentText;
+        break;
+      default:
+        break;
+    }
+  }
 }
 
 function isSyntheticLcmTextPart(part: Part, markers?: string[]): boolean {
@@ -314,10 +555,7 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const isBunRuntime = typeof globalThis === 'object' && 'Bun' in globalThis;
 
   if (isBunRuntime) {
-    const loadRuntimeModule = new Function('specifier', 'return import(specifier)') as (
-      specifier: string,
-    ) => Promise<Record<string, unknown>>;
-    const { Database } = (await loadRuntimeModule('bun:sqlite')) as Record<string, unknown>;
+    const { Database } = await import('bun:sqlite');
     const db = new (
       Database as new (
         path: string,
@@ -632,15 +870,9 @@ export class SqliteLcmStore {
       normalized,
     );
 
-    const db = this.getDb();
-    db.exec('BEGIN');
-    try {
+    withTransaction(this.getDb(), 'capture', () => {
       this.persistCapturedSessionSync(next, normalized);
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
+    });
 
     if (this.shouldRefreshLineageForEvent(normalized.type)) {
       this.refreshAllLineageSync();
@@ -676,15 +908,16 @@ export class SqliteLcmStore {
 
   async stats(): Promise<StoreStats> {
     const db = this.getDb();
-    const totalRow = db
-      .prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events')
-      .get() as {
-      count: number;
-      latest: number | null;
-    };
-    const sessionRow = db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as {
-      count: number;
-    };
+    const totalRow = validateRow<{ count: number; latest: number | null }>(
+      db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
+      { count: 'number', latest: 'nullable' },
+      'stats.totalEvents',
+    );
+    const sessionRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM sessions').get(),
+      { count: 'number' },
+      'stats.sessionCount',
+    );
     const typeRows = safeQuery<{ event_type: string; count: number }>(
       db.prepare(
         'SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type ORDER BY count DESC',
@@ -692,54 +925,78 @@ export class SqliteLcmStore {
       [],
       'stats.eventTypes',
     );
-    const summaryNodeRow = db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get() as {
-      count: number;
-    };
-    const summaryStateRow = db.prepare('SELECT COUNT(*) AS count FROM summary_state').get() as {
-      count: number;
-    };
-    const artifactRow = db.prepare('SELECT COUNT(*) AS count FROM artifacts').get() as {
-      count: number;
-    };
-    const blobRow = db.prepare('SELECT COUNT(*) AS count FROM artifact_blobs').get() as {
-      count: number;
-    };
-    const sharedBlobRow = db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM (
+    const summaryNodeRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get(),
+      { count: 'number' },
+      'stats.summaryNodeCount',
+    );
+    const summaryStateRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM summary_state').get(),
+      { count: 'number' },
+      'stats.summaryStateCount',
+    );
+    const artifactRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM artifacts').get(),
+      { count: 'number' },
+      'stats.artifactCount',
+    );
+    const blobRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM artifact_blobs').get(),
+      { count: 'number' },
+      'stats.artifactBlobCount',
+    );
+    const sharedBlobRow = validateRow<{ count: number }>(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM (
            SELECT content_hash FROM artifacts
            WHERE content_hash IS NOT NULL
            GROUP BY content_hash
            HAVING COUNT(*) > 1
          )`,
-      )
-      .get() as { count: number };
-    const orphanBlobRow = db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM artifact_blobs b
+        )
+        .get(),
+      { count: 'number' },
+      'stats.sharedArtifactBlobCount',
+    );
+    const orphanBlobRow = validateRow<{ count: number }>(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM artifact_blobs b
          WHERE NOT EXISTS (
            SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
          )`,
-      )
-      .get() as { count: number };
-    const rootRow = db
-      .prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NULL')
-      .get() as { count: number };
-    const branchedRow = db
-      .prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NOT NULL')
-      .get() as {
-      count: number;
-    };
-    const pinnedRow = db
-      .prepare('SELECT COUNT(*) AS count FROM sessions WHERE pinned = 1')
-      .get() as { count: number };
-    const worktreeRow = db
-      .prepare(
-        'SELECT COUNT(DISTINCT worktree_key) AS count FROM sessions WHERE worktree_key IS NOT NULL',
-      )
-      .get() as {
-      count: number;
-    };
+        )
+        .get(),
+      { count: 'number' },
+      'stats.orphanArtifactBlobCount',
+    );
+    const rootRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NULL').get(),
+      { count: 'number' },
+      'stats.rootSessionCount',
+    );
+    const branchedRow = validateRow<{ count: number }>(
+      db
+        .prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NOT NULL')
+        .get(),
+      { count: 'number' },
+      'stats.branchedSessionCount',
+    );
+    const pinnedRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE pinned = 1').get(),
+      { count: 'number' },
+      'stats.pinnedSessionCount',
+    );
+    const worktreeRow = validateRow<{ count: number }>(
+      db
+        .prepare(
+          'SELECT COUNT(DISTINCT worktree_key) AS count FROM sessions WHERE worktree_key IS NOT NULL',
+        )
+        .get(),
+      { count: 'number' },
+      'stats.worktreeCount',
+    );
 
     return {
       schemaVersion: this.readSchemaVersionSync(),
@@ -1323,8 +1580,7 @@ export class SqliteLcmStore {
 
     const db = this.getDb();
     let deletedBlobs: RetentionBlobCandidate[] = [];
-    db.exec('BEGIN');
-    try {
+    withTransaction(db, 'retentionPrune', () => {
       for (const sessionID of uniqueSessionIDs) {
         this.clearSessionDataSync(sessionID);
       }
@@ -1337,12 +1593,7 @@ export class SqliteLcmStore {
         const deleteBlob = db.prepare('DELETE FROM artifact_blobs WHERE content_hash = ?');
         for (const blob of deletedBlobs) deleteBlob.run(blob.content_hash);
       }
-
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
+    });
 
     this.refreshAllLineageSync();
     this.syncAllDerivedSessionStateSync(true);
@@ -2967,8 +3218,7 @@ export class SqliteLcmStore {
 
     const roots = currentLevel;
     const db = this.getDb();
-    db.exec('BEGIN');
-    try {
+    withTransaction(db, 'rebuildSummaryGraph', () => {
       this.clearSummaryGraphSync(sessionID);
 
       const insertNode = db.prepare(
@@ -3026,12 +3276,7 @@ export class SqliteLcmStore {
         JSON.stringify(roots.map((node) => node.nodeID)),
         now,
       );
-
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
+    });
 
     return roots;
   }
@@ -3828,55 +4073,7 @@ export class SqliteLcmStore {
       }
       const part = parseJson<Part>(partRow.part_json);
       const artifacts = artifactsByPart.get(part.id) ?? [];
-      for (const artifact of artifacts) {
-        switch (part.type) {
-          case 'text':
-          case 'reasoning':
-            if (artifact.fieldName === 'text') part.text = artifact.contentText;
-            break;
-          case 'tool':
-            if (part.state.status === 'completed' && artifact.fieldName === 'output')
-              part.state.output = artifact.contentText;
-            if (part.state.status === 'error' && artifact.fieldName === 'error')
-              part.state.error = artifact.contentText;
-            if (
-              part.state.status === 'completed' &&
-              artifact.fieldName.startsWith('attachment_text:')
-            ) {
-              const index = Number(artifact.fieldName.split(':')[1]);
-              const attachment = part.state.attachments?.[index];
-              if (attachment?.source?.text) {
-                attachment.source.text.value = artifact.contentText;
-                attachment.source.text.start = 0;
-                attachment.source.text.end = artifact.contentText.length;
-              }
-            }
-            break;
-          case 'file':
-            if (artifact.fieldName === 'source' && part.source?.text) {
-              part.source.text.value = artifact.contentText;
-              part.source.text.start = 0;
-              part.source.text.end = artifact.contentText.length;
-            }
-            break;
-          case 'snapshot':
-            if (artifact.fieldName === 'snapshot') part.snapshot = artifact.contentText;
-            break;
-          case 'agent':
-            if (artifact.fieldName === 'source' && part.source) {
-              part.source.value = artifact.contentText;
-              part.source.start = 0;
-              part.source.end = artifact.contentText.length;
-            }
-            break;
-          case 'subtask':
-            if (artifact.fieldName === 'prompt') part.prompt = artifact.contentText;
-            if (artifact.fieldName === 'description') part.description = artifact.contentText;
-            break;
-          default:
-            break;
-        }
-      }
+      hydratePartFromArtifacts(part, artifacts);
       const parts = partsByMessage.get(partRow.message_id) ?? [];
       parts.push(part);
       partsByMessage.set(partRow.message_id, parts);
@@ -3955,55 +4152,7 @@ export class SqliteLcmStore {
       const parts = partsByMessage.get(partRow.message_id) ?? [];
       const part = parseJson<Part>(partRow.part_json);
       const artifacts = artifactsByPart.get(part.id) ?? [];
-      for (const artifact of artifacts) {
-        switch (part.type) {
-          case 'text':
-          case 'reasoning':
-            if (artifact.fieldName === 'text') part.text = artifact.contentText;
-            break;
-          case 'tool':
-            if (part.state.status === 'completed' && artifact.fieldName === 'output')
-              part.state.output = artifact.contentText;
-            if (part.state.status === 'error' && artifact.fieldName === 'error')
-              part.state.error = artifact.contentText;
-            if (
-              part.state.status === 'completed' &&
-              artifact.fieldName.startsWith('attachment_text:')
-            ) {
-              const index = Number(artifact.fieldName.split(':')[1]);
-              const attachment = part.state.attachments?.[index];
-              if (attachment?.source?.text) {
-                attachment.source.text.value = artifact.contentText;
-                attachment.source.text.start = 0;
-                attachment.source.text.end = artifact.contentText.length;
-              }
-            }
-            break;
-          case 'file':
-            if (artifact.fieldName === 'source' && part.source?.text) {
-              part.source.text.value = artifact.contentText;
-              part.source.text.start = 0;
-              part.source.text.end = artifact.contentText.length;
-            }
-            break;
-          case 'snapshot':
-            if (artifact.fieldName === 'snapshot') part.snapshot = artifact.contentText;
-            break;
-          case 'agent':
-            if (artifact.fieldName === 'source' && part.source) {
-              part.source.value = artifact.contentText;
-              part.source.start = 0;
-              part.source.end = artifact.contentText.length;
-            }
-            break;
-          case 'subtask':
-            if (artifact.fieldName === 'prompt') part.prompt = artifact.contentText;
-            if (artifact.fieldName === 'description') part.description = artifact.contentText;
-            break;
-          default:
-            break;
-        }
-      }
+      hydratePartFromArtifacts(part, artifacts);
       parts.push(part);
       partsByMessage.set(partRow.message_id, parts);
     }
@@ -4707,3 +4856,19 @@ export class SqliteLcmStore {
     return this.db;
   }
 }
+
+export {
+  assertSupportedSchemaVersionSync,
+  readAllSessions,
+  readArtifact,
+  readArtifactBlob,
+  readArtifactsForSession,
+  readChildSessions,
+  readLatestSessionID,
+  readLineageChain,
+  readMessagesForSession,
+  readSchemaVersionSync,
+  readSessionHeader,
+  readSessionStats,
+  writeSchemaVersionSync,
+};
