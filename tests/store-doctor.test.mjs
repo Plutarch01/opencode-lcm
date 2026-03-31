@@ -63,6 +63,7 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
 
     store = new SqliteLcmStore(workspace, options);
     await store.init();
+    await store.stats();
 
     const driftDb = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
       enableForeignKeyConstraints: false,

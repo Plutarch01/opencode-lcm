@@ -22,8 +22,19 @@ import {
 } from './constants.js';
 import { type DoctorReport, type DoctorSessionIssue, formatDoctorReport } from './doctor.js';
 import { getLogger } from './logging.js';
-import { runBinaryPreviewProviders } from './preview-providers.js';
 import { safeQuery, safeQueryOne, validateRow, withTransaction } from './sql-utils.js';
+import {
+  type ArtifactData,
+  buildArtifactSearchContent as buildArtifactSearchContentModule,
+  type ExternalizedMessage,
+  type ExternalizedSession,
+  externalizeMessage as externalizeMessageModule,
+  externalizeSession as externalizeSessionModule,
+  formatArtifactMetadataLines as formatArtifactMetadataLinesModule,
+  materializeArtifactRow as materializeArtifactRowModule,
+  persistStoredSessionSync as persistStoredSessionSyncModule,
+  replaceStoredMessageSync as replaceStoredMessageSyncModule,
+} from './store-artifacts.js';
 import {
   buildFtsQuery,
   filterTokensByTfidf,
@@ -60,14 +71,10 @@ import type {
 import {
   asRecord,
   clamp,
-  classifyFileCategory,
   filterIntentTokens,
   firstFiniteNumber,
-  formatMetadataValue,
   formatRetentionDays,
   hashContent,
-  inferFileExtension,
-  inferUrlScheme,
   isAutomaticRetrievalNoise,
   parseJson,
   sanitizeAutomaticRetrievalSourceText,
@@ -90,31 +97,6 @@ type SummaryNodeData = {
   messageIDs: string[];
   summaryText: string;
   createdAt: number;
-};
-
-type ArtifactData = {
-  artifactID: string;
-  sessionID: string;
-  messageID: string;
-  partID: string;
-  artifactKind: string;
-  fieldName: string;
-  previewText: string;
-  contentText: string;
-  contentHash: string;
-  charCount: number;
-  createdAt: number;
-  metadata: Record<string, unknown>;
-};
-
-type ExternalizedMessage = {
-  storedMessage: ConversationMessage;
-  artifacts: ArtifactData[];
-};
-
-type ExternalizedSession = {
-  storedSession: NormalizedSession;
-  artifacts: ArtifactData[];
 };
 
 export type SessionReadRow = {
@@ -522,43 +504,6 @@ function archivePlaceholder(label: string): string {
   return `[Archived by opencode-lcm: ${label}. Use lcm_resume, lcm_grep, or lcm_expand for details.]`;
 }
 
-function artifactPlaceholder(
-  artifactID: string,
-  label: string,
-  preview: string,
-  charCount: number,
-): string {
-  const body = preview ? ` Preview: ${preview}` : '';
-  return `[Externalized ${label} as ${artifactID} (${charCount} chars). Use lcm_artifact for full content.]${body}`;
-}
-
-function fileCategoryHint(category: string): string {
-  switch (category) {
-    case 'image':
-      return 'Visual asset or screenshot; exact pixels still require the source file.';
-    case 'pdf':
-      return 'Formatted document; exact layout and embedded pages still require the source file.';
-    case 'audio':
-      return 'Audio asset; waveform and transcription details still require the source file.';
-    case 'video':
-      return 'Video asset; frames and timing still require the source file.';
-    case 'archive':
-      return 'Bundled archive; internal file listing still requires unpacking the source file.';
-    case 'spreadsheet':
-      return 'Spreadsheet-like document; formulas and cell layout may require the source file.';
-    case 'presentation':
-      return 'Slide deck; visual layout and speaker notes may require the source file.';
-    case 'document':
-      return 'Rich document; styled content and embedded assets may require the source file.';
-    case 'code':
-      return 'Code or source-like file reference; load the file body if exact lines matter.';
-    case 'structured-data':
-      return 'Structured data file reference; exact records may require the full source body.';
-    default:
-      return 'Binary or opaque artifact reference; inspect the original file for exact contents.';
-  }
-}
-
 async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const isBunRuntime = typeof globalThis === 'object' && 'Bun' in globalThis;
 
@@ -635,6 +580,7 @@ export class SqliteLcmStore {
   private readonly dbPath: string;
   private readonly workspaceDirectory: string;
   private db?: SqlDatabaseLike;
+  private dbReadyPromise?: Promise<void>;
 
   constructor(
     projectDir: string,
@@ -647,14 +593,25 @@ export class SqliteLcmStore {
 
   async init(): Promise<void> {
     await mkdir(this.baseDir, { recursive: true });
+  }
 
-    this.db = await openSqliteDatabase(this.dbPath);
+  private async ensureDbReady(): Promise<void> {
+    if (this.db) return;
+    if (this.dbReadyPromise) return this.dbReadyPromise;
+    this.dbReadyPromise = this.openAndInitializeDb();
+    return this.dbReadyPromise;
+  }
 
-    const db = this.getDb();
-    this.assertSupportedSchemaVersionSync();
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('PRAGMA synchronous = NORMAL');
-    db.exec(`
+  private async openAndInitializeDb(): Promise<void> {
+    await mkdir(this.baseDir, { recursive: true });
+    const db = await openSqliteDatabase(this.dbPath);
+    this.db = db;
+
+    try {
+      this.assertSupportedSchemaVersionSync();
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+      db.exec(`
       CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY,
         session_id TEXT,
@@ -795,23 +752,28 @@ export class SqliteLcmStore {
       );
     `);
 
-    this.ensureSessionColumnsSync();
-    this.ensureSummaryStateColumnsSync();
-    this.ensureArtifactColumnsSync();
-    db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)');
-    db.exec(
-      'CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id, updated_at DESC)',
-    );
-    db.exec(
-      'CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, updated_at DESC)',
-    );
-    db.exec(
-      'CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)',
-    );
-    await this.migrateLegacyArtifacts();
-    this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
-    this.db = db;
-    this.completeDeferredInit();
+      this.ensureSessionColumnsSync();
+      this.ensureSummaryStateColumnsSync();
+      this.ensureArtifactColumnsSync();
+      db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)');
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id, updated_at DESC)',
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, updated_at DESC)',
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)',
+      );
+      await this.migrateLegacyArtifacts();
+      this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
+      this.completeDeferredInit();
+    } catch (error) {
+      db.close();
+      this.db = undefined;
+      this.dbReadyPromise = undefined;
+      throw error;
+    }
   }
 
   private deferredInitCompleted = false;
@@ -853,9 +815,12 @@ export class SqliteLcmStore {
     if (!this.db) return;
     this.db.close();
     this.db = undefined;
+    this.dbReadyPromise = undefined;
   }
 
   async capture(event: Event): Promise<void> {
+    await this.ensureDbReady();
+
     const normalized = normalizeEvent(event);
     if (!normalized) return;
 
@@ -913,6 +878,7 @@ export class SqliteLcmStore {
   }
 
   async stats(): Promise<StoreStats> {
+    await this.ensureDbReady();
     const db = this.getDb();
     const totalRow = validateRow<{ count: number; latest: number | null }>(
       db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
@@ -1029,6 +995,7 @@ export class SqliteLcmStore {
     scope?: string;
     limit?: number;
   }): Promise<SearchResult[]> {
+    await this.ensureDbReady();
     const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
     const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
     const limit = input.limit ?? 5;
@@ -1041,6 +1008,7 @@ export class SqliteLcmStore {
   }
 
   async describe(input?: { sessionID?: string; scope?: string }): Promise<string> {
+    await this.ensureDbReady();
     const scope = this.resolveConfiguredScope('describe', input?.scope, input?.sessionID);
     const sessionID = input?.sessionID;
 
@@ -1132,6 +1100,7 @@ export class SqliteLcmStore {
   }
 
   async doctor(input?: { sessionID?: string; apply?: boolean; limit?: number }): Promise<string> {
+    await this.ensureDbReady();
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const sessionID = input?.sessionID;
     const apply = input?.apply ?? false;
@@ -1937,6 +1906,7 @@ export class SqliteLcmStore {
   }
 
   async lineage(sessionID?: string): Promise<string> {
+    await this.ensureDbReady();
     const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
     if (!resolvedSessionID) return 'No archived sessions yet.';
 
@@ -1981,6 +1951,7 @@ export class SqliteLcmStore {
   }
 
   async pinSession(input: { sessionID?: string; reason?: string }): Promise<string> {
+    await this.ensureDbReady();
     const sessionID = input.sessionID ?? this.latestSessionIDSync();
     if (!sessionID) return 'No archived sessions yet.';
 
@@ -1995,6 +1966,7 @@ export class SqliteLcmStore {
   }
 
   async unpinSession(input: { sessionID?: string }): Promise<string> {
+    await this.ensureDbReady();
     const sessionID = input.sessionID ?? this.latestSessionIDSync();
     if (!sessionID) return 'No archived sessions yet.';
 
@@ -2007,6 +1979,7 @@ export class SqliteLcmStore {
   }
 
   async artifact(input: { artifactID: string; chars?: number }): Promise<string> {
+    await this.ensureDbReady();
     const artifact = this.readArtifactSync(input.artifactID);
     if (!artifact) return 'Unknown artifact.';
 
@@ -2032,6 +2005,7 @@ export class SqliteLcmStore {
   }
 
   async blobStats(input?: { limit?: number }): Promise<string> {
+    await this.ensureDbReady();
     const limit = clamp(input?.limit ?? 5, 1, 20);
     const db = this.getDb();
     const totals = db
@@ -2161,6 +2135,7 @@ export class SqliteLcmStore {
   }
 
   async gcBlobs(input?: { apply?: boolean; limit?: number }): Promise<string> {
+    await this.ensureDbReady();
     const apply = input?.apply ?? false;
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const orphanRows = this.readOrphanArtifactBlobRowsSync();
@@ -2211,6 +2186,7 @@ export class SqliteLcmStore {
     orphanBlobDays?: number;
     limit?: number;
   }): Promise<string> {
+    await this.ensureDbReady();
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const policy = this.resolveRetentionPolicy(input);
     const staleSessions =
@@ -2282,6 +2258,7 @@ export class SqliteLcmStore {
     apply?: boolean;
     limit?: number;
   }): Promise<string> {
+    await this.ensureDbReady();
     const apply = input?.apply ?? false;
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const policy = this.resolveRetentionPolicy(input);
@@ -2370,6 +2347,7 @@ export class SqliteLcmStore {
     sessionID?: string;
     scope?: string;
   }): Promise<string> {
+    await this.ensureDbReady();
     return exportStoreSnapshot(
       {
         workspaceDirectory: this.workspaceDirectory,
@@ -2394,6 +2372,7 @@ export class SqliteLcmStore {
     mode?: 'replace' | 'merge';
     worktreeMode?: SnapshotWorktreeMode;
   }): Promise<string> {
+    await this.ensureDbReady();
     return importStoreSnapshot(
       {
         workspaceDirectory: this.workspaceDirectory,
@@ -2409,6 +2388,7 @@ export class SqliteLcmStore {
   }
 
   async resume(sessionID?: string): Promise<string> {
+    await this.ensureDbReady();
     const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
     if (!resolvedSessionID) return 'No stored resume snapshots yet.';
 
@@ -2427,6 +2407,7 @@ export class SqliteLcmStore {
     messageLimit?: number;
     includeRaw?: boolean;
   }): Promise<string> {
+    await this.ensureDbReady();
     const depth = clamp(input.depth ?? 1, 1, 4);
     const messageLimit = clamp(input.messageLimit ?? EXPAND_MESSAGE_LIMIT, 1, 20);
     const query = input.query?.trim();
@@ -2482,6 +2463,7 @@ export class SqliteLcmStore {
   }
 
   async buildCompactionContext(sessionID: string): Promise<string | undefined> {
+    await this.ensureDbReady();
     const session = this.readSessionSync(sessionID);
     if (session.messages.length === 0) return undefined;
 
@@ -2498,6 +2480,7 @@ export class SqliteLcmStore {
   }
 
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
+    await this.ensureDbReady();
     if (messages.length < this.options.minMessagesForTransform) return false;
 
     const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
@@ -3333,22 +3316,7 @@ export class SqliteLcmStore {
   }
 
   private materializeArtifactRow(row: ArtifactRow): ArtifactData {
-    const blob = this.readArtifactBlobSync(row.content_hash);
-    const contentText = blob?.content_text ?? row.content_text;
-    return {
-      artifactID: row.artifact_id,
-      sessionID: row.session_id,
-      messageID: row.message_id,
-      partID: row.part_id,
-      artifactKind: row.artifact_kind,
-      fieldName: row.field_name,
-      previewText: row.preview_text,
-      contentText,
-      contentHash: row.content_hash ?? hashContent(contentText),
-      charCount: blob?.char_count ?? row.char_count,
-      createdAt: row.created_at,
-      metadata: parseJson<Record<string, unknown>>(row.metadata_json || '{}'),
-    };
+    return materializeArtifactRowModule(this.artifactDeps(), row);
   }
 
   private readArtifactSync(artifactID: string): ArtifactData | undefined {
@@ -3665,6 +3633,29 @@ export class SqliteLcmStore {
       ignoreToolPrefixes: this.options.interop.ignoreToolPrefixes,
       guessMessageText: (message: ConversationMessage, ignorePrefixes: string[]) =>
         guessMessageText(message, ignorePrefixes),
+    };
+  }
+
+  private artifactDeps() {
+    return {
+      workspaceDirectory: this.workspaceDirectory,
+      options: {
+        artifactPreviewChars: this.options.artifactPreviewChars,
+        binaryPreviewProviders: this.options.binaryPreviewProviders,
+        largeContentThreshold: this.options.largeContentThreshold,
+        previewBytePeek: this.options.previewBytePeek,
+      },
+      getDb: () => this.getDb(),
+      readArtifactBlobSync: (contentHash?: string | null) => this.readArtifactBlobSync(contentHash),
+      upsertSessionRowSync: (session: NormalizedSession) => this.upsertSessionRowSync(session),
+      upsertMessageInfoSync: (sessionID: string, message: ConversationMessage) =>
+        this.upsertMessageInfoSync(sessionID, message),
+      deleteMessageSync: (sessionID: string, messageID: string) =>
+        this.deleteMessageSync(sessionID, messageID),
+      replaceMessageSearchRowSync: (sessionID: string, message: ConversationMessage) =>
+        this.replaceMessageSearchRowSync(sessionID, message),
+      replaceMessageSearchRowsSync: (session: NormalizedSession) =>
+        this.replaceMessageSearchRowsSync(session),
     };
   }
 
@@ -4326,42 +4317,7 @@ export class SqliteLcmStore {
     storedSession: NormalizedSession,
     artifacts: ArtifactData[],
   ): void {
-    const db = this.getDb();
-    this.upsertSessionRowSync(storedSession);
-
-    db.prepare('DELETE FROM artifact_fts WHERE session_id = ?').run(storedSession.sessionID);
-    db.prepare('DELETE FROM artifacts WHERE session_id = ?').run(storedSession.sessionID);
-    db.prepare('DELETE FROM parts WHERE session_id = ?').run(storedSession.sessionID);
-    db.prepare('DELETE FROM messages WHERE session_id = ?').run(storedSession.sessionID);
-
-    const insertMessage = db.prepare(
-      'INSERT INTO messages (message_id, session_id, created_at, info_json) VALUES (?, ?, ?, ?)',
-    );
-    const insertPart = db.prepare(
-      'INSERT INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)',
-    );
-
-    for (const message of storedSession.messages) {
-      insertMessage.run(
-        message.info.id,
-        storedSession.sessionID,
-        message.info.time.created,
-        JSON.stringify(message.info),
-      );
-
-      message.parts.forEach((part, index) => {
-        insertPart.run(
-          part.id,
-          storedSession.sessionID,
-          part.messageID,
-          index,
-          JSON.stringify(part),
-        );
-      });
-    }
-
-    this.insertArtifactsSync(artifacts);
-    this.replaceMessageSearchRowsSync(storedSession);
+    persistStoredSessionSyncModule(this.artifactDeps(), storedSession, artifacts);
   }
 
   private upsertSessionRowSync(session: NormalizedSession): void {
@@ -4437,397 +4393,23 @@ export class SqliteLcmStore {
     storedMessage: ConversationMessage,
     artifacts: ArtifactData[],
   ): void {
-    const db = this.getDb();
-
-    this.deleteMessageSync(sessionID, storedMessage.info.id);
-    this.upsertMessageInfoSync(sessionID, storedMessage);
-
-    const insertPart = db.prepare(
-      'INSERT INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)',
-    );
-
-    storedMessage.parts.forEach((part, index) => {
-      insertPart.run(part.id, sessionID, part.messageID, index, JSON.stringify(part));
-    });
-
-    this.insertArtifactsSync(artifacts);
-    this.replaceMessageSearchRowSync(sessionID, storedMessage);
+    replaceStoredMessageSyncModule(this.artifactDeps(), sessionID, storedMessage, artifacts);
   }
 
   private async externalizeMessage(message: ConversationMessage): Promise<ExternalizedMessage> {
-    const artifacts: ArtifactData[] = [];
-    const storedInfo = parseJson<Message>(JSON.stringify(message.info));
-    const storedParts: Part[] = [];
-
-    for (const part of message.parts) {
-      const { storedPart, artifacts: nextArtifacts } = await this.externalizePart(
-        part,
-        message.info.time.created,
-      );
-      artifacts.push(...nextArtifacts);
-      storedParts.push(storedPart);
-    }
-
-    return {
-      storedMessage: {
-        info: storedInfo,
-        parts: storedParts,
-      },
-      artifacts,
-    };
-  }
-
-  private createArtifactData(input: {
-    sessionID: string;
-    messageID: string;
-    partID: string;
-    artifactKind: string;
-    fieldName: string;
-    contentText: string;
-    createdAt: number;
-    metadata?: Record<string, unknown>;
-    previewText?: string;
-  }): ArtifactData {
-    const contentHash = hashContent(input.contentText);
-    return {
-      artifactID: `art_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
-      sessionID: input.sessionID,
-      messageID: input.messageID,
-      partID: input.partID,
-      artifactKind: input.artifactKind,
-      fieldName: input.fieldName,
-      previewText:
-        input.previewText ??
-        truncate(input.contentText.replace(/\s+/g, ' ').trim(), this.options.artifactPreviewChars),
-      contentText: input.contentText,
-      contentHash,
-      charCount: input.contentText.length,
-      createdAt: input.createdAt,
-      metadata: input.metadata ?? {},
-    };
+    return externalizeMessageModule(this.artifactDeps(), message);
   }
 
   private formatArtifactMetadataLines(metadata: Record<string, unknown>): string[] {
-    const lines = Object.entries(metadata)
-      .map(([key, value]) => {
-        const formatted = formatMetadataValue(value);
-        return formatted ? `${key}: ${formatted}` : undefined;
-      })
-      .filter((line): line is string => Boolean(line));
-
-    return lines.length > 0 ? ['Metadata:', ...lines] : [];
+    return formatArtifactMetadataLinesModule(metadata);
   }
 
   private buildArtifactSearchContent(artifact: ArtifactData): string {
-    const metadata = Object.entries(artifact.metadata)
-      .map(([key, value]) => {
-        const formatted = formatMetadataValue(value);
-        return formatted ? `${key}: ${formatted}` : undefined;
-      })
-      .filter((line): line is string => Boolean(line))
-      .join('\n');
-
-    return [artifact.previewText, metadata, artifact.contentText].filter(Boolean).join('\n');
-  }
-
-  private buildFileArtifactMetadata(
-    file: Extract<Part, { type: 'file' }>,
-    extras: Record<string, unknown> = {},
-  ): Record<string, unknown> {
-    const sourcePath = file.source && 'path' in file.source ? file.source.path : undefined;
-    const extension = inferFileExtension(file.filename ?? sourcePath ?? file.url);
-    const category = classifyFileCategory(file.mime, extension);
-    return {
-      category,
-      extension,
-      mime: file.mime,
-      filename: file.filename,
-      url: file.url,
-      urlScheme: inferUrlScheme(file.url),
-      sourceType: file.source?.type,
-      sourcePath,
-      hint: fileCategoryHint(category),
-      ...extras,
-    };
-  }
-
-  private async buildBinaryPreviewArtifact(
-    file: Extract<Part, { type: 'file' }>,
-    fieldName: string,
-    label: string,
-    createdAt: number,
-    extras: Record<string, unknown> = {},
-  ): Promise<ArtifactData> {
-    const baseMetadata = this.buildFileArtifactMetadata(file, extras);
-    const category = typeof baseMetadata.category === 'string' ? baseMetadata.category : 'binary';
-    const extension =
-      typeof baseMetadata.extension === 'string' ? baseMetadata.extension : undefined;
-    const name =
-      file.filename ??
-      (typeof baseMetadata.sourcePath === 'string' ? baseMetadata.sourcePath : undefined) ??
-      file.url ??
-      'unknown file';
-    const previewDetails = await runBinaryPreviewProviders({
-      workspaceDirectory: this.workspaceDirectory,
-      file,
-      category,
-      extension,
-      mime: file.mime,
-      enabledProviders: this.options.binaryPreviewProviders,
-      bytePeek: this.options.previewBytePeek,
-    });
-    const summary = previewDetails.summaryBits.slice(0, 3).join(', ');
-    const contentText = [
-      `${label}`,
-      `Category: ${category}`,
-      `Name: ${name}`,
-      ...(typeof baseMetadata.sourcePath === 'string' ? [`Path: ${baseMetadata.sourcePath}`] : []),
-      ...(file.mime ? [`MIME: ${file.mime}`] : []),
-      ...(extension ? [`Extension: ${extension}`] : []),
-      ...(typeof baseMetadata.urlScheme === 'string'
-        ? [`URL scheme: ${baseMetadata.urlScheme}`]
-        : []),
-      ...(file.url ? [`URL: ${file.url}`] : []),
-      ...(typeof baseMetadata.hint === 'string' ? [`Hint: ${baseMetadata.hint}`] : []),
-      ...previewDetails.lines,
-    ].join('\n');
-    const previewText = truncate(
-      `${label}: ${name} (${category}${summary ? `, ${summary}` : ''})`,
-      this.options.artifactPreviewChars,
-    );
-
-    return this.createArtifactData({
-      sessionID: file.sessionID,
-      messageID: file.messageID,
-      partID: file.id,
-      artifactKind: 'file',
-      fieldName,
-      contentText,
-      createdAt,
-      metadata: { ...baseMetadata, ...previewDetails.metadata },
-      previewText,
-    });
+    return buildArtifactSearchContentModule(artifact);
   }
 
   private async externalizeSession(session: NormalizedSession): Promise<ExternalizedSession> {
-    const artifacts: ArtifactData[] = [];
-    const storedMessages: ConversationMessage[] = [];
-
-    for (const message of session.messages) {
-      const storedInfo = parseJson<Message>(JSON.stringify(message.info));
-      const storedParts: Part[] = [];
-
-      for (const part of message.parts) {
-        const { storedPart, artifacts: nextArtifacts } = await this.externalizePart(
-          part,
-          message.info.time.created,
-        );
-        artifacts.push(...nextArtifacts);
-        storedParts.push(storedPart);
-      }
-
-      storedMessages.push({
-        info: storedInfo,
-        parts: storedParts,
-      });
-    }
-
-    return {
-      storedSession: {
-        ...session,
-        messages: storedMessages,
-      },
-      artifacts,
-    };
-  }
-
-  private async externalizePart(
-    part: Part,
-    createdAt: number,
-  ): Promise<{
-    storedPart: Part;
-    artifacts: ArtifactData[];
-  }> {
-    const storedPart = parseJson<Part>(JSON.stringify(part));
-    const artifacts: ArtifactData[] = [];
-
-    const externalize = (
-      artifactKind: string,
-      fieldName: string,
-      value: string,
-      metadata: Record<string, unknown> = {},
-      previewText?: string,
-    ): string => {
-      if (value.length < this.options.largeContentThreshold) return value;
-
-      const artifact = this.createArtifactData({
-        sessionID: storedPart.sessionID,
-        messageID: storedPart.messageID,
-        partID: storedPart.id,
-        artifactKind,
-        fieldName,
-        contentText: value,
-        createdAt,
-        metadata,
-        previewText,
-      });
-      artifacts.push(artifact);
-      return artifactPlaceholder(
-        artifact.artifactID,
-        `${artifactKind}/${fieldName}`,
-        artifact.previewText,
-        artifact.charCount,
-      );
-    };
-
-    switch (storedPart.type) {
-      case 'text':
-        storedPart.text = externalize('message', 'text', storedPart.text);
-        if (artifacts.length > 0) {
-          storedPart.metadata = {
-            ...(storedPart.metadata ?? {}),
-            opencodeLcmArtifact: artifacts.map((artifact) => artifact.artifactID),
-          };
-        }
-        break;
-      case 'reasoning':
-        storedPart.text = externalize('reasoning', 'text', storedPart.text);
-        if (artifacts.length > 0) {
-          storedPart.metadata = {
-            ...(storedPart.metadata ?? {}),
-            opencodeLcmArtifact: artifacts.map((artifact) => artifact.artifactID),
-          };
-        }
-        break;
-      case 'tool':
-        if (storedPart.state.status === 'completed') {
-          storedPart.state.output = externalize('tool', 'output', storedPart.state.output);
-          if (storedPart.state.attachments) {
-            const storedAttachments: Extract<Part, { type: 'file' }>[] = [];
-            for (const [index, attachment] of storedPart.state.attachments.entries()) {
-              const previewMetadata = {
-                attachmentIndex: index,
-                tool: storedPart.tool,
-                title: storedPart.state.status === 'completed' ? storedPart.state.title : undefined,
-              };
-              artifacts.push(
-                await this.buildBinaryPreviewArtifact(
-                  attachment,
-                  `attachment:${index}`,
-                  `Tool attachment for ${storedPart.tool}`,
-                  createdAt,
-                  previewMetadata,
-                ),
-              );
-
-              if (attachment.source?.text?.value) {
-                attachment.source.text.value = externalize(
-                  'file',
-                  `attachment_text:${index}`,
-                  attachment.source.text.value,
-                  this.buildFileArtifactMetadata(attachment, previewMetadata),
-                );
-                attachment.source.text.start = 0;
-                attachment.source.text.end = attachment.source.text.value.length;
-              }
-              storedAttachments.push(attachment);
-            }
-            storedPart.state.attachments = storedAttachments;
-          }
-        }
-        if (storedPart.state.status === 'error') {
-          storedPart.state.error = externalize('tool', 'error', storedPart.state.error);
-        }
-        break;
-      case 'file':
-        artifacts.push(
-          await this.buildBinaryPreviewArtifact(
-            storedPart,
-            'reference',
-            'File reference',
-            createdAt,
-          ),
-        );
-        if (storedPart.source?.text?.value) {
-          storedPart.source.text.value = externalize(
-            'file',
-            'source',
-            storedPart.source.text.value,
-            this.buildFileArtifactMetadata(storedPart),
-          );
-          storedPart.source.text.start = 0;
-          storedPart.source.text.end = storedPart.source.text.value.length;
-        }
-        break;
-      case 'snapshot':
-        storedPart.snapshot = externalize('snapshot', 'snapshot', storedPart.snapshot);
-        break;
-      case 'agent':
-        if (storedPart.source?.value) {
-          storedPart.source.value = externalize('agent', 'source', storedPart.source.value);
-          storedPart.source.start = 0;
-          storedPart.source.end = storedPart.source.value.length;
-        }
-        break;
-      case 'subtask':
-        storedPart.prompt = externalize('subtask', 'prompt', storedPart.prompt);
-        storedPart.description = externalize('subtask', 'description', storedPart.description);
-        break;
-      default:
-        break;
-    }
-
-    return { storedPart, artifacts };
-  }
-
-  private insertArtifactsSync(artifacts: ArtifactData[]): void {
-    if (artifacts.length === 0) return;
-
-    const db = this.getDb();
-    const insertBlob = db.prepare(
-      `INSERT OR IGNORE INTO artifact_blobs (content_hash, content_text, char_count, created_at)
-       VALUES (?, ?, ?, ?)`,
-    );
-    const insertArtifact = db.prepare(
-      `INSERT INTO artifacts
-       (artifact_id, session_id, message_id, part_id, artifact_kind, field_name, preview_text, content_text, content_hash, metadata_json, char_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    const insertFts = db.prepare(
-      'INSERT INTO artifact_fts (session_id, artifact_id, message_id, part_id, artifact_kind, created_at, content) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    );
-
-    for (const artifact of artifacts) {
-      insertBlob.run(
-        artifact.contentHash,
-        artifact.contentText,
-        artifact.charCount,
-        artifact.createdAt,
-      );
-      insertArtifact.run(
-        artifact.artifactID,
-        artifact.sessionID,
-        artifact.messageID,
-        artifact.partID,
-        artifact.artifactKind,
-        artifact.fieldName,
-        artifact.previewText,
-        '',
-        artifact.contentHash,
-        JSON.stringify(artifact.metadata),
-        artifact.charCount,
-        artifact.createdAt,
-      );
-      insertFts.run(
-        artifact.sessionID,
-        artifact.artifactID,
-        artifact.messageID,
-        artifact.partID,
-        artifact.artifactKind,
-        String(artifact.createdAt),
-        this.buildArtifactSearchContent(artifact),
-      );
-    }
+    return externalizeSessionModule(this.artifactDeps(), session);
   }
 
   private writeEvent(event: CapturedEvent): void {

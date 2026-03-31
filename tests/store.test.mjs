@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -103,7 +103,31 @@ test('init rejects newer on-disk schema versions', async () => {
     db.close();
 
     store = new SqliteLcmStore(workspace, makeOptions());
-    await assert.rejects(store.init(), /Unsupported store schema version: 99/);
+    await store.init();
+    await assert.rejects(store.stats(), /Unsupported store schema version: 99/);
+  } finally {
+    store?.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('init is lazy and does not create the database until first operation', async () => {
+  const workspace = makeWorkspace('lcm-lazy-init');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    assert.equal(
+      existsSync(path.join(workspace, '.lcm', 'lcm.db')),
+      false,
+      'init() should not eagerly create the database file',
+    );
+
+    const stats = await store.stats();
+    assert.equal(stats.schemaVersion, 1);
+    assert.equal(existsSync(path.join(workspace, '.lcm', 'lcm.db')), true);
   } finally {
     store?.close();
     rmSync(workspace, { recursive: true, force: true });
