@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { getLogger, setLogger } from '../dist/logging.js';
+import { getLogger, isStartupLoggingEnabled, setLogger } from '../dist/logging.js';
 
 test('getLogger returns default logger', () => {
   const logger = getLogger();
@@ -39,4 +39,25 @@ test('setLogger swaps the logger', () => {
 
   // Restore default logger
   setLogger(getLogger());
+});
+
+test('isStartupLoggingEnabled respects OPENCODE_LCM_STARTUP_LOG', () => {
+  const previous = process.env.OPENCODE_LCM_STARTUP_LOG;
+
+  try {
+    delete process.env.OPENCODE_LCM_STARTUP_LOG;
+    assert.equal(isStartupLoggingEnabled(), false);
+
+    process.env.OPENCODE_LCM_STARTUP_LOG = '1';
+    assert.equal(isStartupLoggingEnabled(), true);
+
+    process.env.OPENCODE_LCM_STARTUP_LOG = 'true';
+    assert.equal(isStartupLoggingEnabled(), true);
+
+    process.env.OPENCODE_LCM_STARTUP_LOG = 'off';
+    assert.equal(isStartupLoggingEnabled(), false);
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_LCM_STARTUP_LOG;
+    else process.env.OPENCODE_LCM_STARTUP_LOG = previous;
+  }
 });

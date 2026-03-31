@@ -144,6 +144,12 @@ Three ways to turn off the plugin without removing it:
 - Create an empty file at `~/.config/opencode/plugins/opencode-lcm.disabled`
 - Set `ENABLED = false` in the global loader at `~/.config/opencode/plugins/opencode-lcm.ts`
 
+## Startup Diagnostics
+
+To log store startup phases during plugin initialization, set `OPENCODE_LCM_STARTUP_LOG=1` before starting OpenCode.
+
+This emits one-line `[lcm] startup phase: ...` markers around DB open, schema setup, legacy migration, deferred init, and error handling so a Bun crash log shows the last active phase.
+
 ## Source layout
 
 - `src/index.ts` - plugin entrypoint and OpenCode hooks
