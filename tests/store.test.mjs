@@ -5,7 +5,11 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
-import { SqliteLcmStore } from '../dist/store.js';
+import {
+  resolveSqliteRuntime,
+  resolveSqliteRuntimeCandidates,
+  SqliteLcmStore,
+} from '../dist/store.js';
 
 function makeWorkspace(prefix) {
   return mkdtempSync(path.join(tmpdir(), `${prefix}-`));
@@ -60,6 +64,56 @@ function userInfo(sessionID, id, created) {
     model: { providerID: 'openai', modelID: 'gpt-4.1' },
   };
 }
+
+test('resolveSqliteRuntime keeps bun:sqlite as a fallback for Bun on Windows', () => {
+  const options = {
+    envOverride: undefined,
+    isBunRuntime: true,
+    platform: 'win32',
+  };
+
+  assert.equal(resolveSqliteRuntime(options), 'node');
+  assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['node', 'bun']);
+});
+
+test('resolveSqliteRuntime keeps bun:sqlite first for Bun on non-Windows', () => {
+  const options = {
+    envOverride: undefined,
+    isBunRuntime: true,
+    platform: 'linux',
+  };
+
+  assert.equal(resolveSqliteRuntime(options), 'bun');
+  assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['bun', 'node']);
+});
+
+test('resolveSqliteRuntime honors explicit override', () => {
+  const options = {
+    envOverride: 'bun',
+    isBunRuntime: true,
+    platform: 'win32',
+  };
+
+  assert.equal(
+    resolveSqliteRuntime(options),
+    'bun',
+  );
+  assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['bun']);
+});
+
+test('resolveSqliteRuntime defaults to node outside Bun', () => {
+  const options = {
+    envOverride: undefined,
+    isBunRuntime: false,
+    platform: 'win32',
+  };
+
+  assert.equal(
+    resolveSqliteRuntime(options),
+    'node',
+  );
+  assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['node']);
+});
 
 test('init stamps the current schema version on disk', async () => {
   const workspace = makeWorkspace('lcm-schema-version');
