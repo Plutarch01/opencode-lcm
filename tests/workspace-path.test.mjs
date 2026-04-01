@@ -7,7 +7,7 @@ import { resolveWorkspacePath } from '../dist/workspace-path.js';
 
 function makeWorkspace() {
   const base = os.tmpdir();
-  const ws = path.join(base, 'lcm-test-ws-' + Math.random().toString(36).slice(2, 8));
+  const ws = path.join(base, `lcm-test-ws-${Math.random().toString(36).slice(2, 8)}`);
   return { base, ws, sep: path.sep };
 }
 
@@ -24,7 +24,7 @@ test('resolves nested relative paths', () => {
 });
 
 test('rejects paths that escape workspace', () => {
-  const { ws, base } = makeWorkspace();
+  const { ws } = makeWorkspace();
   assert.throws(
     () => resolveWorkspacePath(ws, path.join('..', 'file.txt')),
     /Path must stay within the workspace/,
@@ -67,6 +67,6 @@ test('handles workspace root path', () => {
 
 test('handles current directory reference', () => {
   const { ws } = makeWorkspace();
-  const result = resolveWorkspacePath(ws, '.' + path.sep + 'file.txt');
+  const result = resolveWorkspacePath(ws, `.${path.sep}file.txt`);
   assert.equal(result, path.join(ws, 'file.txt'));
 });
