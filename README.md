@@ -42,12 +42,6 @@ OpenCode still handles compaction the normal way: when the active conversation g
 ## Install
 
 ```sh
-npm install opencode-lcm
-```
-
-Or from source:
-
-```sh
 git clone https://github.com/plutarch01/opencode-lcm.git
 cd opencode-lcm
 npm install
