@@ -126,6 +126,25 @@ When using alongside `context-mode`, add the `interop` block to avoid hook confl
 }
 ```
 
+## Disable
+
+To disable `opencode-lcm` completely, remove its entry from the `plugin` array and restart OpenCode.
+
+If you want to keep the archive store and `lcm_*` tools available but stop archived context from being injected back into the prompt, set `automaticRetrieval.enabled` to `false`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    ["opencode-lcm", {
+      "automaticRetrieval": {
+        "enabled": false
+      }
+    }]
+  ]
+}
+```
+
 ## Startup Diagnostics
 
 To log store startup phases during plugin initialization, set `OPENCODE_LCM_STARTUP_LOG=1` before starting OpenCode.
