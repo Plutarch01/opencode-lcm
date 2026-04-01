@@ -5,9 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-03-31
 
 ### Added
+- Initial release of opencode-lcm plugin
+- SQLite-based session storage with FTS5 full-text search
+- Hierarchical summary graph for message archiving
+- Artifact deduplication via content hashing
+- Snapshot export/import for portable session data
+- Automatic retrieval with TF-IDF query weighting
+- Session lineage tracking (parent/child/root relationships)
+- Retention policy enforcement (stale sessions, deleted sessions, orphan blobs)
+- Resume notes for session continuation
+- Doctor command for diagnosing and repairing store integrity
+- Binary preview providers for file artifacts (image dimensions, PDF metadata, ZIP entries)
+- Context-mode interop for sandboxed command execution
+- Worktree-aware scoping for multi-workspace projects
+- 141 tests covering core functionality
 - `CHANGELOG.md` for tracking release history
 - Direct regression coverage for scoped FTS refresh and snapshot replace-import stale-row cleanup
 
@@ -45,21 +59,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - Fixed workspace path validation bypass that allowed absolute paths to escape the workspace root
 - Added `validateRow()` runtime validation for all SQL query results in `stats()` method
-
-## [0.1.0] - 2026-03-31
-
-### Added
-- Initial release of opencode-lcm plugin
-- SQLite-based session storage with FTS5 full-text search
-- Hierarchical summary graph for message archiving
-- Artifact deduplication via content hashing
-- Snapshot export/import for portable session data
-- Automatic retrieval with TF-IDF query weighting
-- Session lineage tracking (parent/child/root relationships)
-- Retention policy enforcement (stale sessions, deleted sessions, orphan blobs)
-- Resume notes for session continuation
-- Doctor command for diagnosing and repairing store integrity
-- Binary preview providers for file artifacts (image dimensions, PDF metadata, ZIP entries)
-- Context-mode interop for sandboxed command execution
-- Worktree-aware scoping for multi-workspace projects
-- 141 tests covering core functionality
