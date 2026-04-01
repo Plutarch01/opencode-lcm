@@ -1,19 +1,17 @@
 # opencode-lcm
 
-[![npm version](https://img.shields.io/npm/v/opencode-lcm.svg)](https://www.npmjs.com/package/opencode-lcm)
+[![CI](https://github.com/Plutarch01/opencode-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/Plutarch01/opencode-lcm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode), based on the [Long Context Memory (LCM)](https://papers.voltropy.com/LCM) research. It captures older session context outside the active prompt, compresses it into searchable summaries and artifacts, then automatically recalls the relevant archived details back into the prompt when the current turn needs them. The model does not become smarter, but it behaves much better across long, compacted sessions because important prior context stops disappearing.
 
 ## Status
 
-Production-ready, plugin-first, tested with OpenCode and SQLite. Designed for long-session recall across compaction boundaries. Tested primarily on Windows with Node 22 and OpenCode's plugin system.
+Early release, actively tested with OpenCode and SQLite, with CI on Node 22 and 24. Designed for long-session recall across compaction boundaries. Tested primarily on Windows with Node 22 and OpenCode's plugin system.
 
-## Recommended Companion: context-mode
+## context-mode
 
-We recommend pairing `opencode-lcm` with [`context-mode`](https://github.com/mksglu/context-mode/). `context-mode` is a separate project that reduces context-window token usage by routing large-output work through sandboxed tools. It blocks unsafe raw commands and cuts token waste from dumped tool output. `opencode-lcm` focuses on preserving and recalling older session context. They solve different problems and work well together in practice.
-
-> **Note:** `opencode-lcm` is an independent project. We recommend `context-mode` for its context-protection and token-saving benefits, not as an official joint integration.
+`opencode-lcm` preserves archived conversation context so the assistant can recall earlier decisions without re-reading old files. Pairing it with [context-mode](https://github.com/mksglu/context-mode/) reduces tool-output token waste and keeps the active prompt lean.
 
 ## How it works
 
@@ -128,14 +126,6 @@ When using alongside `context-mode`, add the `interop` block to avoid hook confl
 }
 ```
 
-## Disabling
-
-Three ways to turn off the plugin without removing it:
-
-- Set `OPENCODE_DISABLE_OPENCODE_LCM=1` in the environment before starting OpenCode
-- Create an empty file at `~/.config/opencode/plugins/opencode-lcm.disabled`
-- Set `ENABLED = false` in the global loader at `~/.config/opencode/plugins/opencode-lcm.ts`
-
 ## Startup Diagnostics
 
 To log store startup phases during plugin initialization, set `OPENCODE_LCM_STARTUP_LOG=1` before starting OpenCode.
@@ -149,14 +139,18 @@ This emits one-line `[lcm] startup phase: ...` markers around DB open, schema se
 | `src/index.ts` | Plugin entrypoint and OpenCode hooks |
 | `src/options.ts` | Option normalization and defaults |
 | `src/types.ts` | Shared types |
+| `src/store-types.ts` | Internal store type definitions |
 | `src/store.ts` | SQLite store with event-driven state machine, FTS, summary DAG, artifact externalization, archive repair |
 | `src/store-search.ts` | FTS5 search module with TF-IDF weighting and query building |
 | `src/store-snapshot.ts` | Portable snapshot export/import with worktree-mode controls |
+| `src/store-artifacts.ts` | Artifact externalization and deduplication |
+| `src/store-retention.ts` | Retention pruning and reporting |
 | `src/workspace-path.ts` | Safe workspace-relative path resolution |
 | `src/worktree-key.ts` | Worktree key normalization |
 | `src/archive-transform.ts` | Archive window selection, automatic retrieval, synthetic context rendering |
 | `src/search-ranking.ts` | Cross-source search ranking with named scoring constants |
 | `src/sql-utils.ts` | Safe SQL query wrappers |
+| `src/bun-sqlite.d.ts` | Type declarations for Bun's built-in SQLite |
 | `src/logging.ts` | Structured debug logger |
 | `src/doctor.ts` | Archive health report formatting |
 | `src/preview-providers.ts` | Binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata) |
