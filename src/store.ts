@@ -509,58 +509,105 @@ function logStartupPhase(phase: string, context?: Record<string, unknown>): void
   getLogger().info(`startup phase: ${phase}`, context);
 }
 
-async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
-  const isBunRuntime = typeof globalThis === 'object' && 'Bun' in globalThis;
+type SqliteRuntime = 'bun' | 'node';
+type SqliteRuntimeOptions = {
+  envOverride?: string | undefined;
+  isBunRuntime?: boolean;
+  platform?: string | undefined;
+};
 
-  if (isBunRuntime) {
-    const { Database } = await import('bun:sqlite');
-    const db = new (
-      Database as new (
-        path: string,
-        opts?: { create: boolean },
-      ) => {
-        exec(sql: string): void;
-        close(): void;
-        prepare(sql: string): {
-          run(...args: unknown[]): void;
-          get(...args: unknown[]): Record<string, unknown>;
-          all(...args: unknown[]): Record<string, unknown>[];
-          values(...args: unknown[]): unknown[][];
-        };
-        query(sql: string): {
-          run(...args: unknown[]): void;
-          get(...args: unknown[]): Record<string, unknown>;
-          all(...args: unknown[]): Record<string, unknown>[];
-        };
-      }
-    )(dbPath, { create: true });
-    db.exec('PRAGMA foreign_keys = ON');
-    db.exec('PRAGMA busy_timeout = 5000');
+function normalizeSqliteRuntimeOverride(value: string | undefined): SqliteRuntime | 'auto' {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'bun' || normalized === 'node') return normalized;
+  return 'auto';
+}
 
-    return {
-      exec(sql: string) {
-        return db.exec(sql);
-      },
-      close() {
-        db.close();
-      },
-      prepare(sql: string) {
-        const statement = typeof db.prepare === 'function' ? db.prepare(sql) : db.query(sql);
-        return {
-          run(...args: unknown[]) {
-            return statement.run(...args);
-          },
-          get(...args: unknown[]) {
-            return statement.get(...args);
-          },
-          all(...args: unknown[]) {
-            return statement.all(...args);
-          },
-        };
-      },
-    };
-  }
+export function resolveSqliteRuntimeCandidates(options?: SqliteRuntimeOptions): SqliteRuntime[] {
+  const override = normalizeSqliteRuntimeOverride(
+    options?.envOverride ?? process.env.OPENCODE_LCM_SQLITE_RUNTIME,
+  );
+  if (override !== 'auto') return [override];
 
+  const isBunRuntime =
+    options?.isBunRuntime ?? (typeof globalThis === 'object' && 'Bun' in globalThis);
+  if (!isBunRuntime) return ['node'];
+
+  const platform = options?.platform ?? process.platform;
+  return platform === 'win32' ? ['node', 'bun'] : ['bun', 'node'];
+}
+
+export function resolveSqliteRuntime(options?: SqliteRuntimeOptions): SqliteRuntime {
+  return resolveSqliteRuntimeCandidates(options)[0];
+}
+
+function isSqliteRuntimeImportError(runtime: SqliteRuntime, error: unknown): boolean {
+  const code =
+    typeof error === 'object' && error && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const specifier = runtime === 'bun' ? 'bun:sqlite' : 'node:sqlite';
+
+  if (!message.includes(specifier)) return false;
+  if (code === 'ERR_UNKNOWN_BUILTIN_MODULE' || code === 'ERR_MODULE_NOT_FOUND') return true;
+
+  return (
+    message.includes('Cannot find module') ||
+    message.includes('Cannot find package') ||
+    message.includes('No such built-in module')
+  );
+}
+
+async function openBunSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
+  const { Database } = await import('bun:sqlite');
+  const db = new (
+    Database as new (
+      path: string,
+      opts?: { create: boolean },
+    ) => {
+      exec(sql: string): void;
+      close(): void;
+      prepare(sql: string): {
+        run(...args: unknown[]): void;
+        get(...args: unknown[]): Record<string, unknown>;
+        all(...args: unknown[]): Record<string, unknown>[];
+        values(...args: unknown[]): unknown[][];
+      };
+      query(sql: string): {
+        run(...args: unknown[]): void;
+        get(...args: unknown[]): Record<string, unknown>;
+        all(...args: unknown[]): Record<string, unknown>[];
+      };
+    }
+  )(dbPath, { create: true });
+  db.exec('PRAGMA foreign_keys = ON');
+  db.exec('PRAGMA busy_timeout = 5000');
+
+  return {
+    exec(sql: string) {
+      return db.exec(sql);
+    },
+    close() {
+      db.close();
+    },
+    prepare(sql: string) {
+      const statement = typeof db.prepare === 'function' ? db.prepare(sql) : db.query(sql);
+      return {
+        run(...args: unknown[]) {
+          return statement.run(...args);
+        },
+        get(...args: unknown[]) {
+          return statement.get(...args);
+        },
+        all(...args: unknown[]) {
+          return statement.all(...args);
+        },
+      };
+    },
+  };
+}
+
+async function openNodeSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const { DatabaseSync } = await import('node:sqlite');
   const db = new DatabaseSync(dbPath, {
     enableForeignKeyConstraints: true,
@@ -578,6 +625,36 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
       return db.prepare(sql) as SqlStatementLike;
     },
   };
+}
+
+async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
+  const candidates = resolveSqliteRuntimeCandidates();
+  const openers: Record<SqliteRuntime, (path: string) => Promise<SqlDatabaseLike>> = {
+    bun: openBunSqliteDatabase,
+    node: openNodeSqliteDatabase,
+  };
+
+  let lastError: unknown;
+  for (const [index, runtime] of candidates.entries()) {
+    try {
+      return await openers[runtime](dbPath);
+    } catch (error) {
+      if (!isSqliteRuntimeImportError(runtime, error) || index === candidates.length - 1) {
+        throw error;
+      }
+
+      lastError = error;
+      logStartupPhase('open-db:sqlite-runtime-fallback', {
+        runtime,
+        fallbackRuntime: candidates[index + 1],
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Unable to initialize a supported SQLite runtime.');
 }
 
 export class SqliteLcmStore {
@@ -612,6 +689,7 @@ export class SqliteLcmStore {
     await mkdir(this.baseDir, { recursive: true });
     logStartupPhase('open-db:connect', {
       runtime: typeof globalThis === 'object' && 'Bun' in globalThis ? 'bun' : 'node',
+      sqliteRuntime: resolveSqliteRuntime(),
     });
     const db = await openSqliteDatabase(this.dbPath);
     this.db = db;
