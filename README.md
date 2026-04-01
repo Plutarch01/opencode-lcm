@@ -1,5 +1,8 @@
 # opencode-lcm
 
+[![npm version](https://img.shields.io/npm/v/opencode-lcm.svg)](https://www.npmjs.com/package/opencode-lcm)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode), based on the [Long Context Memory (LCM)](https://papers.voltropy.com/LCM) research. It captures older session context outside the active prompt, compresses it into searchable summaries and artifacts, then automatically recalls the relevant archived details back into the prompt when the current turn needs them. The model does not become smarter, but it behaves much better across long, compacted sessions because important prior context stops disappearing.
 
 ## Status
@@ -36,25 +39,20 @@ OpenCode still handles compaction the normal way: when the active conversation g
 - Configurable binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata)
 - Auto-migrate legacy `.lcm/events.jsonl`, `.lcm/resume.json`, and `.lcm/sessions/*.json`
 
-## Requirements
-
-- Node 22 or newer
-- OpenCode with plugin support
-
 ## Install
 
 ```sh
+npm install opencode-lcm
+```
+
+Or from source:
+
+```sh
+git clone https://github.com/plutarch01/opencode-lcm.git
+cd opencode-lcm
 npm install
 npm run build
 npm run test
-```
-
-Load the plugin from a local path or symlink during development, or publish and reference from `opencode.json`.
-
-Run a live dogfood probe to compare archive recall with automatic retrieval off vs on:
-
-```sh
-npm run dogfood:opencode
 ```
 
 ## Configuration
@@ -152,27 +150,25 @@ This emits one-line `[lcm] startup phase: ...` markers around DB open, schema se
 
 ## Source layout
 
-- `src/index.ts` - plugin entrypoint and OpenCode hooks
-- `src/options.ts` - option normalization and defaults
-- `src/types.ts` - shared types
-- `src/store.ts` - SQLite store with event-driven state machine, FTS integration, summary DAG, artifact externalization, and archive repair
-- `src/store-search.ts` - extracted FTS5 search module with TF-IDF token weighting, query building, and index management
-- `src/store-snapshot.ts` - portable snapshot export/import with worktree-mode controls and path-safety guards
-- `src/workspace-path.ts` - safe workspace-relative path resolution
-- `src/worktree-key.ts` - worktree key normalization
-- `src/archive-transform.ts` - archive window selection, automatic retrieval with TF-IDF filtering, and synthetic context rendering
-- `src/search-ranking.ts` - cross-source search ranking with named scoring constants
-- `src/sql-utils.ts` - safe SQL query wrappers that replace raw `as` type assertions
-- `src/logging.ts` - structured debug logger for plugin diagnostics
-- `src/doctor.ts` - archive health report formatting (includes `invalid-summary-graph` diagnosis)
-- `src/preview-providers.ts` - configurable binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata)
-- `src/utils.ts` - shared utilities including tokenization, snippet building, and TF-IDF helpers
-- `src/constants.ts` - shared constants and thresholds
-- `docs/interop-mvp.md` - hook ownership, conflict rules, and next milestones
+| File | Purpose |
+|------|---------|
+| `src/index.ts` | Plugin entrypoint and OpenCode hooks |
+| `src/options.ts` | Option normalization and defaults |
+| `src/types.ts` | Shared types |
+| `src/store.ts` | SQLite store with event-driven state machine, FTS, summary DAG, artifact externalization, archive repair |
+| `src/store-search.ts` | FTS5 search module with TF-IDF weighting and query building |
+| `src/store-snapshot.ts` | Portable snapshot export/import with worktree-mode controls |
+| `src/workspace-path.ts` | Safe workspace-relative path resolution |
+| `src/worktree-key.ts` | Worktree key normalization |
+| `src/archive-transform.ts` | Archive window selection, automatic retrieval, synthetic context rendering |
+| `src/search-ranking.ts` | Cross-source search ranking with named scoring constants |
+| `src/sql-utils.ts` | Safe SQL query wrappers |
+| `src/logging.ts` | Structured debug logger |
+| `src/doctor.ts` | Archive health report formatting |
+| `src/preview-providers.ts` | Binary preview providers (fingerprint, byte peek, image dimensions, PDF metadata) |
+| `src/utils.ts` | Shared utilities: tokenization, snippet building, TF-IDF helpers |
+| `src/constants.ts` | Shared constants and thresholds |
 
-## Next milestones
+## License
 
-1. Continue hardening summary invalidation for more pathological lineage changes (multi-cycle reparents, cross-worktree collisions)
-2. Add richer recall debugging and tuning controls once the heuristics settle
-3. Add richer media-specific preview providers on top of the existing binary preview framework
-4. Add per-worktree mapping tables for more selective multi-worktree snapshot restores
+MIT

@@ -12,10 +12,23 @@
     }
   },
   "files": [
-    "dist",
+    "dist/",
+    "dist-tests/",
+    "src/",
     "README.md",
-    "docs/interop-mvp.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
+  "author": "Isaac Grumberg",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/plutarch01/opencode-lcm.git"
+  },
+  "homepage": "https://github.com/plutarch01/opencode-lcm#readme",
+  "bugs": {
+    "url": "https://github.com/plutarch01/opencode-lcm/issues"
+  },
   "engines": {
     "node": ">=22"
   },
