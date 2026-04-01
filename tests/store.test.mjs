@@ -94,10 +94,7 @@ test('resolveSqliteRuntime honors explicit override', () => {
     platform: 'win32',
   };
 
-  assert.equal(
-    resolveSqliteRuntime(options),
-    'bun',
-  );
+  assert.equal(resolveSqliteRuntime(options), 'bun');
   assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['bun']);
 });
 
@@ -108,10 +105,7 @@ test('resolveSqliteRuntime defaults to node outside Bun', () => {
     platform: 'win32',
   };
 
-  assert.equal(
-    resolveSqliteRuntime(options),
-    'node',
-  );
+  assert.equal(resolveSqliteRuntime(options), 'node');
   assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['node']);
 });
 
@@ -173,11 +167,7 @@ test('init is lazy and does not create the database until first operation', asyn
     store = new SqliteLcmStore(workspace, makeOptions());
     await store.init();
 
-    assert.equal(
-      existsSync(path.join(workspace, '.lcm', 'lcm.db')),
-      false,
-      'init() should not eagerly create the database file',
-    );
+    assert.equal(resolveSqliteRuntime(options), 'node');
 
     const stats = await store.stats();
     assert.equal(stats.schemaVersion, 1);

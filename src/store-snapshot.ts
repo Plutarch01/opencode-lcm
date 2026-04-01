@@ -145,11 +145,6 @@ export type SnapshotImportBindings = {
   refreshSearchIndexesSync(sessionIDs?: string[]): void;
 };
 
-type SqlStatementLike = {
-  run(...args: unknown[]): unknown;
-  all(...args: unknown[]): unknown;
-};
-
 export async function exportStoreSnapshot(
   bindings: SnapshotExportBindings,
   input: ExportSnapshotInput,

@@ -38,7 +38,6 @@ import {
 import {
   buildFtsQuery,
   filterTokensByTfidf,
-  rebuildSearchIndexesSync as rebuildSearchIndexesModule,
   refreshSearchIndexesSync as refreshSearchIndexesModule,
   replaceMessageSearchRowSync as replaceMessageSearchRowModule,
   replaceMessageSearchRowsSync as replaceMessageSearchRowsModule,
@@ -215,7 +214,7 @@ function readMessagesForSession(db: SqlDatabaseLike, sessionID: string): Message
     .all(sessionID) as MessageReadRow[];
 }
 
-function readPartsForSession(db: SqlDatabaseLike, sessionID: string): PartReadRow[] {
+function _readPartsForSession(db: SqlDatabaseLike, sessionID: string): PartReadRow[] {
   return db
     .prepare('SELECT * FROM parts WHERE session_id = ? ORDER BY message_id ASC, sort_key ASC')
     .all(sessionID) as PartReadRow[];
@@ -242,7 +241,7 @@ function readArtifactBlob(
     | undefined;
 }
 
-function readOrphanArtifactBlobRows(db: SqlDatabaseLike): ArtifactBlobReadRow[] {
+function _readOrphanArtifactBlobRows(db: SqlDatabaseLike): ArtifactBlobReadRow[] {
   return db
     .prepare(
       `SELECT b.* FROM artifact_blobs b
@@ -3797,10 +3796,6 @@ export class SqliteLcmStore {
 
   private replaceMessageSearchRowSync(sessionID: string, message: ConversationMessage): void {
     replaceMessageSearchRowModule(this.searchDeps(), sessionID, message);
-  }
-
-  private rebuildSearchIndexesSync(): void {
-    rebuildSearchIndexesModule(this.searchDeps());
   }
 
   private refreshSearchIndexesSync(sessionIDs?: string[]): void {
