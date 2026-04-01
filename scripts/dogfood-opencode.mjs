@@ -1,32 +1,33 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const distPath = path.join(repoRoot, "dist", "index.js");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const distPath = path.join(repoRoot, 'dist', 'index.js');
 
 if (!existsSync(distPath)) {
   console.error(`Missing build output at ${distPath}. Run npm run build first.`);
   process.exit(1);
 }
 
-const model = process.argv[2] ?? process.env.OPENCODE_LCM_DOGFOOD_MODEL ?? "openai/gpt-5.4-mini";
+const model = process.argv[2] ?? process.env.OPENCODE_LCM_DOGFOOD_MODEL ?? 'openai/gpt-5.4-mini';
 const distUrl = pathToFileURL(distPath).href;
+const expectedMarker = 'ZX729ALBATROSS';
 
 function runOpencode(cwd, args) {
-  if (process.platform === "win32") {
-    return spawnSync("cmd.exe", ["/c", "opencode", ...args], {
+  if (process.platform === 'win32') {
+    return spawnSync('cmd.exe', ['/c', 'opencode', ...args], {
       cwd,
-      encoding: "utf8",
+      encoding: 'utf8',
       timeout: 180000,
     });
   }
 
-  return spawnSync("opencode", args, {
+  return spawnSync('opencode', args, {
     cwd,
-    encoding: "utf8",
+    encoding: 'utf8',
     timeout: 180000,
   });
 }
@@ -38,24 +39,24 @@ function extractText(output) {
     .map((line) => {
       try {
         const entry = JSON.parse(line);
-        return entry.type === "text" ? entry.part?.text ?? "" : "";
+        return entry.type === 'text' ? (entry.part?.text ?? '') : '';
       } catch {
-        return "";
+        return '';
       }
     })
     .filter(Boolean)
-    .join("");
+    .join('');
 }
 
 function summarizeFailure(result) {
   const stdoutLine = result.stdout?.split(/\r?\n/).find(Boolean);
   const stderrLine = result.stderr?.split(/\r?\n/).find(Boolean);
-  return stdoutLine || stderrLine || result.error?.message || "no output";
+  return stdoutLine || stderrLine || result.error?.message || 'no output';
 }
 
 function readTraceEntries(tracePath) {
   if (!existsSync(tracePath)) return [];
-  return readFileSync(tracePath, "utf8")
+  return readFileSync(tracePath, 'utf8')
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => JSON.parse(line));
@@ -69,37 +70,40 @@ function validateResults(results) {
   const errors = [];
 
   for (const result of results) {
-    const mode = result.enabled ? "automatic retrieval ON" : "automatic retrieval OFF";
+    const mode = result.enabled ? 'automatic retrieval ON' : 'automatic retrieval OFF';
     if (!result.ok) {
       errors.push(`${mode}: ${result.reason}`);
       continue;
     }
     if (!result.pluginLoaded) errors.push(`${mode}: plugin did not emit an init trace`);
-    if (!result.toolKeys.includes("lcm_status")) errors.push(`${mode}: plugin tools did not include lcm_status`);
+    if (!result.toolKeys.includes('lcm_status'))
+      errors.push(`${mode}: plugin tools did not include lcm_status`);
     if (result.transformCount === 0) errors.push(`${mode}: message transform hook never ran`);
   }
 
   const enabledResult = results.find((result) => result.enabled && result.ok);
   const disabledResult = results.find((result) => !result.enabled && result.ok);
   if (enabledResult) {
-    if (!enabledResult.markers.includes("retrieved-context")) {
-      errors.push("automatic retrieval ON: missing retrieved-context marker");
+    if (!enabledResult.markers.includes('retrieved-context')) {
+      errors.push('automatic retrieval ON: missing retrieved-context marker');
     }
-    if (!enabledResult.retrievedContext?.includes("ZX-729-ALBATROSS")) {
-      errors.push("automatic retrieval ON: retrieved context did not contain the expected marker");
+    if (!enabledResult.retrievedContext?.includes(expectedMarker)) {
+      errors.push('automatic retrieval ON: retrieved context did not contain the expected marker');
     }
   }
-  if (disabledResult?.markers.includes("retrieved-context")) {
-    errors.push("automatic retrieval OFF: unexpectedly injected retrieved-context");
+  if (disabledResult?.markers.includes('retrieved-context')) {
+    errors.push('automatic retrieval OFF: unexpectedly injected retrieved-context');
   }
 
   return errors;
 }
 
 function runScenario(enabled) {
-  const projectDir = mkdtempSync(path.join(tmpdir(), enabled ? "lcm-dogfood-on-" : "lcm-dogfood-off-"));
-  const pluginDir = path.join(projectDir, ".opencode", "plugins");
-  const tracePath = path.join(projectDir, "trace.jsonl").replace(/\\/g, "/");
+  const projectDir = mkdtempSync(
+    path.join(tmpdir(), enabled ? 'lcm-dogfood-on-' : 'lcm-dogfood-off-'),
+  );
+  const pluginDir = path.join(projectDir, '.opencode', 'plugins');
+  const tracePath = path.join(projectDir, 'trace.jsonl').replace(/\\/g, '/');
   mkdirSync(pluginDir, { recursive: true });
 
   const pluginSource = [
@@ -112,7 +116,7 @@ function runScenario(enabled) {
     `    minMessagesForTransform: 3,`,
     `    summaryCharBudget: 180,`,
     `    automaticRetrieval: {`,
-    `      enabled: ${enabled ? "true" : "false"},`,
+    `      enabled: ${enabled ? 'true' : 'false'},`,
     `      maxChars: 700,`,
     `      minTokens: 2,`,
     `      maxMessageHits: 2,`,
@@ -135,24 +139,25 @@ function runScenario(enabled) {
     `    },`,
     `  };`,
     `};`,
-  ].join("\n");
+  ].join('\n');
 
-  writeFileSync(path.join(pluginDir, "dogfood.js"), pluginSource);
+  writeFileSync(path.join(pluginDir, 'dogfood.js'), pluginSource);
 
   const firstPrompt =
     'Remember this incident note for later: ' +
     'alpha '.repeat(18) +
-    'the exact root cause marker was ZX-729-ALBATROSS and the billing shard was billing_42. Reply only stored.';
-  const secondPrompt = 'What exact root cause marker did I mention earlier? Reply only with the marker.';
+    `the exact root cause marker ${expectedMarker} and the billing shard billing_42. Reply only stored.`;
+  const secondPrompt =
+    'What exact root cause marker did I mention earlier? Reply only with the marker.';
 
   const first = runOpencode(projectDir, [
-    "run",
+    'run',
     firstPrompt,
-    "--format",
-    "json",
-    "--dir",
+    '--format',
+    'json',
+    '--dir',
     projectDir,
-    "--model",
+    '--model',
     model,
   ]);
   if (first.status !== 0) {
@@ -165,14 +170,14 @@ function runScenario(enabled) {
   }
 
   const second = runOpencode(projectDir, [
-    "run",
+    'run',
     secondPrompt,
-    "--continue",
-    "--format",
-    "json",
-    "--dir",
+    '--continue',
+    '--format',
+    'json',
+    '--dir',
     projectDir,
-    "--model",
+    '--model',
     model,
   ]);
   if (second.status !== 0) {
@@ -185,30 +190,31 @@ function runScenario(enabled) {
   }
 
   const traceEntries = readTraceEntries(tracePath);
-  const pluginInit = traceEntries.find((entry) => entry.type === "plugin-init");
-  const transforms = traceEntries.filter((entry) => entry.type === "message-transform");
+  const pluginInit = traceEntries.find((entry) => entry.type === 'plugin-init');
+  const transforms = traceEntries.filter((entry) => entry.type === 'message-transform');
   const lastTrace = transforms.at(-1) ?? { synthetic: [] };
 
   return {
     enabled,
     ok: true,
     projectDir,
-    answer: extractText(second.stdout ?? ""),
+    answer: extractText(second.stdout ?? ''),
     pluginLoaded: Boolean(pluginInit),
     toolKeys: pluginInit?.toolKeys ?? [],
     transformCount: transforms.length,
     markers: lastTrace.synthetic.map((entry) => entry.marker),
-    retrievedContext: lastTrace.synthetic.find((entry) => entry.marker === "retrieved-context")?.text,
+    retrievedContext: lastTrace.synthetic.find((entry) => entry.marker === 'retrieved-context')
+      ?.text,
   };
 }
 
 const results = [runScenario(false), runScenario(true)];
-const keepProjects = process.env.OPENCODE_LCM_DOGFOOD_KEEP === "1";
+const keepProjects = process.env.OPENCODE_LCM_DOGFOOD_KEEP === '1';
 const validationErrors = validateResults(results);
 
 console.log(`Model: ${model}`);
 for (const result of results) {
-  const mode = result.enabled ? "automatic retrieval ON" : "automatic retrieval OFF";
+  const mode = result.enabled ? 'automatic retrieval ON' : 'automatic retrieval OFF';
   if (!result.ok) {
     console.log(`${mode}: FAILED`);
     console.log(`- reason: ${result.reason}`);
@@ -217,31 +223,34 @@ for (const result of results) {
   }
 
   console.log(`${mode}:`);
-  console.log(`- answer: ${result.answer || "(empty)"}`);
+  console.log(`- answer: ${result.answer || '(empty)'}`);
   console.log(`- plugin loaded: ${result.pluginLoaded}`);
   console.log(`- transform count: ${result.transformCount}`);
-  console.log(`- tool keys include lcm_status: ${result.toolKeys.includes("lcm_status")}`);
-  console.log(`- markers: ${result.markers.join(", ") || "none"}`);
+  console.log(`- tool keys include lcm_status: ${result.toolKeys.includes('lcm_status')}`);
+  console.log(`- markers: ${result.markers.join(', ') || 'none'}`);
   if (result.retrievedContext) {
-    console.log(`- retrieved context: ${result.retrievedContext.split("\n")[0]}`);
+    const preview =
+      result.retrievedContext.split('\n').find((line) => line.startsWith('- message ')) ??
+      result.retrievedContext.split('\n')[0];
+    console.log(`- retrieved context: ${preview}`);
   }
 }
 
 const enabledResult = results.find((result) => result.enabled && result.ok);
 const disabledResult = results.find((result) => !result.enabled && result.ok);
 if (enabledResult && disabledResult) {
-  const enabledHit = enabledResult.markers.includes("retrieved-context");
-  const disabledHit = disabledResult.markers.includes("retrieved-context");
+  const enabledHit = enabledResult.markers.includes('retrieved-context');
+  const disabledHit = disabledResult.markers.includes('retrieved-context');
   console.log(`Verdict: enabled_hit=${enabledHit} disabled_hit=${disabledHit}`);
 }
 
 if (validationErrors.length > 0) {
-  console.log("Smoke test FAILED:");
+  console.log('Smoke test FAILED:');
   for (const error of validationErrors) console.log(`- ${error}`);
   process.exit(1);
 }
 
-console.log("Smoke test passed.");
+console.log('Smoke test passed.');
 for (const result of results) {
   if (!result.ok || keepProjects) continue;
   cleanupProjectDir(result.projectDir, keepProjects);
