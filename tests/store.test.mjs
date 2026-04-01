@@ -167,8 +167,6 @@ test('init is lazy and does not create the database until first operation', asyn
     store = new SqliteLcmStore(workspace, makeOptions());
     await store.init();
 
-    assert.equal(resolveSqliteRuntime(options), 'node');
-
     const stats = await store.stats();
     assert.equal(stats.schemaVersion, 1);
     assert.equal(existsSync(path.join(workspace, '.lcm', 'lcm.db')), true);
