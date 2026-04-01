@@ -7,7 +7,13 @@ A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode)
 
 ## Status
 
-Early release, actively tested with OpenCode and SQLite, with CI on Node 22 and 24. Designed for long-session recall across compaction boundaries. Tested primarily on Windows with Node 22 and OpenCode's plugin system.
+`opencode-lcm` is an early release, and its behavior, archive internals, and configuration may still change as the project evolves.
+
+This is an unofficial community plugin for [OpenCode](https://github.com/sst/opencode) and is not affiliated with or endorsed by the OpenCode project.
+
+The plugin stores archived conversation context locally in `.lcm/`, so review the storage behavior before using it with sensitive data.
+
+Actively tested with OpenCode and SQLite, with CI on Node 22 and 24. Tested primarily on Windows with Node 22 and OpenCode's plugin system. Issues and PRs are welcome.
 
 ## context-mode
 
