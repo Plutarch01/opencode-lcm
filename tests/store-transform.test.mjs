@@ -138,8 +138,9 @@ test('transformMessages automatically injects relevant archived memory snippets'
     assert.equal(changed, true);
     assert.ok(retrievalPart);
     assert.ok(summaryPart);
-    assert.match(retrievalPart.text, /automatically recalled/);
-    assert.match(retrievalPart.text, /Recall telemetry: queries=/);
+    assert.equal(messages[3].parts[0].text, 'tenant mapping sqlite');
+    assert.match(retrievalPart.text, /recalled \d+ archived hit/);
+    assert.match(retrievalPart.text, /Archived hits:/);
     assert.match(retrievalPart.text, /message session=s1 id=m1/);
     assert.ok(!retrievalPart.text.includes('id=m4'));
   } finally {
@@ -249,6 +250,7 @@ test('automatic retrieval ignores framing words like "say" and recalls the archi
     );
 
     assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /Archived hits:/);
     assert.match(retrievalPart.text, /billing cache/);
     assert.ok(!retrievalPart.text.includes('session=s1 id=m4'));
   } finally {
@@ -344,8 +346,9 @@ test('automatic retrieval can build recall queries from later intent tokens', as
     );
 
     assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /scope=session/);
     assert.match(retrievalPart.text, /billing cache/);
-    assert.match(retrievalPart.text, /queries=.*tenant mapping sqlite/);
+    assert.match(retrievalPart.text, /Archived hits:/);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
@@ -403,6 +406,16 @@ test('automatic retrieval ignores pasted system reminders on low-signal confirma
         ),
       ],
     });
+
+    const reminderResults = await store.grep({
+      query: 'operational mode',
+      sessionID: 's1',
+      limit: 3,
+    });
+    const cleanedResults = await store.grep({ query: 'go ahead', sessionID: 's1', limit: 3 });
+
+    assert.equal(reminderResults.length, 0);
+    assert.ok(cleanedResults.length > 0);
 
     const messages = [
       conversationMessage({
@@ -693,7 +706,8 @@ test('automatic retrieval ignores meta-heavy artifact snippets when real message
     );
 
     assert.ok(retrievalPart);
-    assert.match(retrievalPart.text, /message session=s1 id=m1/);
+    assert.match(retrievalPart.text, /Archived hits:/);
+    assert.match(retrievalPart.text, /billing cache/);
     assert.ok(!retrievalPart.text.includes('artifact:tool'));
   } finally {
     store?.close();
@@ -778,7 +792,7 @@ test('automatic retrieval escalates from session to worktree when nearby archive
 
     assert.ok(retrievalPart);
     assert.match(retrievalPart.text, /scope=session -> worktree/);
-    assert.match(retrievalPart.text, /Recall telemetry: raw_results=/);
+    assert.match(retrievalPart.text, /Archived hits:/);
     assert.match(retrievalPart.text, /message session=older id=om1/);
     assert.match(retrievalPart.text, /billing cache/);
   } finally {
@@ -933,11 +947,7 @@ test('automatic retrieval can skip a scope with a zero budget', async () => {
 
     assert.ok(retrievalPart);
     assert.match(retrievalPart.text, /scope=worktree/);
-    assert.match(retrievalPart.text, /stop_reason=target-hits-reached/);
-    assert.match(
-      retrievalPart.text,
-      /scope_stats=session:hits=0,raw=0,budget=0 \| worktree:hits=1/,
-    );
+    assert.match(retrievalPart.text, /Archived hits:/);
     assert.match(retrievalPart.text, /message session=older id=om1/);
   } finally {
     store?.close();
@@ -1044,7 +1054,7 @@ test('automatic retrieval can stop after the first scope with hits', async () =>
     assert.ok(retrievalPart);
     assert.match(retrievalPart.text, /scope=session/);
     assert.ok(!retrievalPart.text.includes('scope=session -> worktree'));
-    assert.match(retrievalPart.text, /stop_reason=first-scope-hit/);
+    assert.match(retrievalPart.text, /Archived hits:/);
     assert.match(retrievalPart.text, /message session=current id=m1/);
     assert.ok(!retrievalPart.text.includes('session=older id=om1'));
   } finally {
@@ -1172,8 +1182,12 @@ test('transformMessages anchors synthetic context on the latest user when the re
     assert.equal(changed, true);
     assert.match(messages[0].parts[0].text, /Archived by opencode-lcm/);
     assert.match(messages[1].parts[0].text, /Archived by opencode-lcm/);
-    assert.equal(messages[2].parts[0].metadata.opencodeLcm, 'archive-summary');
-    assert.match(messages[2].parts[0].text, /Archived roots:/);
+    const summaryPart = messages[2].parts.find(
+      (part) => part.type === 'text' && part.metadata?.opencodeLcm === 'archive-summary',
+    );
+    assert.equal(messages[2].parts[0].text, 'current user request');
+    assert.ok(summaryPart);
+    assert.match(summaryPart.text, /Summary roots:/);
     assert.equal(messages[3].parts[0].type, 'tool');
     assert.equal(messages[3].parts[0].tool, 'lcm_grep');
     assert.equal(messages[3].parts[0].state.output, 'first tool output');

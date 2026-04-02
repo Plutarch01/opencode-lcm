@@ -427,16 +427,20 @@ function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: stri
 
   for (const part of message.parts) {
     switch (part.type) {
-      case 'text':
+      case 'text': {
         if (isSyntheticLcmTextPart(part, ['archive-summary', 'retrieved-context', 'archived-part']))
           break;
         if (part.text.startsWith('[Archived by opencode-lcm:')) break;
-        segments.push(part.text);
+        const sanitized = sanitizeAutomaticRetrievalSourceText(part.text);
+        if (sanitized) segments.push(sanitized);
         break;
-      case 'reasoning':
+      }
+      case 'reasoning': {
         if (part.text.startsWith('[Archived by opencode-lcm:')) break;
-        segments.push(part.text);
+        const sanitized = sanitizeAutomaticRetrievalSourceText(part.text);
+        if (sanitized) segments.push(sanitized);
         break;
+      }
       case 'file': {
         const sourcePath = part.source?.path;
         const filename = part.filename;
@@ -2656,7 +2660,7 @@ export class SqliteLcmStore {
       synthetic: true,
       metadata: { opencodeLcm: 'archive-summary' },
     });
-    anchor.parts.unshift(...syntheticParts);
+    anchor.parts.push(...syntheticParts);
     return true;
   }
 

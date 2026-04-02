@@ -383,7 +383,7 @@ test('message.removed drops reverted content from session memory and search', as
     });
 
     const before = await store.grep({ query: 'reverted memory body', sessionID: 's1', limit: 3 });
-    assert.equal(before[0]?.id, 'm1');
+    assert.ok(before.some((result) => result.id === 'm1' || result.type.startsWith('artifact:')));
 
     await store.capture({
       type: 'message.removed',

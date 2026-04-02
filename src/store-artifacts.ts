@@ -23,6 +23,7 @@ import {
   inferFileExtension,
   inferUrlScheme,
   parseJson,
+  sanitizeAutomaticRetrievalSourceText,
   truncate,
 } from './utils.js';
 
@@ -280,8 +281,10 @@ async function externalizePart(
     value: string,
     metadata: Record<string, unknown> = {},
     previewText?: string,
+    sanitize = false,
   ): string => {
-    if (value.length < bindings.options.largeContentThreshold) return value;
+    const contentText = sanitize ? sanitizeAutomaticRetrievalSourceText(value) : value;
+    if (contentText.length < bindings.options.largeContentThreshold) return contentText;
 
     const artifact = createArtifactData(bindings, {
       sessionID: storedPart.sessionID,
@@ -289,7 +292,7 @@ async function externalizePart(
       partID: storedPart.id,
       artifactKind,
       fieldName,
-      contentText: value,
+      contentText,
       createdAt,
       metadata,
       previewText,
@@ -305,7 +308,7 @@ async function externalizePart(
 
   switch (storedPart.type) {
     case 'text':
-      storedPart.text = externalize('message', 'text', storedPart.text);
+      storedPart.text = externalize('message', 'text', storedPart.text, {}, undefined, true);
       if (artifacts.length > 0) {
         storedPart.metadata = {
           ...(storedPart.metadata ?? {}),
@@ -314,7 +317,7 @@ async function externalizePart(
       }
       break;
     case 'reasoning':
-      storedPart.text = externalize('reasoning', 'text', storedPart.text);
+      storedPart.text = externalize('reasoning', 'text', storedPart.text, {}, undefined, true);
       if (artifacts.length > 0) {
         storedPart.metadata = {
           ...(storedPart.metadata ?? {}),
@@ -336,7 +339,14 @@ async function externalizePart(
         break;
       }
       if (storedPart.state.status === 'completed') {
-        storedPart.state.output = externalize('tool', 'output', storedPart.state.output);
+        storedPart.state.output = externalize(
+          'tool',
+          'output',
+          storedPart.state.output,
+          {},
+          undefined,
+          true,
+        );
         if (storedPart.state.attachments) {
           const storedAttachments: Extract<Part, { type: 'file' }>[] = [];
           for (const [index, attachment] of storedPart.state.attachments.entries()) {
@@ -377,7 +387,14 @@ async function externalizePart(
         }
       }
       if (storedPart.state.status === 'error') {
-        storedPart.state.error = externalize('tool', 'error', storedPart.state.error);
+        storedPart.state.error = externalize(
+          'tool',
+          'error',
+          storedPart.state.error,
+          {},
+          undefined,
+          true,
+        );
       }
       break;
     case 'file':
@@ -406,18 +423,39 @@ async function externalizePart(
       }
       break;
     case 'snapshot':
-      storedPart.snapshot = externalize('snapshot', 'snapshot', storedPart.snapshot);
+      storedPart.snapshot = externalize(
+        'snapshot',
+        'snapshot',
+        storedPart.snapshot,
+        {},
+        undefined,
+        true,
+      );
       break;
     case 'agent':
       if (storedPart.source?.value) {
-        storedPart.source.value = externalize('agent', 'source', storedPart.source.value);
+        storedPart.source.value = externalize(
+          'agent',
+          'source',
+          storedPart.source.value,
+          {},
+          undefined,
+          true,
+        );
         storedPart.source.start = 0;
         storedPart.source.end = storedPart.source.value.length;
       }
       break;
     case 'subtask':
-      storedPart.prompt = externalize('subtask', 'prompt', storedPart.prompt);
-      storedPart.description = externalize('subtask', 'description', storedPart.description);
+      storedPart.prompt = externalize('subtask', 'prompt', storedPart.prompt, {}, undefined, true);
+      storedPart.description = externalize(
+        'subtask',
+        'description',
+        storedPart.description,
+        {},
+        undefined,
+        true,
+      );
       break;
     default:
       break;
