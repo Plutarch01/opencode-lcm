@@ -138,9 +138,11 @@ test('sanitizeAutomaticRetrievalSourceText strips system reminders', () => {
 });
 
 test('sanitizeAutomaticRetrievalSourceText strips archived markers', () => {
-  const input = '[Archived by opencode-lcm: older text] actual content';
+  const input =
+    '[Archived by opencode-lcm: recalled 1 archived hit for this turn (scope=session).]\nArchived hits: message session=s1 id=m1: tenant mapping sqlite\nactual content';
   const result = sanitizeAutomaticRetrievalSourceText(input);
   assert.ok(!result.includes('Archived by opencode-lcm'));
+  assert.ok(!result.includes('Archived hits:'));
   assert.ok(result.includes('actual content'));
 });
 
@@ -149,6 +151,9 @@ test('sanitizeAutomaticRetrievalSourceText strips archived markers', () => {
 test('isAutomaticRetrievalNoise detects noise patterns', () => {
   assert.ok(isAutomaticRetrievalNoise('<system-reminder>'));
   assert.ok(isAutomaticRetrievalNoise('[Archived by opencode-lcm: text]'));
+  assert.ok(
+    isAutomaticRetrievalNoise('Archived hits: message session=s1 id=m1: tenant mapping sqlite'),
+  );
   assert.ok(!isAutomaticRetrievalNoise('hello world'));
 });
 

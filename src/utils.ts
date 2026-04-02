@@ -125,10 +125,16 @@ const AUTOMATIC_RETRIEVAL_NOISE_PATTERNS = [
   /<system-reminder>/i,
   /system[-\s[\]]*reminder/i,
   /\[archived by opencode-lcm:/i,
+  /archived hits:/i,
+  /summary roots:/i,
+  /\b(?:message|summary|artifact) session=[^\s]+ id=[^\s]+/i,
+  /\bsum_[a-f0-9]{12}_l\d+_p\d+:/i,
   /recall telemetry:/i,
   /recalled context:/i,
   /your operational mode has changed/i,
   /opencode-lcm automatically recalled/i,
+  /recalled \d+ archived hit/i,
+  /compacted \d+ older conversation turn/i,
   /treat recalled archive as supporting context/i,
   /use lcm_(describe|grep|resume|expand|artifact)/i,
 ];
@@ -271,6 +277,8 @@ export function sanitizeAutomaticRetrievalSourceText(text: string): string {
     .replace(/<system-reminder>/gi, ' ')
     .replace(/<\/system-reminder>/gi, ' ')
     .replace(/\[Archived by opencode-lcm:[^\]]*\]/gi, ' ')
+    .replace(/Archived hits:[^\n]*/gi, ' ')
+    .replace(/Summary roots:[^\n]*/gi, ' ')
     .replace(/Recall telemetry:[^\n]*/gi, ' ')
     .replace(/Recalled context:/gi, ' ')
     .replace(/Archived roots:/gi, ' ')

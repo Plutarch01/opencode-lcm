@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-02
+
 ### Added
 - Cross-platform CI matrix for Linux, Windows, and macOS on Node 22 and 24
 - Opt-in CI dogfood smoke job for the existing `dogfood:opencode` flow, including workflow-managed OpenCode CLI installation
@@ -15,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `lcm_status` now reports configured privacy-control counts and excluded tool prefixes
 - `tests/store.test.mjs` cleanup now retries transient Windows SQLite file-lock races
+- Archived recall and summary reminders now use terse inline formatting and attach after the active user text instead of leading it
+- Automatic-retrieval sanitization now strips archived reminder boilerplate before indexing and artifact externalization
+
+### Fixed
+- Pasted reminder text no longer pollutes retrieval candidates or dominates later archive recall
 
 ## [0.1.0] - 2026-03-31
 

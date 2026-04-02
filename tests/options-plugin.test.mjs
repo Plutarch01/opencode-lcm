@@ -225,9 +225,13 @@ test('plugin system and message transform hooks respect options', async () => {
 
     assert.match(output.messages[0].parts[0].text, /Archived by opencode-lcm/);
     assert.match(output.messages[1].parts[0].state.output, /infrastructure tool output omitted/);
-    assert.equal(output.messages[2].parts[0].metadata.opencodeLcm, 'archive-summary');
-    assert.match(output.messages[2].parts[0].text, /Archived roots:/);
-    assert.ok(!output.messages[2].parts[0].text.includes('ctx_search'));
+    const summaryPart = output.messages[2].parts.find(
+      (part) => part.type === 'text' && part.metadata?.opencodeLcm === 'archive-summary',
+    );
+    assert.equal(output.messages[2].parts[0].text, 'fresh user request');
+    assert.ok(summaryPart);
+    assert.match(summaryPart.text, /Summary roots:/);
+    assert.ok(!summaryPart.text.includes('ctx_search'));
   } finally {
     // Plugin hooks keep their SQLite store open for the life of the plugin instance.
     // Let the temp workspace be reclaimed by the OS after process exit.
