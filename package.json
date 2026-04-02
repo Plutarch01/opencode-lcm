@@ -13,7 +13,6 @@
   },
   "files": [
     "dist/",
-    "dist-tests/",
     "src/",
     "README.md",
     "CHANGELOG.md",
