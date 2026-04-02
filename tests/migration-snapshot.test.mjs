@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
+import { getLogger, setLogger } from '../dist/logging.js';
 import { SqliteLcmStore } from '../dist/store.js';
 
 import {
@@ -76,6 +77,46 @@ test('init migrates legacy session, resume, and event files into SQLite', async 
     assert.equal(grep[0].id, 'm1');
   } finally {
     store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('fresh init skips missing legacy files without logging', async () => {
+  const workspace = makeWorkspace('lcm-fresh');
+  const defaultLogger = getLogger();
+  const previousStartupLog = process.env.OPENCODE_LCM_STARTUP_LOG;
+  const calls = [];
+  let store;
+
+  try {
+    delete process.env.OPENCODE_LCM_STARTUP_LOG;
+    setLogger({
+      debug(message, context) {
+        calls.push({ level: 'debug', message, context });
+      },
+      info(message, context) {
+        calls.push({ level: 'info', message, context });
+      },
+      warn(message, context) {
+        calls.push({ level: 'warn', message, context });
+      },
+      error(message, context) {
+        calls.push({ level: 'error', message, context });
+      },
+    });
+
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    const stats = await store.stats();
+
+    assert.equal(stats.sessionCount, 0);
+    assert.deepEqual(calls, []);
+  } finally {
+    store?.close();
+    setLogger(defaultLogger);
+    if (previousStartupLog === undefined) delete process.env.OPENCODE_LCM_STARTUP_LOG;
+    else process.env.OPENCODE_LCM_STARTUP_LOG = previousStartupLog;
     await cleanupWorkspace(workspace);
   }
 });

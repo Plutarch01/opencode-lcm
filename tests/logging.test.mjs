@@ -11,7 +11,38 @@ test('getLogger returns default logger', () => {
   assert.ok(typeof logger.error === 'function');
 });
 
+test('default logger is silent', () => {
+  const logger = getLogger();
+  const calls = [];
+  const original = {
+    debug: console.debug,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+  };
+
+  console.debug = (...args) => calls.push({ level: 'debug', args });
+  console.info = (...args) => calls.push({ level: 'info', args });
+  console.warn = (...args) => calls.push({ level: 'warn', args });
+  console.error = (...args) => calls.push({ level: 'error', args });
+
+  try {
+    logger.debug('debug message', { key: 'value' });
+    logger.info('info message');
+    logger.warn('warn message');
+    logger.error('error message');
+  } finally {
+    console.debug = original.debug;
+    console.info = original.info;
+    console.warn = original.warn;
+    console.error = original.error;
+  }
+
+  assert.deepEqual(calls, []);
+});
+
 test('setLogger swaps the logger', () => {
+  const defaultLogger = getLogger();
   const calls = [];
   const customLogger = {
     debug(message, context) {
@@ -37,8 +68,7 @@ test('setLogger swaps the logger', () => {
   assert.deepEqual(calls[0], { level: 'info', message: 'test message', context: { key: 'value' } });
   assert.deepEqual(calls[1], { level: 'error', message: 'error message', context: undefined });
 
-  // Restore default logger
-  setLogger(getLogger());
+  setLogger(defaultLogger);
 });
 
 test('isStartupLoggingEnabled respects OPENCODE_LCM_STARTUP_LOG', () => {
