@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { Event, Message, Part } from '@opencode-ai/sdk';
@@ -957,7 +957,9 @@ export class SqliteLcmStore {
     const normalized = normalizeEvent(event);
     if (!normalized) return;
 
-    this.writeEvent(normalized);
+    if (this.shouldRecordEvent(normalized.type)) {
+      this.writeEvent(normalized);
+    }
 
     if (!normalized.sessionID) return;
     if (!this.shouldPersistSessionForEvent(normalized.type)) return;
@@ -1477,6 +1479,18 @@ export class SqliteLcmStore {
       eventType === 'message.removed' ||
       eventType === 'message.part.updated' ||
       eventType === 'message.part.removed'
+    );
+  }
+
+  private shouldRecordEvent(eventType: string): boolean {
+    if (this.shouldPersistSessionForEvent(eventType)) return true;
+
+    return (
+      eventType === 'session.error' ||
+      eventType === 'permission.asked' ||
+      eventType === 'permission.replied' ||
+      eventType === 'question.asked' ||
+      eventType === 'question.replied'
     );
   }
 
@@ -2312,6 +2326,123 @@ export class SqliteLcmStore {
           (row) =>
             `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
         ),
+    ].join('\n');
+  }
+
+  private readPrunableEventTypeCountsSync(): Array<{ eventType: string; count: number }> {
+    const rows = this.getDb()
+      .prepare(
+        'SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type ORDER BY count DESC',
+      )
+      .all() as Array<{ event_type: string; count: number }>;
+
+    return rows
+      .filter((row) => !this.shouldRecordEvent(row.event_type))
+      .map((row) => ({
+        eventType: row.event_type,
+        count: row.count,
+      }));
+  }
+
+  private async readStoreFileSizes(): Promise<{
+    dbBytes: number;
+    walBytes: number;
+    shmBytes: number;
+    totalBytes: number;
+  }> {
+    const readBytes = async (filePath: string): Promise<number> => {
+      try {
+        return (await stat(filePath)).size;
+      } catch {
+        return 0;
+      }
+    };
+
+    const dbBytes = await readBytes(this.dbPath);
+    const walBytes = await readBytes(`${this.dbPath}-wal`);
+    const shmBytes = await readBytes(`${this.dbPath}-shm`);
+
+    return {
+      dbBytes,
+      walBytes,
+      shmBytes,
+      totalBytes: dbBytes + walBytes + shmBytes,
+    };
+  }
+
+  async compactEventLog(input?: {
+    apply?: boolean;
+    vacuum?: boolean;
+    limit?: number;
+  }): Promise<string> {
+    await this.ensureDbReady();
+    const apply = input?.apply ?? false;
+    const vacuum = input?.vacuum ?? true;
+    const limit = clamp(input?.limit ?? 10, 1, 50);
+    const candidates = this.readPrunableEventTypeCountsSync();
+    const candidateEvents = candidates.reduce((sum, row) => sum + row.count, 0);
+    const beforeSizes = await this.readStoreFileSizes();
+
+    if (!apply || candidateEvents === 0) {
+      return [
+        `candidate_events=${candidateEvents}`,
+        `apply=false`,
+        `vacuum_requested=${vacuum}`,
+        `db_bytes=${beforeSizes.dbBytes}`,
+        `wal_bytes=${beforeSizes.walBytes}`,
+        `shm_bytes=${beforeSizes.shmBytes}`,
+        `total_bytes=${beforeSizes.totalBytes}`,
+        ...(candidates.length > 0
+          ? [
+              'candidate_event_types:',
+              ...candidates
+                .slice(0, limit)
+                .map((row) => `- ${row.eventType} count=${row.count}`),
+            ]
+          : ['candidate_event_types:', '- none']),
+      ].join('\n');
+    }
+
+    const eventTypes = candidates.map((row) => row.eventType);
+    if (eventTypes.length > 0) {
+      const placeholders = eventTypes.map(() => '?').join(', ');
+      this.getDb()
+        .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
+        .run(...eventTypes);
+    }
+
+    let vacuumApplied = false;
+    this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    if (vacuum) {
+      this.getDb().exec('VACUUM');
+      this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      vacuumApplied = true;
+    }
+
+    const afterSizes = await this.readStoreFileSizes();
+
+    return [
+      `candidate_events=${candidateEvents}`,
+      `deleted_events=${candidateEvents}`,
+      `apply=true`,
+      `vacuum_requested=${vacuum}`,
+      `vacuum_applied=${vacuumApplied}`,
+      `db_bytes_before=${beforeSizes.dbBytes}`,
+      `wal_bytes_before=${beforeSizes.walBytes}`,
+      `shm_bytes_before=${beforeSizes.shmBytes}`,
+      `total_bytes_before=${beforeSizes.totalBytes}`,
+      `db_bytes_after=${afterSizes.dbBytes}`,
+      `wal_bytes_after=${afterSizes.walBytes}`,
+      `shm_bytes_after=${afterSizes.shmBytes}`,
+      `total_bytes_after=${afterSizes.totalBytes}`,
+      ...(candidates.length > 0
+        ? [
+            'deleted_event_types:',
+            ...candidates
+              .slice(0, limit)
+              .map((row) => `- ${row.eventType} count=${row.count}`),
+          ]
+        : ['deleted_event_types:', '- none']),
     ].join('\n');
   }
 
