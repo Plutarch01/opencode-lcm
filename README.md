@@ -17,6 +17,19 @@ A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode)
 
 ## Installation
 
+Add to your `opencode.json` (project or global `~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-lcm"]
+}
+```
+
+OpenCode will automatically download the latest version from npm on startup. No manual install needed.
+
+### From source
+
 ```sh
 git clone https://github.com/plutarch01/opencode-lcm.git
 cd opencode-lcm
