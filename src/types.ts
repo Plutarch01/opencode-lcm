@@ -25,6 +25,12 @@ export type RetentionPolicyOptions = {
   orphanBlobDays?: number;
 };
 
+export type PrivacyOptions = {
+  excludeToolPrefixes: string[];
+  excludePathPatterns: string[];
+  redactPatterns: string[];
+};
+
 export type AutomaticRetrievalScopeBudgets = {
   session: number;
   root: number;
@@ -54,6 +60,7 @@ export type OpencodeLcmOptions = {
   scopeDefaults: ScopeDefaults;
   scopeProfiles: ScopeProfile[];
   retention: RetentionPolicyOptions;
+  privacy: PrivacyOptions;
   automaticRetrieval: AutomaticRetrievalOptions;
   compactContextLimit: number;
   systemHint: boolean;

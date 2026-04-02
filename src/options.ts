@@ -4,6 +4,7 @@ import type {
   AutomaticRetrievalStopOptions,
   InteropOptions,
   OpencodeLcmOptions,
+  PrivacyOptions,
   RetentionPolicyOptions,
   ScopeDefaults,
   ScopeName,
@@ -25,6 +26,12 @@ const DEFAULT_RETENTION: RetentionPolicyOptions = {
   staleSessionDays: undefined,
   deletedSessionDays: 30,
   orphanBlobDays: 14,
+};
+
+const DEFAULT_PRIVACY: PrivacyOptions = {
+  excludeToolPrefixes: [],
+  excludePathPatterns: [],
+  redactPatterns: [],
 };
 
 const DEFAULT_AUTOMATIC_RETRIEVAL: AutomaticRetrievalOptions = {
@@ -52,6 +59,7 @@ export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   scopeDefaults: DEFAULT_SCOPE_DEFAULTS,
   scopeProfiles: [],
   retention: DEFAULT_RETENTION,
+  privacy: DEFAULT_PRIVACY,
   automaticRetrieval: DEFAULT_AUTOMATIC_RETRIEVAL,
   compactContextLimit: 1200,
   systemHint: true,
@@ -176,6 +184,15 @@ function asRetentionOptions(
   };
 }
 
+function asPrivacyOptions(value: unknown, fallback: PrivacyOptions): PrivacyOptions {
+  const record = asRecord(value);
+  return {
+    excludeToolPrefixes: asStringArray(record?.excludeToolPrefixes, fallback.excludeToolPrefixes),
+    excludePathPatterns: asStringArray(record?.excludePathPatterns, fallback.excludePathPatterns),
+    redactPatterns: asStringArray(record?.redactPatterns, fallback.redactPatterns),
+  };
+}
+
 function asAutomaticRetrievalOptions(
   value: unknown,
   fallback: AutomaticRetrievalOptions,
@@ -241,6 +258,7 @@ export function resolveOptions(raw: unknown): OpencodeLcmOptions {
     scopeDefaults,
     scopeProfiles: asScopeProfiles(options?.scopeProfiles),
     retention: asRetentionOptions(options?.retention, DEFAULT_RETENTION),
+    privacy: asPrivacyOptions(options?.privacy, DEFAULT_PRIVACY),
     automaticRetrieval: asAutomaticRetrievalOptions(
       options?.automaticRetrieval,
       DEFAULT_AUTOMATIC_RETRIEVAL,

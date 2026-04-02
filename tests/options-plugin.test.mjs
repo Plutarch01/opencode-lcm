@@ -37,6 +37,11 @@ test('resolveOptions normalizes malformed plugin config', () => {
       deletedSessionDays: -4,
       orphanBlobDays: 7,
     },
+    privacy: {
+      excludeToolPrefixes: ['secret_', '', 42],
+      excludePathPatterns: ['fixtures[/\\\\]private', null, ''],
+      redactPatterns: ['token_[0-9]+', false, ''],
+    },
     automaticRetrieval: {
       enabled: false,
       maxChars: Number.NaN,
@@ -63,6 +68,11 @@ test('resolveOptions normalizes malformed plugin config', () => {
   assert.equal(resolved.retention.staleSessionDays, undefined);
   assert.equal(resolved.retention.deletedSessionDays, undefined);
   assert.equal(resolved.retention.orphanBlobDays, 7);
+  assert.deepEqual(resolved.privacy, {
+    excludeToolPrefixes: ['secret_'],
+    excludePathPatterns: ['fixtures[/\\\\]private'],
+    redactPatterns: ['token_[0-9]+'],
+  });
   assert.equal(resolved.automaticRetrieval.enabled, false);
   assert.equal(resolved.automaticRetrieval.maxChars, DEFAULT_OPTIONS.automaticRetrieval.maxChars);
   assert.equal(resolved.automaticRetrieval.minTokens, DEFAULT_OPTIONS.automaticRetrieval.minTokens);

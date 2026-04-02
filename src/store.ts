@@ -22,6 +22,12 @@ import {
 } from './constants.js';
 import { type DoctorReport, type DoctorSessionIssue, formatDoctorReport } from './doctor.js';
 import { getLogger, isStartupLoggingEnabled } from './logging.js';
+import {
+  type CompiledPrivacyOptions,
+  compilePrivacyOptions,
+  redactStructuredValue,
+  redactText,
+} from './privacy.js';
 import { safeQuery, safeQueryOne, validateRow, withTransaction } from './sql-utils.js';
 import {
   type ArtifactData,
@@ -659,6 +665,7 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
 export class SqliteLcmStore {
   private readonly baseDir: string;
   private readonly dbPath: string;
+  private readonly privacy: CompiledPrivacyOptions;
   private readonly workspaceDirectory: string;
   private db?: SqlDatabaseLike;
   private dbReadyPromise?: Promise<void>;
@@ -667,6 +674,7 @@ export class SqliteLcmStore {
     projectDir: string,
     private readonly options: OpencodeLcmOptions,
   ) {
+    this.privacy = compilePrivacyOptions(options.privacy);
     this.workspaceDirectory = projectDir;
     this.baseDir = path.join(projectDir, options.storeDir ?? '.lcm');
     this.dbPath = path.join(this.baseDir, 'lcm.db');
@@ -3767,6 +3775,7 @@ export class SqliteLcmStore {
         binaryPreviewProviders: this.options.binaryPreviewProviders,
         largeContentThreshold: this.options.largeContentThreshold,
         previewBytePeek: this.options.previewBytePeek,
+        privacy: this.privacy,
       },
       getDb: () => this.getDb(),
       readArtifactBlobSync: (contentHash?: string | null) => this.readArtifactBlobSync(contentHash),
@@ -3791,11 +3800,15 @@ export class SqliteLcmStore {
   }
 
   private replaceMessageSearchRowsSync(session: NormalizedSession): void {
-    replaceMessageSearchRowsModule(this.searchDeps(), session);
+    replaceMessageSearchRowsModule(this.searchDeps(), redactStructuredValue(session, this.privacy));
   }
 
   private replaceMessageSearchRowSync(sessionID: string, message: ConversationMessage): void {
-    replaceMessageSearchRowModule(this.searchDeps(), sessionID, message);
+    replaceMessageSearchRowModule(
+      this.searchDeps(),
+      sessionID,
+      redactStructuredValue(message, this.privacy),
+    );
   }
 
   private refreshSearchIndexesSync(sessionIDs?: string[]): void {
@@ -4441,7 +4454,10 @@ export class SqliteLcmStore {
 
   private upsertSessionRowSync(session: NormalizedSession): void {
     const db = this.getDb();
-    const worktreeKey = normalizeWorktreeKey(session.directory);
+    const title = session.title ? redactText(session.title, this.privacy) : undefined;
+    const directory = session.directory ? redactText(session.directory, this.privacy) : undefined;
+    const pinReason = session.pinReason ? redactText(session.pinReason, this.privacy) : undefined;
+    const worktreeKey = normalizeWorktreeKey(directory);
 
     db.prepare(
       `INSERT INTO sessions (session_id, title, session_directory, worktree_key, parent_session_id, root_session_id, lineage_depth, pinned, pin_reason, updated_at, compacted_at, deleted, event_count)
@@ -4461,14 +4477,14 @@ export class SqliteLcmStore {
          event_count = excluded.event_count`,
     ).run(
       session.sessionID,
-      session.title ?? null,
-      session.directory ?? null,
+      title ?? null,
+      directory ?? null,
       worktreeKey ?? null,
       session.parentSessionID ?? null,
       session.rootSessionID ?? session.sessionID,
       session.lineageDepth ?? 0,
       session.pinned ? 1 : 0,
-      session.pinReason ?? null,
+      pinReason ?? null,
       session.updatedAt,
       session.compactedAt ?? null,
       session.deleted ? 1 : 0,
@@ -4477,16 +4493,17 @@ export class SqliteLcmStore {
   }
 
   private upsertMessageInfoSync(sessionID: string, message: ConversationMessage): void {
+    const info = redactStructuredValue(message.info, this.privacy);
     this.getDb()
       .prepare(
         `INSERT INTO messages (message_id, session_id, created_at, info_json)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(message_id) DO UPDATE SET
-           session_id = excluded.session_id,
-           created_at = excluded.created_at,
-           info_json = excluded.info_json`,
+            session_id = excluded.session_id,
+            created_at = excluded.created_at,
+            info_json = excluded.info_json`,
       )
-      .run(message.info.id, sessionID, message.info.time.created, JSON.stringify(message.info));
+      .run(info.id, sessionID, info.time.created, JSON.stringify(info));
   }
 
   private deleteMessageSync(sessionID: string, messageID: string): void {

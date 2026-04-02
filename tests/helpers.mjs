@@ -8,6 +8,7 @@ const BASE_OPTIONS = {
   scopeDefaults: { grep: 'session', describe: 'session' },
   scopeProfiles: [],
   retention: { staleSessionDays: undefined, deletedSessionDays: 30, orphanBlobDays: 14 },
+  privacy: { excludeToolPrefixes: [], excludePathPatterns: [], redactPatterns: [] },
   automaticRetrieval: {
     enabled: true,
     maxChars: 900,
@@ -62,6 +63,7 @@ export function makeOptions(overrides = {}) {
     scopeDefaults: { ...BASE_OPTIONS.scopeDefaults, ...overrides.scopeDefaults },
     scopeProfiles: overrides.scopeProfiles ?? BASE_OPTIONS.scopeProfiles,
     retention: { ...BASE_OPTIONS.retention, ...overrides.retention },
+    privacy: { ...BASE_OPTIONS.privacy, ...overrides.privacy },
     automaticRetrieval: {
       ...BASE_OPTIONS.automaticRetrieval,
       ...overrides.automaticRetrieval,

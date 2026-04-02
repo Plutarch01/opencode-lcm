@@ -175,3 +175,86 @@ test('search prefers direct message hits, indexes artifact metadata, and falls b
     await cleanupWorkspace(workspace);
   }
 });
+
+test('privacy controls redact archived text and exclude configured tool and path captures', async () => {
+  const workspace = makeWorkspace('lcm-privacy-controls');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        largeContentThreshold: 40,
+        privacy: {
+          excludeToolPrefixes: ['secret_'],
+          excludePathPatterns: ['fixtures[/\\\\]private'],
+          redactPatterns: ['(', 'ZX729ALBATROSS'],
+        },
+      }),
+    );
+    await store.init();
+
+    const privatePath = writeFixtureFile(
+      workspace,
+      'fixtures/private/report.txt',
+      'private file body ZX729ALBATROSS',
+    );
+
+    await createSession(store, workspace, 's1', 1);
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm1',
+      created: 2,
+      parts: [textPart('s1', 'm1', 'm1-p', 'invoice issue ZX729ALBATROSS '.repeat(6))],
+    });
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm2',
+      created: 3,
+      parts: [
+        toolCompletedPart(
+          's1',
+          'm2',
+          'm2-p',
+          'secret_fetch_credentials',
+          'tool secret ZX729ALBATROSS should never store',
+          [filePart('s1', 'm2', 'attachment-1', privatePath, 'attached secret ZX729ALBATROSS')],
+        ),
+      ],
+    });
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm3',
+      created: 4,
+      parts: [filePart('s1', 'm3', 'm3-p', privatePath, 'private file body ZX729ALBATROSS')],
+    });
+
+    const invoiceResults = await store.grep({ query: 'invoice issue', sessionID: 's1', limit: 5 });
+    const artifactResult = invoiceResults.find((result) => result.type.startsWith('artifact:'));
+    const secretResults = await store.grep({ query: 'ZX729ALBATROSS', sessionID: 's1', limit: 5 });
+    const toolResults = await store.grep({
+      query: 'should never store',
+      sessionID: 's1',
+      limit: 5,
+    });
+    const fileResults = await store.grep({ query: 'private file body', sessionID: 's1', limit: 5 });
+    const describe = await store.describe({ sessionID: 's1' });
+    const stats = await store.stats();
+
+    assert.ok(artifactResult, 'expected a redacted artifact hit');
+    const artifactText = await store.artifact({ artifactID: artifactResult.id, chars: 400 });
+    assert.match(artifactText, /\[REDACTED\]/);
+    assert.ok(!artifactText.includes('ZX729ALBATROSS'));
+    assert.equal(secretResults.length, 0);
+    assert.equal(toolResults.length, 0);
+    assert.equal(fileResults.length, 0);
+    assert.match(describe, /Excluded tool payload by opencode-lcm privacy policy/);
+    assert.match(describe, /Excluded file content by opencode-lcm privacy policy/);
+    assert.ok(!describe.includes('report.txt'));
+    assert.ok(!describe.includes('ZX729ALBATROSS'));
+    assert.equal(stats.artifactCount, 1);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
