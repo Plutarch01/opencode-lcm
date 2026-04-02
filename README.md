@@ -175,6 +175,28 @@ To log store startup phases during plugin initialization, set `OPENCODE_LCM_STAR
 
 This emits one-line `[lcm] startup phase: ...` markers around DB open, schema setup, legacy migration, deferred init, and error handling so a Bun crash log shows the last active phase.
 
+## Performance Harness
+
+The repo includes an opt-in archive performance harness for regression tracking on larger stores.
+
+Run it locally:
+
+```sh
+npm run perf:archive -- --json-out perf-results/archive-perf.json
+```
+
+Useful knobs:
+
+- `--medium-messages <n>`: branch-session message count for the medium scenario
+- `--large-messages <n>`: branch-session message count for the large scenario
+- `--samples <n>`: independent scenario samples to run
+- `--warm-runs <n>`: repeated warm calls for `grep()` and `resume()` medians
+- `--keep-workspaces`: keep generated temp stores for inspection
+
+The harness seeds root, branch, and worktree-peer sessions, then measures capture, `transformMessages()`, warm scoped `grep()`, `resume()`, snapshot export/import, reopen latency, and deleted-session retention pruning. It writes optional JSON output for CI artifact retention instead of enforcing hard timing thresholds in normal PR CI.
+
+There is also a separate `Archive Performance` GitHub Actions workflow for scheduled/manual advisory runs.
+
 ## Source layout
 
 | File | Purpose |

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Opt-in `perf:archive` harness for large-archive regression coverage across transform, grep, snapshot, reopen, resume, and retention paths
+- Separate advisory `Archive Performance` workflow for scheduled/manual perf runs with JSON artifact upload
+
 ## [0.11.0] - 2026-04-02
 
 ### Added

@@ -1,0 +1,55 @@
+name: Archive Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mediumMessages:
+        description: Medium scenario branch-session message count
+        required: false
+        default: '120'
+      largeMessages:
+        description: Large scenario branch-session message count
+        required: false
+        default: '480'
+      samples:
+        description: Independent samples per scenario
+        required: false
+        default: '2'
+      warmRuns:
+        description: Warm repeated calls for grep/resume medians
+        required: false
+        default: '4'
+  schedule:
+    - cron: '17 7 * * 1'
+
+jobs:
+  archive-perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run archive perf harness
+        run: >-
+          npm run perf:archive --
+          --json-out perf-results/archive-perf.json
+          --medium-messages ${{ github.event.inputs.mediumMessages || '120' }}
+          --large-messages ${{ github.event.inputs.largeMessages || '480' }}
+          --samples ${{ github.event.inputs.samples || '2' }}
+          --warm-runs ${{ github.event.inputs.warmRuns || '4' }}
+
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-perf-report
+          path: perf-results/archive-perf.json
+          if-no-files-found: error
