@@ -1,4 +1,4 @@
-# opencode-lcm
+# Opencode-lcm (Loseless Context Memory)
 
 [![npm version](https://img.shields.io/npm/v/opencode-lcm)](https://www.npmjs.com/package/opencode-lcm)
 [![CI](https://github.com/Plutarch01/opencode-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/Plutarch01/opencode-lcm/actions/workflows/ci.yml)
