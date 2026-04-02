@@ -355,6 +355,11 @@ function normalizeEvent(event: unknown): CapturedEvent | null {
   };
 }
 
+function getDeferredPartUpdateKey(event: Event): string | undefined {
+  if (event.type !== 'message.part.updated') return undefined;
+  return `${event.properties.part.sessionID}:${event.properties.part.messageID}:${event.properties.part.id}`;
+}
+
 function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
   return a.info.time.created - b.info.time.created;
 }
@@ -671,12 +676,16 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
 }
 
 export class SqliteLcmStore {
+  private static readonly deferredPartUpdateDelayMs = 250;
   private readonly baseDir: string;
   private readonly dbPath: string;
   private readonly privacy: CompiledPrivacyOptions;
   private readonly workspaceDirectory: string;
   private db?: SqlDatabaseLike;
   private dbReadyPromise?: Promise<void>;
+  private readonly pendingPartUpdates = new Map<string, Event>();
+  private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
+  private pendingPartUpdateFlushPromise?: Promise<void>;
 
   constructor(
     projectDir: string,
@@ -690,6 +699,123 @@ export class SqliteLcmStore {
 
   async init(): Promise<void> {
     await mkdir(this.baseDir, { recursive: true });
+  }
+
+  private async prepareForRead(): Promise<void> {
+    await this.ensureDbReady();
+    await this.flushDeferredPartUpdates();
+  }
+
+  private scheduleDeferredPartUpdateFlush(): void {
+    if (this.pendingPartUpdateTimer || this.pendingPartUpdates.size === 0) return;
+
+    this.pendingPartUpdateTimer = setTimeout(() => {
+      this.pendingPartUpdateTimer = undefined;
+      void this.flushDeferredPartUpdates();
+    }, SqliteLcmStore.deferredPartUpdateDelayMs);
+
+    if (
+      typeof this.pendingPartUpdateTimer === 'object' &&
+      this.pendingPartUpdateTimer &&
+      'unref' in this.pendingPartUpdateTimer &&
+      typeof this.pendingPartUpdateTimer.unref === 'function'
+    ) {
+      this.pendingPartUpdateTimer.unref();
+    }
+  }
+
+  private clearDeferredPartUpdateTimer(): void {
+    if (!this.pendingPartUpdateTimer) return;
+    clearTimeout(this.pendingPartUpdateTimer);
+    this.pendingPartUpdateTimer = undefined;
+  }
+
+  private clearDeferredPartUpdatesForSession(sessionID?: string): void {
+    if (!sessionID || this.pendingPartUpdates.size === 0) return;
+
+    for (const [key, event] of this.pendingPartUpdates.entries()) {
+      if (event.type !== 'message.part.updated') continue;
+      if (event.properties.part.sessionID !== sessionID) continue;
+      this.pendingPartUpdates.delete(key);
+    }
+
+    if (this.pendingPartUpdates.size === 0) this.clearDeferredPartUpdateTimer();
+  }
+
+  private clearDeferredPartUpdatesForMessage(sessionID?: string, messageID?: string): void {
+    if (!sessionID || !messageID || this.pendingPartUpdates.size === 0) return;
+
+    for (const [key, event] of this.pendingPartUpdates.entries()) {
+      if (event.type !== 'message.part.updated') continue;
+      if (event.properties.part.sessionID !== sessionID) continue;
+      if (event.properties.part.messageID !== messageID) continue;
+      this.pendingPartUpdates.delete(key);
+    }
+
+    if (this.pendingPartUpdates.size === 0) this.clearDeferredPartUpdateTimer();
+  }
+
+  private clearDeferredPartUpdateForPart(
+    sessionID?: string,
+    messageID?: string,
+    partID?: string,
+  ): void {
+    if (!sessionID || !messageID || !partID || this.pendingPartUpdates.size === 0) return;
+    this.pendingPartUpdates.delete(`${sessionID}:${messageID}:${partID}`);
+    if (this.pendingPartUpdates.size === 0) this.clearDeferredPartUpdateTimer();
+  }
+
+  async captureDeferred(event: Event): Promise<void> {
+    switch (event.type) {
+      case 'message.part.updated': {
+        const key = getDeferredPartUpdateKey(event);
+        if (!key) return await this.capture(event);
+        this.pendingPartUpdates.set(key, event);
+        this.scheduleDeferredPartUpdateFlush();
+        return;
+      }
+      case 'message.part.removed':
+        this.clearDeferredPartUpdateForPart(
+          event.properties.sessionID,
+          event.properties.messageID,
+          event.properties.partID,
+        );
+        break;
+      case 'message.removed':
+        this.clearDeferredPartUpdatesForMessage(
+          event.properties.sessionID,
+          event.properties.messageID,
+        );
+        break;
+      case 'session.deleted':
+        this.clearDeferredPartUpdatesForSession(extractSessionID(event));
+        break;
+      default:
+        break;
+    }
+
+    await this.capture(event);
+  }
+
+  async flushDeferredPartUpdates(): Promise<void> {
+    if (this.pendingPartUpdateFlushPromise) return this.pendingPartUpdateFlushPromise;
+    if (this.pendingPartUpdates.size === 0) return;
+
+    this.clearDeferredPartUpdateTimer();
+    this.pendingPartUpdateFlushPromise = (async () => {
+      while (this.pendingPartUpdates.size > 0) {
+        const batch = [...this.pendingPartUpdates.values()];
+        this.pendingPartUpdates.clear();
+        for (const event of batch) {
+          await this.capture(event);
+        }
+      }
+    })().finally(() => {
+      this.pendingPartUpdateFlushPromise = undefined;
+      if (this.pendingPartUpdates.size > 0) this.scheduleDeferredPartUpdateFlush();
+    });
+
+    return this.pendingPartUpdateFlushPromise;
   }
 
   private async ensureDbReady(): Promise<void> {
@@ -949,6 +1075,8 @@ export class SqliteLcmStore {
   }
 
   close(): void {
+    this.clearDeferredPartUpdateTimer();
+    this.pendingPartUpdates.clear();
     if (!this.db) return;
     this.db.close();
     this.db = undefined;
@@ -1017,7 +1145,7 @@ export class SqliteLcmStore {
   }
 
   async stats(): Promise<StoreStats> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const db = this.getDb();
     const totalRow = validateRow<{ count: number; latest: number | null }>(
       db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
@@ -1134,7 +1262,7 @@ export class SqliteLcmStore {
     scope?: string;
     limit?: number;
   }): Promise<SearchResult[]> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
     const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
     const limit = input.limit ?? 5;
@@ -1147,7 +1275,7 @@ export class SqliteLcmStore {
   }
 
   async describe(input?: { sessionID?: string; scope?: string }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const scope = this.resolveConfiguredScope('describe', input?.scope, input?.sessionID);
     const sessionID = input?.sessionID;
 
@@ -1239,7 +1367,7 @@ export class SqliteLcmStore {
   }
 
   async doctor(input?: { sessionID?: string; apply?: boolean; limit?: number }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const sessionID = input?.sessionID;
     const apply = input?.apply ?? false;
@@ -2059,7 +2187,7 @@ export class SqliteLcmStore {
   }
 
   async lineage(sessionID?: string): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
     if (!resolvedSessionID) return 'No archived sessions yet.';
 
@@ -2104,7 +2232,7 @@ export class SqliteLcmStore {
   }
 
   async pinSession(input: { sessionID?: string; reason?: string }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const sessionID = input.sessionID ?? this.latestSessionIDSync();
     if (!sessionID) return 'No archived sessions yet.';
 
@@ -2119,7 +2247,7 @@ export class SqliteLcmStore {
   }
 
   async unpinSession(input: { sessionID?: string }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const sessionID = input.sessionID ?? this.latestSessionIDSync();
     if (!sessionID) return 'No archived sessions yet.';
 
@@ -2132,7 +2260,7 @@ export class SqliteLcmStore {
   }
 
   async artifact(input: { artifactID: string; chars?: number }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const artifact = this.readArtifactSync(input.artifactID);
     if (!artifact) return 'Unknown artifact.';
 
@@ -2158,7 +2286,7 @@ export class SqliteLcmStore {
   }
 
   async blobStats(input?: { limit?: number }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const limit = clamp(input?.limit ?? 5, 1, 20);
     const db = this.getDb();
     const totals = db
@@ -2288,7 +2416,7 @@ export class SqliteLcmStore {
   }
 
   async gcBlobs(input?: { apply?: boolean; limit?: number }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const apply = input?.apply ?? false;
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const orphanRows = this.readOrphanArtifactBlobRowsSync();
@@ -2379,7 +2507,7 @@ export class SqliteLcmStore {
     vacuum?: boolean;
     limit?: number;
   }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const apply = input?.apply ?? false;
     const vacuum = input?.vacuum ?? true;
     const limit = clamp(input?.limit ?? 10, 1, 50);
@@ -2452,7 +2580,7 @@ export class SqliteLcmStore {
     orphanBlobDays?: number;
     limit?: number;
   }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const policy = this.resolveRetentionPolicy(input);
     const staleSessions =
@@ -2524,7 +2652,7 @@ export class SqliteLcmStore {
     apply?: boolean;
     limit?: number;
   }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const apply = input?.apply ?? false;
     const limit = clamp(input?.limit ?? 10, 1, 50);
     const policy = this.resolveRetentionPolicy(input);
@@ -2613,7 +2741,7 @@ export class SqliteLcmStore {
     sessionID?: string;
     scope?: string;
   }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     return exportStoreSnapshot(
       {
         workspaceDirectory: this.workspaceDirectory,
@@ -2638,7 +2766,7 @@ export class SqliteLcmStore {
     mode?: 'replace' | 'merge';
     worktreeMode?: SnapshotWorktreeMode;
   }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     return importStoreSnapshot(
       {
         workspaceDirectory: this.workspaceDirectory,
@@ -2654,7 +2782,7 @@ export class SqliteLcmStore {
   }
 
   async resume(sessionID?: string): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
     if (!resolvedSessionID) return 'No stored resume snapshots yet.';
 
@@ -2673,7 +2801,7 @@ export class SqliteLcmStore {
     messageLimit?: number;
     includeRaw?: boolean;
   }): Promise<string> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const depth = clamp(input.depth ?? 1, 1, 4);
     const messageLimit = clamp(input.messageLimit ?? EXPAND_MESSAGE_LIMIT, 1, 20);
     const query = input.query?.trim();
@@ -2729,7 +2857,7 @@ export class SqliteLcmStore {
   }
 
   async buildCompactionContext(sessionID: string): Promise<string | undefined> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     const session = this.readSessionSync(sessionID);
     if (session.messages.length === 0) return undefined;
 
@@ -2746,7 +2874,7 @@ export class SqliteLcmStore {
   }
 
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
-    await this.ensureDbReady();
+    await this.prepareForRead();
     if (messages.length < this.options.minMessagesForTransform) return false;
 
     const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);

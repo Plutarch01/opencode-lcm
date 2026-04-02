@@ -521,6 +521,77 @@ test('message.part.delta is ignored by the event log without rewriting archived 
   }
 });
 
+test('captureDeferred coalesces repeated message.part.updated events for the same part', async () => {
+  const workspace = makeWorkspace('lcm-deferred-part-updates');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await store.captureDeferred({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.captureDeferred({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+    await store.captureDeferred({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'draft',
+        },
+      },
+    });
+    await store.captureDeferred({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'draft expanded',
+        },
+      },
+    });
+    await store.captureDeferred({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'final stable body',
+        },
+      },
+    });
+
+    const describe = await store.describe({ sessionID: 's1' });
+    const stats = await store.stats();
+
+    assert.match(describe, /final stable body/);
+    assert.equal(stats.totalEvents, 3);
+    assert.equal(stats.eventTypes['message.part.updated'], 1);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('compactEventLog prunes transient event rows without touching archived state', async () => {
   const workspace = makeWorkspace('lcm-compact-event-log');
   let store;

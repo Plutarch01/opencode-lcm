@@ -13,7 +13,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
 
   return {
     event: async ({ event }) => {
-      await store.capture(event);
+      await store.captureDeferred(event);
     },
 
     tool: {
