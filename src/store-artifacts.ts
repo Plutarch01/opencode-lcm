@@ -1,11 +1,21 @@
 import { randomUUID } from 'node:crypto';
 
 import type { Message, Part } from '@opencode-ai/sdk';
-
 import { runBinaryPreviewProviders } from './preview-providers.js';
+import {
+  type CompiledPrivacyOptions,
+  isExcludedTool,
+  matchesExcludedPath,
+  PRIVACY_EXCLUDED_FILE_CONTENT,
+  PRIVACY_EXCLUDED_FILE_REFERENCE,
+  PRIVACY_EXCLUDED_TOOL_OUTPUT,
+  PRIVACY_REDACTED_PATH_TEXT,
+  redactStructuredValue,
+  redactText,
+} from './privacy.js';
 import type { ArtifactBlobRow, ArtifactRow } from './store-snapshot.js';
 import type { SqlDatabaseLike } from './store-types.js';
-import type { ConversationMessage, NormalizedSession, OpencodeLcmOptions } from './types.js';
+import type { ConversationMessage, NormalizedSession } from './types.js';
 import {
   classifyFileCategory,
   formatMetadataValue,
@@ -43,10 +53,13 @@ export type ExternalizedSession = {
 
 export type StoreArtifactBindings = {
   workspaceDirectory: string;
-  options: Pick<
-    OpencodeLcmOptions,
-    'artifactPreviewChars' | 'binaryPreviewProviders' | 'largeContentThreshold' | 'previewBytePeek'
-  >;
+  options: {
+    artifactPreviewChars: number;
+    binaryPreviewProviders: string[];
+    largeContentThreshold: number;
+    previewBytePeek: number;
+    privacy: CompiledPrivacyOptions;
+  };
   getDb(): SqlDatabaseLike;
   readArtifactBlobSync(contentHash?: string | null): ArtifactBlobRow | undefined;
   upsertSessionRowSync(session: NormalizedSession): void;
@@ -107,7 +120,14 @@ function createArtifactData(
     previewText?: string;
   },
 ): ArtifactData {
-  const contentHash = hashContent(input.contentText);
+  const contentText = redactText(input.contentText, bindings.options.privacy);
+  const metadata = redactStructuredValue(input.metadata ?? {}, bindings.options.privacy);
+  const previewText = redactText(
+    input.previewText ??
+      truncate(contentText.replace(/\s+/g, ' ').trim(), bindings.options.artifactPreviewChars),
+    bindings.options.privacy,
+  );
+  const contentHash = hashContent(contentText);
   return {
     artifactID: `art_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
     sessionID: input.sessionID,
@@ -115,18 +135,29 @@ function createArtifactData(
     partID: input.partID,
     artifactKind: input.artifactKind,
     fieldName: input.fieldName,
-    previewText:
-      input.previewText ??
-      truncate(
-        input.contentText.replace(/\s+/g, ' ').trim(),
-        bindings.options.artifactPreviewChars,
-      ),
-    contentText: input.contentText,
+    previewText,
+    contentText,
     contentHash,
-    charCount: input.contentText.length,
+    charCount: contentText.length,
     createdAt: input.createdAt,
-    metadata: input.metadata ?? {},
+    metadata,
   };
+}
+
+function filePrivacyCandidates(file: Extract<Part, { type: 'file' }>): Array<string | undefined> {
+  const sourcePath = file.source && 'path' in file.source ? file.source.path : undefined;
+  return [file.filename, file.url, sourcePath];
+}
+
+function excludeStoredFilePart(file: Extract<Part, { type: 'file' }>): void {
+  file.filename = PRIVACY_EXCLUDED_FILE_REFERENCE;
+  file.url = 'lcm://privacy-excluded';
+  if (file.source && 'path' in file.source) file.source.path = PRIVACY_REDACTED_PATH_TEXT;
+  if (file.source?.text?.value) {
+    file.source.text.value = PRIVACY_EXCLUDED_FILE_CONTENT;
+    file.source.text.start = 0;
+    file.source.text.end = file.source.text.value.length;
+  }
 }
 
 export function formatArtifactMetadataLines(metadata: Record<string, unknown>): string[] {
@@ -241,6 +272,7 @@ async function externalizePart(
 }> {
   const storedPart = parseJson<Part>(JSON.stringify(part));
   const artifacts: ArtifactData[] = [];
+  const privacy = bindings.options.privacy;
 
   const externalize = (
     artifactKind: string,
@@ -291,11 +323,28 @@ async function externalizePart(
       }
       break;
     case 'tool':
+      if (isExcludedTool(storedPart.tool, privacy)) {
+        storedPart.state.input = { excluded: true };
+        if ('metadata' in storedPart.state) storedPart.state.metadata = { excluded: true };
+        if (storedPart.state.status === 'completed') {
+          storedPart.state.output = PRIVACY_EXCLUDED_TOOL_OUTPUT;
+          storedPart.state.attachments = [];
+        }
+        if (storedPart.state.status === 'error') {
+          storedPart.state.error = PRIVACY_EXCLUDED_TOOL_OUTPUT;
+        }
+        break;
+      }
       if (storedPart.state.status === 'completed') {
         storedPart.state.output = externalize('tool', 'output', storedPart.state.output);
         if (storedPart.state.attachments) {
           const storedAttachments: Extract<Part, { type: 'file' }>[] = [];
           for (const [index, attachment] of storedPart.state.attachments.entries()) {
+            if (matchesExcludedPath(filePrivacyCandidates(attachment), privacy)) {
+              excludeStoredFilePart(attachment);
+              storedAttachments.push(attachment);
+              continue;
+            }
             const previewMetadata = {
               attachmentIndex: index,
               tool: storedPart.tool,
@@ -332,6 +381,10 @@ async function externalizePart(
       }
       break;
     case 'file':
+      if (matchesExcludedPath(filePrivacyCandidates(storedPart), privacy)) {
+        excludeStoredFilePart(storedPart);
+        break;
+      }
       artifacts.push(
         await buildBinaryPreviewArtifact(
           bindings,
@@ -370,7 +423,10 @@ async function externalizePart(
       break;
   }
 
-  return { storedPart, artifacts };
+  return {
+    storedPart: redactStructuredValue(storedPart, privacy),
+    artifacts,
+  };
 }
 
 export async function externalizeMessage(
@@ -393,7 +449,7 @@ export async function externalizeMessage(
 
   return {
     storedMessage: {
-      info: storedInfo,
+      info: redactStructuredValue(storedInfo, bindings.options.privacy),
       parts: storedParts,
     },
     artifacts,
@@ -422,16 +478,19 @@ export async function externalizeSession(
     }
 
     storedMessages.push({
-      info: storedInfo,
+      info: redactStructuredValue(storedInfo, bindings.options.privacy),
       parts: storedParts,
     });
   }
 
   return {
-    storedSession: {
-      ...session,
-      messages: storedMessages,
-    },
+    storedSession: redactStructuredValue(
+      {
+        ...session,
+        messages: storedMessages,
+      },
+      bindings.options.privacy,
+    ),
     artifacts,
   };
 }

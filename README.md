@@ -11,9 +11,9 @@ A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode)
 
 This is an unofficial community plugin for [OpenCode](https://github.com/sst/opencode) and is not affiliated with or endorsed by the OpenCode project.
 
-The plugin stores archived conversation context locally in `.lcm/`, so review the storage behavior before using it with sensitive data.
+The plugin stores archived conversation context locally in `.lcm/`, so review the storage behavior before using it with sensitive data. Use the `privacy` options below if you need path exclusion or content redaction before data is indexed.
 
-Actively tested with OpenCode and SQLite, with CI on Node 22 and 24. Tested primarily on Windows with Node 22 and OpenCode's plugin system. Issues and PRs are welcome.
+Actively tested with OpenCode and SQLite, with CI on Linux, Windows, and macOS across Node 22 and 24. Issues and PRs are welcome.
 
 ## context-mode
 
@@ -37,6 +37,7 @@ OpenCode still handles compaction the normal way: when the active conversation g
 - Import/export portable snapshots with safe merge collision checks, explicit restore worktree modes (`auto`, `preserve`, `current`), and relative-path traversal protection
 - SQLite FTS search across archived messages, summary nodes, and externalized artifacts
 - Configurable default retrieval scopes (session, root, worktree) with worktree profiles
+- Privacy controls for tool-output exclusion, path-based file capture exclusion, and regex redaction before storage/indexing
 - Bounded automatic recall with configurable scope order, per-scope budgets, stop rules, recency-aware ranking, and visible recall telemetry
 - TF-IDF weighted automatic retrieval that queries FTS5 for document frequency to drop corpus-common noise tokens, replacing static stopword lists with corpus-aware scoring
 - Bigram phrase queries for better adjacency matching in automatic retrieval
@@ -71,6 +72,11 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
         "deletedSessionDays": 30,
         "orphanBlobDays": 14
       },
+      "privacy": {
+        "excludeToolPrefixes": ["playwright_browser_"],
+        "excludePathPatterns": ["[\\\\/]secrets[\\\\/]", "\\\\.env($|\\\\.)"],
+        "redactPatterns": ["sk-[A-Za-z0-9_-]+", "ZX729ALBATROSS"]
+      },
       "automaticRetrieval": {
         "enabled": true,
         "scopeOrder": ["session", "root", "worktree"],
@@ -98,6 +104,18 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
   ]
 }
 ```
+
+## Privacy Controls
+
+`privacy` patterns run before archived content is stored or indexed.
+
+- `excludeToolPrefixes`: do not archive tool payloads or attachments for matching tools
+- `excludePathPatterns`: suppress file previews/source capture for matching file paths and redact matching path strings
+- `redactPatterns`: replace matching content with `[REDACTED]` before storage and search indexing
+
+Patterns are JavaScript regular-expression source strings. Invalid or empty-match patterns are ignored.
+
+These controls are not encryption, and they are not retroactive. Existing archived rows keep their previous content until they are rewritten or removed.
 
 When using alongside `context-mode`, add the `interop` block to avoid hook conflicts:
 
@@ -163,6 +181,7 @@ This emits one-line `[lcm] startup phase: ...` markers around DB open, schema se
 |------|---------|
 | `src/index.ts` | Plugin entrypoint and OpenCode hooks |
 | `src/options.ts` | Option normalization and defaults |
+| `src/privacy.ts` | Privacy pattern compilation and storage-time redaction helpers |
 | `src/types.ts` | Shared types |
 | `src/store-types.ts` | Internal store type definitions |
 | `src/store.ts` | SQLite store with event-driven state machine, FTS, summary DAG, artifact externalization, archive repair |

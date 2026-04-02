@@ -58,6 +58,9 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `large_content_threshold=${options.largeContentThreshold}`,
             `binary_preview_providers=${options.binaryPreviewProviders.join(',')}`,
             `preview_byte_peek=${options.previewBytePeek}`,
+            `privacy_exclude_tool_prefixes=${options.privacy.excludeToolPrefixes.join(',')}`,
+            `privacy_exclude_path_patterns=${options.privacy.excludePathPatterns.length}`,
+            `privacy_redact_patterns=${options.privacy.redactPatterns.length}`,
             ...Object.entries(stats.eventTypes)
               .sort((a, b) => b[1] - a[1])
               .slice(0, 10)

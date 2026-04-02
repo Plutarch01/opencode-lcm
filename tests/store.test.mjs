@@ -25,6 +25,7 @@ function makeOptions(overrides = {}) {
     scopeDefaults: { grep: 'session', describe: 'session' },
     scopeProfiles: [],
     retention: { staleSessionDays: undefined, deletedSessionDays: 30, orphanBlobDays: 14 },
+    privacy: { excludeToolPrefixes: [], excludePathPatterns: [], redactPatterns: [] },
     compactContextLimit: 1200,
     systemHint: true,
     storeDir: '.lcm',
@@ -39,6 +40,21 @@ function makeOptions(overrides = {}) {
     previewBytePeek: 8,
     ...overrides,
   };
+}
+
+async function cleanupWorkspace(workspace) {
+  let attempt = 0;
+  while (attempt < 8) {
+    try {
+      rmSync(workspace, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (err.code !== 'EBUSY' && err.code !== 'EPERM') throw err;
+      attempt++;
+      if (attempt >= 8) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** (attempt - 1)));
+    }
+  }
 }
 
 function sessionInfo(directory, id, created, parentID) {
@@ -133,7 +149,7 @@ test('init stamps the current schema version on disk', async () => {
     assert.equal(Object.values(versionRow)[0], 1);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -155,7 +171,7 @@ test('init rejects newer on-disk schema versions', async () => {
     await assert.rejects(store.stats(), /Unsupported store schema version: 99/);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -172,7 +188,7 @@ test('init is lazy and does not create the database until first operation', asyn
     assert.equal(existsSync(path.join(workspace, '.lcm', 'lcm.db')), true);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -226,8 +242,8 @@ test('exports and imports a portable snapshot', async () => {
   } finally {
     source?.close();
     target?.close();
-    rmSync(sourceDir, { recursive: true, force: true });
-    rmSync(targetDir, { recursive: true, force: true });
+    await cleanupWorkspace(sourceDir);
+    await cleanupWorkspace(targetDir);
   }
 });
 
@@ -280,7 +296,7 @@ test('applies worktree scope defaults from profiles', async () => {
     assert.match(describe, /Scope: root/);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -331,7 +347,7 @@ test('message.updated preserves existing parts and search content', async () => 
     assert.match(describe, /preserve this message body/);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -384,7 +400,7 @@ test('message.removed drops reverted content from session memory and search', as
     assert.equal(stats.orphanArtifactBlobCount, 0);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -447,7 +463,7 @@ test('message.part.updated replaces externalized content without leaving stale a
     assert.equal(after.orphanArtifactBlobCount, 0);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -500,7 +516,7 @@ test('message.part.delta is recorded without rewriting archived session state', 
     assert.equal(stats.eventTypes['message.part.delta'], 1);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -568,7 +584,7 @@ test('search hardening drops FTS5 reserved words and punctuation noise', async (
     assert.equal(nearKeyword[0]?.id, 'm1');
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -674,7 +690,7 @@ test('synthetic text parts are excluded from grep results', async () => {
     assert.ok(!ids.includes('m4'), 'retrieved-context marker should be filtered');
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -756,7 +772,7 @@ test('retention pruning skips pinned sessions and cleans orphan blobs', async ()
     assert.equal(stats.orphanArtifactBlobCount, 0);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -800,7 +816,7 @@ test('deferred init runs at startup and grep works without capture', async () =>
     assert.equal(results[0].id, 'm1');
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -865,7 +881,7 @@ test('deferred init applies retention pruning at startup', async () => {
     assert.equal(stats.totalEvents, 0);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -987,7 +1003,7 @@ test('deferred init preserves existing summary and FTS state on reopen', async (
     assert.deepEqual(after, before);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
 
@@ -1078,6 +1094,6 @@ test('startup orphan blob cleanup does not trigger unrelated session rebuilds', 
     assert.equal(after.artifactFts, before.artifactFts);
   } finally {
     store?.close();
-    rmSync(workspace, { recursive: true, force: true });
+    await cleanupWorkspace(workspace);
   }
 });
