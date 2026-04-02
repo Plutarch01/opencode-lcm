@@ -1,5 +1,6 @@
 # opencode-lcm
 
+[![npm version](https://img.shields.io/npm/v/opencode-lcm)](https://www.npmjs.com/package/opencode-lcm)
 [![CI](https://github.com/Plutarch01/opencode-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/Plutarch01/opencode-lcm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -31,11 +32,23 @@ OpenCode will automatically download the latest version from npm on startup. No 
 ### From source
 
 ```sh
-git clone https://github.com/plutarch01/opencode-lcm.git
+git clone https://github.com/Plutarch01/opencode-lcm.git
 cd opencode-lcm
 npm install
 npm run build
 ```
+
+Then copy or symlink the built plugin into your plugins directory:
+
+```sh
+# Project-level
+cp dist/index.js .opencode/plugins/opencode-lcm.js
+
+# Or global
+cp dist/index.js ~/.config/opencode/plugins/opencode-lcm.js
+```
+
+Local plugins in `.opencode/plugins/` or `~/.config/opencode/plugins/` are loaded automatically by OpenCode at startup.
 
 ## How It Works
 
