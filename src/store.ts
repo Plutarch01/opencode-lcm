@@ -567,6 +567,10 @@ function isSqliteRuntimeImportError(runtime: SqliteRuntime, error: unknown): boo
   );
 }
 
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
+}
+
 async function openBunSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const { Database } = await import('bun:sqlite');
   const db = new (
@@ -2395,9 +2399,7 @@ export class SqliteLcmStore {
         ...(candidates.length > 0
           ? [
               'candidate_event_types:',
-              ...candidates
-                .slice(0, limit)
-                .map((row) => `- ${row.eventType} count=${row.count}`),
+              ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
             ]
           : ['candidate_event_types:', '- none']),
       ].join('\n');
@@ -2438,9 +2440,7 @@ export class SqliteLcmStore {
       ...(candidates.length > 0
         ? [
             'deleted_event_types:',
-            ...candidates
-              .slice(0, limit)
-              .map((row) => `- ${row.eventType} count=${row.count}`),
+            ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
           ]
         : ['deleted_event_types:', '- none']),
     ].join('\n');
@@ -4729,7 +4729,9 @@ export class SqliteLcmStore {
         await this.persistSession(session);
       }
     } catch (error) {
-      getLogger().debug('Legacy session snapshot migration skipped', { error });
+      if (!hasErrorCode(error, 'ENOENT')) {
+        getLogger().debug('Legacy session snapshot migration skipped', { error });
+      }
     }
 
     const resumePath = path.join(this.baseDir, 'resume.json');
@@ -4746,7 +4748,9 @@ export class SqliteLcmStore {
         insertResume.run(sessionID, note, now);
       }
     } catch (error) {
-      getLogger().debug('Legacy resume migration skipped', { error });
+      if (!hasErrorCode(error, 'ENOENT')) {
+        getLogger().debug('Legacy resume migration skipped', { error });
+      }
     }
 
     const eventsPath = path.join(this.baseDir, 'events.jsonl');
@@ -4761,7 +4765,9 @@ export class SqliteLcmStore {
         }
       }
     } catch (error) {
-      getLogger().debug('Legacy event migration skipped', { error });
+      if (!hasErrorCode(error, 'ENOENT')) {
+        getLogger().debug('Legacy event migration skipped', { error });
+      }
     }
   }
 

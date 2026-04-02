@@ -1,6 +1,6 @@
 /**
  * Lightweight structured logging interface for opencode-lcm.
- * Uses console methods by default but can be swapped for a proper logger.
+ * Silent by default so plugin logs do not corrupt the host terminal UI.
  */
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -18,36 +18,14 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
   return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
 }
 
-let currentLogger: Logger = {
-  debug(message: string, context?: Record<string, unknown>) {
-    if (context) {
-      console.debug(`[lcm] ${message}`, context);
-    } else {
-      console.debug(`[lcm] ${message}`);
-    }
-  },
-  info(message: string, context?: Record<string, unknown>) {
-    if (context) {
-      console.info(`[lcm] ${message}`, context);
-    } else {
-      console.info(`[lcm] ${message}`);
-    }
-  },
-  warn(message: string, context?: Record<string, unknown>) {
-    if (context) {
-      console.warn(`[lcm] ${message}`, context);
-    } else {
-      console.warn(`[lcm] ${message}`);
-    }
-  },
-  error(message: string, context?: Record<string, unknown>) {
-    if (context) {
-      console.error(`[lcm] ${message}`, context);
-    } else {
-      console.error(`[lcm] ${message}`);
-    }
-  },
+const silentLogger: Logger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
 };
+
+let currentLogger: Logger = silentLogger;
 
 export function setLogger(logger: Logger): void {
   currentLogger = logger;
