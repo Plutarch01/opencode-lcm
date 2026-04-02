@@ -467,7 +467,7 @@ test('message.part.updated replaces externalized content without leaving stale a
   }
 });
 
-test('message.part.delta is recorded without rewriting archived session state', async () => {
+test('message.part.delta is ignored by the event log without rewriting archived session state', async () => {
   const workspace = makeWorkspace('lcm-part-delta');
   let store;
 
@@ -513,7 +513,74 @@ test('message.part.delta is recorded without rewriting archived session state', 
     const stats = await store.stats();
 
     assert.equal(after, before);
-    assert.equal(stats.eventTypes['message.part.delta'], 1);
+    assert.equal(stats.totalEvents, 3);
+    assert.equal(stats.eventTypes['message.part.delta'], undefined);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('compactEventLog prunes transient event rows without touching archived state', async () => {
+  const workspace = makeWorkspace('lcm-compact-event-log');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'stable archived body',
+        },
+      },
+    });
+
+    const before = await store.describe({ sessionID: 's1' });
+    store.close();
+    store = undefined;
+
+    const db = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.prepare(
+      `INSERT INTO events (id, session_id, event_type, ts, payload_json)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run('legacy-status-row', 's1', 'session.status', 3, '[session.status]');
+    db.close();
+
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    const dryRun = await store.compactEventLog({ limit: 5, vacuum: false });
+    const applied = await store.compactEventLog({ apply: true, limit: 5, vacuum: false });
+    const after = await store.describe({ sessionID: 's1' });
+    const stats = await store.stats();
+
+    assert.match(dryRun, /candidate_events=1/);
+    assert.match(dryRun, /session\.status count=1/);
+    assert.match(applied, /deleted_events=1/);
+    assert.match(applied, /vacuum_applied=false/);
+    assert.equal(after, before);
+    assert.equal(stats.totalEvents, 3);
+    assert.equal(stats.eventTypes['session.status'], undefined);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
