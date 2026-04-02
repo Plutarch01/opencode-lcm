@@ -46,6 +46,7 @@
     "lint": "biome check src tests",
     "format": "biome format --write src tests",
     "test": "npm run build && tsc -p tests/tsconfig.json && node --test tests/*.test.mjs dist-tests/*.test.js",
+    "perf:archive": "npm run build && node scripts/perf-archive.mjs",
     "dogfood:opencode": "npm run build && node scripts/dogfood-opencode.mjs",
     "prepublishOnly": "npm run typecheck && npm run lint && npm run test"
   },
