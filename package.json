@@ -22,11 +22,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/plutarch01/opencode-lcm.git"
+    "url": "git+https://github.com/Plutarch01/opencode-lcm.git"
   },
-  "homepage": "https://github.com/plutarch01/opencode-lcm#readme",
+  "homepage": "https://github.com/Plutarch01/opencode-lcm#readme",
   "bugs": {
-    "url": "https://github.com/plutarch01/opencode-lcm/issues"
+    "url": "https://github.com/Plutarch01/opencode-lcm/issues"
   },
   "engines": {
     "node": ">=22"
