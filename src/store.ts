@@ -303,10 +303,6 @@ function readSessionStats(db: SqlDatabaseLike): {
   };
 }
 
-type ReadSessionOptions = {
-  artifactMessageIDs?: string[];
-};
-
 function extractSessionID(event: unknown): string | undefined {
   const record = asRecord(event);
   if (!record) return undefined;
@@ -362,6 +358,15 @@ function getDeferredPartUpdateKey(event: Event): string | undefined {
 
 function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
   return a.info.time.created - b.info.time.created;
+}
+
+function emptySession(sessionID: string): NormalizedSession {
+  return {
+    sessionID,
+    updatedAt: 0,
+    eventCount: 0,
+    messages: [],
+  };
 }
 
 function buildSummaryNodeID(sessionID: string, level: number, slot: number): string {
@@ -1096,19 +1101,13 @@ export class SqliteLcmStore {
     if (!normalized.sessionID) return;
     if (!this.shouldPersistSessionForEvent(normalized.type)) return;
 
-    const session = this.readSessionSync(normalized.sessionID, {
-      artifactMessageIDs: this.captureArtifactHydrationMessageIDs(normalized),
-    });
+    const session = this.readSessionForCaptureSync(normalized);
     const previousParentSessionID = session.parentSessionID;
+    const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(session, normalized);
     let next = this.applyEvent(session, normalized);
     next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
     next.eventCount += 1;
     next = this.prepareSessionForPersistence(next);
-    const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
-      session,
-      next,
-      normalized,
-    );
 
     await this.persistCapturedSession(next, normalized);
 
@@ -1645,70 +1644,58 @@ export class SqliteLcmStore {
     );
   }
 
-  private captureArtifactHydrationMessageIDs(event: CapturedEvent): string[] {
-    const payload = event.payload as Event;
-
-    switch (payload.type) {
-      case 'message.updated':
-        return [payload.properties.info.id];
-      case 'message.part.updated':
-        return [payload.properties.part.messageID];
-      case 'message.part.removed':
-        return [payload.properties.messageID];
-      default:
-        return [];
-    }
-  }
-
-  private archivedMessageIDs(messages: ConversationMessage[]): string[] {
-    return this.getArchivedMessages(messages).map((message) => message.info.id);
-  }
-
-  private didArchivedMessagesChange(
-    before: ConversationMessage[],
-    after: ConversationMessage[],
-  ): boolean {
-    const beforeIDs = this.archivedMessageIDs(before);
-    const afterIDs = this.archivedMessageIDs(after);
-    if (beforeIDs.length !== afterIDs.length) return true;
-    return beforeIDs.some((messageID, index) => messageID !== afterIDs[index]);
-  }
-
-  private isArchivedMessage(messages: ConversationMessage[], messageID?: string): boolean {
-    if (!messageID) return false;
-    return this.archivedMessageIDs(messages).includes(messageID);
-  }
-
   private shouldSyncDerivedSessionStateForEvent(
-    previous: NormalizedSession,
-    next: NormalizedSession,
+    session: NormalizedSession,
     event: CapturedEvent,
   ): boolean {
     const payload = event.payload as Event;
 
     switch (payload.type) {
       case 'message.updated': {
-        const messageID = payload.properties.info.id;
-        return (
-          this.didArchivedMessagesChange(previous.messages, next.messages) ||
-          this.isArchivedMessage(previous.messages, messageID) ||
-          this.isArchivedMessage(next.messages, messageID)
+        const existing = session.messages.find(
+          (message) => message.info.id === payload.properties.info.id,
         );
+        if (existing) {
+          return this.isMessageArchivedSync(
+            session.sessionID,
+            existing.info.id,
+            existing.info.time.created,
+          );
+        }
+
+        return this.readMessageCountSync(session.sessionID) >= this.options.freshTailMessages;
       }
-      case 'message.removed':
-        return this.didArchivedMessagesChange(previous.messages, next.messages);
+      case 'message.removed': {
+        const existing = safeQueryOne<{ created_at: number }>(
+          this.getDb().prepare(
+            'SELECT created_at FROM messages WHERE session_id = ? AND message_id = ?',
+          ),
+          [session.sessionID, payload.properties.messageID],
+          'shouldSyncDerivedSessionStateForEvent.messageRemoved',
+        );
+        if (!existing) return false;
+        return this.readMessageCountSync(session.sessionID) > this.options.freshTailMessages;
+      }
       case 'message.part.updated': {
-        const messageID = payload.properties.part.messageID;
-        return (
-          this.isArchivedMessage(previous.messages, messageID) ||
-          this.isArchivedMessage(next.messages, messageID)
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.part.messageID,
+        );
+        if (!message) return false;
+        return this.isMessageArchivedSync(
+          session.sessionID,
+          message.info.id,
+          message.info.time.created,
         );
       }
       case 'message.part.removed': {
-        const messageID = payload.properties.messageID;
-        return (
-          this.isArchivedMessage(previous.messages, messageID) ||
-          this.isArchivedMessage(next.messages, messageID)
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.messageID,
+        );
+        if (!message) return false;
+        return this.isMessageArchivedSync(
+          session.sessionID,
+          message.info.id,
+          message.info.time.created,
         );
       }
       default:
@@ -4496,7 +4483,7 @@ export class SqliteLcmStore {
       const row = sessionMap.get(sessionID);
       const messages = messagesBySession.get(sessionID) ?? [];
       if (!row) {
-        return { sessionID, updatedAt: 0, eventCount: 0, messages };
+        return { ...emptySession(sessionID), messages };
       }
       return {
         sessionID: row.session_id,
@@ -4516,7 +4503,7 @@ export class SqliteLcmStore {
     });
   }
 
-  private readSessionSync(sessionID: string, options?: ReadSessionOptions): NormalizedSession {
+  private readSessionSync(sessionID: string): NormalizedSession {
     const db = this.getDb();
     const row = safeQueryOne<SessionRow>(
       db.prepare('SELECT * FROM sessions WHERE session_id = ?'),
@@ -4534,14 +4521,7 @@ export class SqliteLcmStore {
       )
       .all(sessionID) as PartRow[];
     const artifactsByPart = new Map<string, ArtifactData[]>();
-    const artifactMessageIDs = options?.artifactMessageIDs;
-    const artifacts =
-      artifactMessageIDs === undefined
-        ? this.readArtifactsForSessionSync(sessionID)
-        : [...new Set(artifactMessageIDs)].flatMap((messageID) =>
-            this.readArtifactsForMessageSync(messageID),
-          );
-    for (const artifact of artifacts) {
+    for (const artifact of this.readArtifactsForSessionSync(sessionID)) {
       const list = artifactsByPart.get(artifact.partID) ?? [];
       list.push(artifact);
       artifactsByPart.set(artifact.partID, list);
@@ -4563,12 +4543,7 @@ export class SqliteLcmStore {
     }));
 
     if (!row) {
-      return {
-        sessionID,
-        updatedAt: 0,
-        eventCount: 0,
-        messages,
-      };
+      return { ...emptySession(sessionID), messages };
     }
 
     return {
@@ -4620,6 +4595,85 @@ export class SqliteLcmStore {
     }
 
     return parentSessionID;
+  }
+
+  private readSessionForCaptureSync(event: CapturedEvent): NormalizedSession {
+    const sessionID = event.sessionID;
+    if (!sessionID) return emptySession('');
+
+    const session = this.readSessionHeaderSync(sessionID) ?? emptySession(sessionID);
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case 'message.updated': {
+        const message = this.readMessageSync(sessionID, payload.properties.info.id);
+        if (message) session.messages = [message];
+        return session;
+      }
+      case 'message.part.updated': {
+        const message = this.readMessageSync(sessionID, payload.properties.part.messageID);
+        if (message) session.messages = [message];
+        return session;
+      }
+      case 'message.part.removed': {
+        const message = this.readMessageSync(sessionID, payload.properties.messageID);
+        if (message) session.messages = [message];
+        return session;
+      }
+      default:
+        return session;
+    }
+  }
+
+  private readMessageSync(sessionID: string, messageID: string): ConversationMessage | undefined {
+    const db = this.getDb();
+    const row = safeQueryOne<MessageRow>(
+      db.prepare('SELECT * FROM messages WHERE session_id = ? AND message_id = ?'),
+      [sessionID, messageID],
+      'readMessageSync',
+    );
+    if (!row) return undefined;
+
+    const artifactsByPart = new Map<string, ArtifactData[]>();
+    for (const artifact of this.readArtifactsForMessageSync(messageID)) {
+      const list = artifactsByPart.get(artifact.partID) ?? [];
+      list.push(artifact);
+      artifactsByPart.set(artifact.partID, list);
+    }
+
+    const parts = db
+      .prepare(
+        'SELECT * FROM parts WHERE session_id = ? AND message_id = ? ORDER BY sort_key ASC, part_id ASC',
+      )
+      .all(sessionID, messageID) as PartRow[];
+
+    return {
+      info: parseJson<Message>(row.info_json),
+      parts: parts.map((partRow) => {
+        const part = parseJson<Part>(partRow.part_json);
+        hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
+        return part;
+      }),
+    };
+  }
+
+  private readMessageCountSync(sessionID: string): number {
+    const row = this.getDb()
+      .prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?')
+      .get(sessionID) as { count: number };
+    return row.count;
+  }
+
+  private isMessageArchivedSync(sessionID: string, messageID: string, createdAt: number): boolean {
+    const row = this.getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM messages
+         WHERE session_id = ?
+           AND (created_at > ? OR (created_at = ? AND message_id > ?))`,
+      )
+      .get(sessionID, createdAt, createdAt, messageID) as { count: number };
+    return row.count >= this.options.freshTailMessages;
   }
 
   private async persistCapturedSession(

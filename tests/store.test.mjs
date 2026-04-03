@@ -467,6 +467,114 @@ test('message.part.updated replaces externalized content without leaving stale a
   }
 });
 
+test('fresh-tail message.part.updated avoids full session hydration', async () => {
+  const workspace = makeWorkspace('lcm-fresh-tail-part-update');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 4 }));
+    await store.init();
+
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+
+    let readSessionCalls = 0;
+    const originalReadSessionSync = store.readSessionSync.bind(store);
+    store.readSessionSync = (...args) => {
+      readSessionCalls += 1;
+      return originalReadSessionSync(...args);
+    };
+
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'fresh tail body',
+        },
+      },
+    });
+
+    store.readSessionSync = originalReadSessionSync;
+
+    assert.equal(readSessionCalls, 0);
+    const describe = await store.describe({ sessionID: 's1' });
+    assert.match(describe, /fresh tail body/);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('fresh-tail message.updated preserves search content without full session hydration', async () => {
+  const workspace = makeWorkspace('lcm-fresh-tail-message-update');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ freshTailMessages: 4 }));
+    await store.init();
+
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 2,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'searchable fresh tail body',
+        },
+      },
+    });
+
+    let readSessionCalls = 0;
+    const originalReadSessionSync = store.readSessionSync.bind(store);
+    store.readSessionSync = (...args) => {
+      readSessionCalls += 1;
+      return originalReadSessionSync(...args);
+    };
+
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+
+    store.readSessionSync = originalReadSessionSync;
+
+    assert.equal(readSessionCalls, 0);
+    const grep = await store.grep({
+      query: 'searchable fresh tail body',
+      sessionID: 's1',
+      limit: 3,
+    });
+    assert.ok(grep.some((result) => result.id === 'm1'));
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('message.part.delta is ignored by the event log without rewriting archived session state', async () => {
   const workspace = makeWorkspace('lcm-part-delta');
   let store;
