@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import {
+  resolveCaptureHydrationMode,
   resolveSqliteRuntime,
   resolveSqliteRuntimeCandidates,
   SqliteLcmStore,
@@ -123,6 +124,32 @@ test('resolveSqliteRuntime defaults to node outside Bun', () => {
 
   assert.equal(resolveSqliteRuntime(options), 'node');
   assert.deepEqual(resolveSqliteRuntimeCandidates(options), ['node']);
+});
+
+test('resolveCaptureHydrationMode falls back to full hydration for Bun on Windows', () => {
+  const options = {
+    isBunRuntime: true,
+    platform: 'win32',
+  };
+
+  assert.equal(resolveCaptureHydrationMode(options), 'full');
+});
+
+test('resolveCaptureHydrationMode keeps targeted hydration outside Bun on Windows', () => {
+  assert.equal(
+    resolveCaptureHydrationMode({
+      isBunRuntime: true,
+      platform: 'linux',
+    }),
+    'targeted',
+  );
+  assert.equal(
+    resolveCaptureHydrationMode({
+      isBunRuntime: false,
+      platform: 'win32',
+    }),
+    'targeted',
+  );
 });
 
 test('init stamps the current schema version on disk', async () => {

@@ -534,6 +534,11 @@ type SqliteRuntimeOptions = {
   isBunRuntime?: boolean;
   platform?: string | undefined;
 };
+type CaptureHydrationMode = 'full' | 'targeted';
+type CaptureHydrationOptions = {
+  isBunRuntime?: boolean;
+  platform?: string | undefined;
+};
 
 function normalizeSqliteRuntimeOverride(value: string | undefined): SqliteRuntime | 'auto' {
   const normalized = value?.trim().toLowerCase();
@@ -557,6 +562,20 @@ export function resolveSqliteRuntimeCandidates(options?: SqliteRuntimeOptions): 
 
 export function resolveSqliteRuntime(options?: SqliteRuntimeOptions): SqliteRuntime {
   return resolveSqliteRuntimeCandidates(options)[0];
+}
+
+export function resolveCaptureHydrationMode(
+  options?: CaptureHydrationOptions,
+): CaptureHydrationMode {
+  const isBunRuntime =
+    options?.isBunRuntime ?? (typeof globalThis === 'object' && 'Bun' in globalThis);
+  const platform = options?.platform ?? process.platform;
+
+  // The targeted fresh-tail capture path is safe under Node, but the bundled
+  // Bun runtime on Windows has been the only environment where users have
+  // reported native crashes in this hot path. Keep the older full-session
+  // hydration there until Bun/Windows is proven stable again.
+  return isBunRuntime && platform === 'win32' ? 'full' : 'targeted';
 }
 
 function isSqliteRuntimeImportError(runtime: SqliteRuntime, error: unknown): boolean {
@@ -1101,7 +1120,10 @@ export class SqliteLcmStore {
     if (!normalized.sessionID) return;
     if (!this.shouldPersistSessionForEvent(normalized.type)) return;
 
-    const session = this.readSessionForCaptureSync(normalized);
+    const session =
+      resolveCaptureHydrationMode() === 'targeted'
+        ? this.readSessionForCaptureSync(normalized)
+        : this.readSessionSync(normalized.sessionID);
     const previousParentSessionID = session.parentSessionID;
     const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(session, normalized);
     let next = this.applyEvent(session, normalized);
