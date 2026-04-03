@@ -31,6 +31,16 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Verify version matches release tag
+        run: |
+          TAG_VERSION="${{ github.event.release.tag_name }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match release tag ($TAG_VERSION)"
+            echo "::notice::This check is informational — the publish job will auto-sync the version."
+          fi
+
   publish:
     name: Publish to npm
     needs: check
@@ -52,6 +62,12 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Sync package.json version with release tag
+        run: |
+          TAG_VERSION="${{ github.event.release.tag_name }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          npm version "$TAG_VERSION" --no-git-tag-version --allow-same-version
 
       - name: Publish
         run: npm publish --provenance --access public
