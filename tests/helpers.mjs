@@ -277,6 +277,24 @@ export function makePluginContext(directory) {
   };
 }
 
+export function makeMockClient() {
+  const calls = [];
+  let counter = 0;
+  return {
+    calls,
+    session: {
+      async create(input) {
+        counter += 1;
+        calls.push({ type: 'create', input });
+        return { id: `child-${counter}` };
+      },
+      async promptAsync(input) {
+        calls.push({ type: 'promptAsync', input });
+      },
+    },
+  };
+}
+
 export function makeToolContext(directory, sessionID = 'root') {
   return {
     sessionID,

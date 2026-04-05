@@ -8,6 +8,7 @@ import {
   captureMessage,
   conversationMessage,
   makeOptions,
+  makeMockClient,
   makePluginContext,
   makeToolContext,
   makeWorkspace,
@@ -129,6 +130,8 @@ test('plugin exposes tools, records events, and appends compaction context once'
         'lcm_retention_prune',
         'lcm_resume',
         'lcm_status',
+        'lcm_task',
+        'lcm_tasks',
         'lcm_unpin_session',
       ].sort(),
     );
@@ -175,6 +178,80 @@ test('plugin exposes tools, records events, and appends compaction context once'
     await hooks['experimental.session.compacting']({ sessionID: 's1' }, dedupedCompaction);
     assert.equal(dedupedCompaction.prompt, 'keep-default');
     assert.equal(dedupedCompaction.context.length, 1);
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+
+test('plugin lcm_task and lcm_tasks map delegation to host child sessions', async () => {
+  const workspace = makeWorkspace('lcm-plugin-task-tools');
+
+  try {
+    const client = makeMockClient();
+    const hooks = await OpencodeLcmPlugin(
+      {
+        ...makePluginContext(workspace),
+        client,
+      },
+      makeOptions(),
+    );
+
+    const toolContext = makeToolContext(workspace, 'parent-1');
+    const single = await hooks.tool.lcm_task.execute(
+      {
+        title: 'Investigate retrieval drift',
+        prompt: 'Find why retrieval drifted after compaction.',
+        agent: 'explore',
+      },
+      toolContext,
+    );
+    const batch = await hooks.tool.lcm_tasks.execute(
+      {
+        tasks: [
+          {
+            title: 'Audit summaries',
+            prompt: 'Check summary graph integrity.',
+            agent: 'explore',
+          },
+          {
+            title: 'Review retention',
+            prompt: 'Review retention pruning edge cases.',
+          },
+        ],
+      },
+      toolContext,
+    );
+
+    assert.match(single, /status=queued/);
+    assert.match(single, /session_id=child-1/);
+    assert.match(single, /parent_session_id=parent-1/);
+    assert.match(batch, /spawned=2/);
+    assert.match(batch, /session_id=child-2 title=Audit summaries agent=explore/);
+    assert.match(batch, /session_id=child-3 title=Review retention agent=default/);
+
+    assert.equal(client.calls.length, 6);
+    assert.deepEqual(client.calls[0], {
+      type: 'create',
+      input: {
+        body: { parentID: 'parent-1', title: 'Investigate retrieval drift' },
+        query: { directory: workspace },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[1], {
+      type: 'promptAsync',
+      input: {
+        path: { id: 'child-1' },
+        query: { directory: workspace },
+        body: {
+          agent: 'explore',
+          model: undefined,
+          parts: [{ type: 'text', text: 'Find why retrieval drifted after compaction.' }],
+        },
+        responseStyle: 'data',
+      },
+    });
   } finally {
     // Plugin hooks keep their SQLite store open for the life of the plugin instance.
     // Let the temp workspace be reclaimed by the OS after process exit.

@@ -5,6 +5,60 @@ import { SqliteLcmStore } from './store.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
 
+function hasSessionPromptClient(client: PluginInput['client']): client is PluginInput['client'] & {
+  session: {
+    create: (...args: any[]) => Promise<{ data?: { id?: string } }> | Promise<{ id?: string }>;
+    promptAsync: (...args: any[]) => Promise<unknown>;
+  };
+} {
+  const record = client as unknown as { session?: { create?: unknown; promptAsync?: unknown } };
+  return Boolean(
+    record?.session &&
+      typeof record.session.create === 'function' &&
+      typeof record.session.promptAsync === 'function',
+  );
+}
+
+async function createDelegatedSession(input: {
+  client: PluginInput['client'];
+  directory: string;
+  parentID: string;
+  title: string;
+  prompt: string;
+  agent?: string;
+  model?: { providerID: string; modelID: string };
+}): Promise<string> {
+  const created = await input.client.session.create({
+    body: {
+      parentID: input.parentID,
+      title: input.title,
+    },
+    query: { directory: input.directory },
+    responseStyle: 'data',
+  });
+
+  const sessionID = (created as { id?: string } | undefined)?.id;
+  if (!sessionID) throw new Error('Failed to create delegated session.');
+
+  await input.client.session.promptAsync({
+    path: { id: sessionID },
+    query: { directory: input.directory },
+    body: {
+      agent: input.agent,
+      model: input.model,
+      parts: [
+        {
+          type: 'text',
+          text: input.prompt,
+        },
+      ],
+    },
+    responseStyle: 'data',
+  });
+
+  return sessionID;
+}
+
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   const options = resolveOptions(rawOptions);
   const store = new SqliteLcmStore(ctx.directory, options);
@@ -68,6 +122,98 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
               .map(([type, count]) => `${type}=${count}`),
           ];
           return lines.join('\n');
+        },
+      }),
+
+      lcm_task: tool({
+        description: 'Spawn one OMO/OpenCode-compatible delegated task as a child session',
+        args: {
+          title: tool.schema.string().min(1),
+          prompt: tool.schema.string().min(1),
+          agent: tool.schema.string().min(1).optional(),
+          providerID: tool.schema.string().min(1).optional(),
+          modelID: tool.schema.string().min(1).optional(),
+        },
+        async execute(args, context) {
+          if (!hasSessionPromptClient(ctx.client)) {
+            return 'Delegation client unavailable: host session.create/promptAsync support is missing.';
+          }
+
+          const model =
+            args.providerID && args.modelID
+              ? { providerID: args.providerID, modelID: args.modelID }
+              : undefined;
+          const sessionID = await createDelegatedSession({
+            client: ctx.client,
+            directory: context.directory,
+            parentID: context.sessionID,
+            title: args.title,
+            prompt: args.prompt,
+            agent: args.agent,
+            model,
+          });
+
+          return [
+            'status=queued',
+            `session_id=${sessionID}`,
+            `parent_session_id=${context.sessionID}`,
+            `title=${args.title}`,
+            `agent=${args.agent ?? 'default'}`,
+          ].join('\n');
+        },
+      }),
+
+      lcm_tasks: tool({
+        description: 'Spawn multiple OMO/OpenCode-compatible delegated tasks as child sessions',
+        args: {
+          tasks: tool.schema
+            .array(
+              tool.schema.object({
+                title: tool.schema.string().min(1),
+                prompt: tool.schema.string().min(1),
+                agent: tool.schema.string().min(1).optional(),
+              }),
+            )
+            .min(1)
+            .max(10),
+          providerID: tool.schema.string().min(1).optional(),
+          modelID: tool.schema.string().min(1).optional(),
+        },
+        async execute(args, context) {
+          if (!hasSessionPromptClient(ctx.client)) {
+            return 'Delegation client unavailable: host session.create/promptAsync support is missing.';
+          }
+
+          const model =
+            args.providerID && args.modelID
+              ? { providerID: args.providerID, modelID: args.modelID }
+              : undefined;
+
+          const spawned = await Promise.all(
+            args.tasks.map(async (task) => ({
+              title: task.title,
+              agent: task.agent,
+              sessionID: await createDelegatedSession({
+                client: ctx.client,
+                directory: context.directory,
+                parentID: context.sessionID,
+                title: task.title,
+                prompt: task.prompt,
+                agent: task.agent,
+                model,
+              }),
+            })),
+          );
+
+          return [
+            `status=queued`,
+            `parent_session_id=${context.sessionID}`,
+            `spawned=${spawned.length}`,
+            ...spawned.map(
+              (task, index) =>
+                `${index + 1}. session_id=${task.sessionID} title=${task.title} agent=${task.agent ?? 'default'}`,
+            ),
+          ].join('\n');
         },
       }),
 
