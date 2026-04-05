@@ -715,6 +715,8 @@ export class SqliteLcmStore {
   private dbReadyPromise?: Promise<void>;
   private deferredInitTimer?: ReturnType<typeof setTimeout>;
   private deferredInitPromise?: Promise<void>;
+  private deferredInitRequested = false;
+  private activeOperationCount = 0;
   private readonly pendingPartUpdates = new Map<string, Event>();
   private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
   private pendingPartUpdateFlushPromise?: Promise<void>;
@@ -733,8 +735,27 @@ export class SqliteLcmStore {
     await mkdir(this.baseDir, { recursive: true });
   }
 
+  // Keep deferred SQLite maintenance off the active connection while a store operation is running.
+  private async withStoreActivity<T>(operation: () => Promise<T>): Promise<T> {
+    this.activeOperationCount += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeOperationCount -= 1;
+      if (this.activeOperationCount === 0 && this.deferredInitRequested) {
+        this.scheduleDeferredInit();
+      }
+    }
+  }
+
+  private async waitForDeferredInitIfRunning(): Promise<void> {
+    if (!this.deferredInitPromise) return;
+    await this.deferredInitPromise;
+  }
+
   private async prepareForRead(): Promise<void> {
     await this.ensureDbReady();
+    await this.waitForDeferredInitIfRunning();
     await this.flushDeferredPartUpdates();
   }
 
@@ -790,56 +811,60 @@ export class SqliteLcmStore {
   }
 
   async captureDeferred(event: Event): Promise<void> {
-    switch (event.type) {
-      case 'message.part.updated': {
-        const key = getDeferredPartUpdateKey(event);
-        if (!key) return await this.capture(event);
-        this.pendingPartUpdates.set(key, event);
-        this.scheduleDeferredPartUpdateFlush();
-        return;
+    return this.withStoreActivity(async () => {
+      switch (event.type) {
+        case 'message.part.updated': {
+          const key = getDeferredPartUpdateKey(event);
+          if (!key) return await this.capture(event);
+          this.pendingPartUpdates.set(key, event);
+          this.scheduleDeferredPartUpdateFlush();
+          return;
+        }
+        case 'message.part.removed':
+          this.clearDeferredPartUpdateForPart(
+            event.properties.sessionID,
+            event.properties.messageID,
+            event.properties.partID,
+          );
+          break;
+        case 'message.removed':
+          this.clearDeferredPartUpdatesForMessage(
+            event.properties.sessionID,
+            event.properties.messageID,
+          );
+          break;
+        case 'session.deleted':
+          this.clearDeferredPartUpdatesForSession(extractSessionID(event));
+          break;
+        default:
+          break;
       }
-      case 'message.part.removed':
-        this.clearDeferredPartUpdateForPart(
-          event.properties.sessionID,
-          event.properties.messageID,
-          event.properties.partID,
-        );
-        break;
-      case 'message.removed':
-        this.clearDeferredPartUpdatesForMessage(
-          event.properties.sessionID,
-          event.properties.messageID,
-        );
-        break;
-      case 'session.deleted':
-        this.clearDeferredPartUpdatesForSession(extractSessionID(event));
-        break;
-      default:
-        break;
-    }
 
-    await this.capture(event);
+      await this.capture(event);
+    });
   }
 
   async flushDeferredPartUpdates(): Promise<void> {
-    if (this.pendingPartUpdateFlushPromise) return this.pendingPartUpdateFlushPromise;
-    if (this.pendingPartUpdates.size === 0) return;
+    return this.withStoreActivity(async () => {
+      if (this.pendingPartUpdateFlushPromise) return this.pendingPartUpdateFlushPromise;
+      if (this.pendingPartUpdates.size === 0) return;
 
-    this.clearDeferredPartUpdateTimer();
-    this.pendingPartUpdateFlushPromise = (async () => {
-      while (this.pendingPartUpdates.size > 0) {
-        const batch = [...this.pendingPartUpdates.values()];
-        this.pendingPartUpdates.clear();
-        for (const event of batch) {
-          await this.capture(event);
+      this.clearDeferredPartUpdateTimer();
+      this.pendingPartUpdateFlushPromise = (async () => {
+        while (this.pendingPartUpdates.size > 0) {
+          const batch = [...this.pendingPartUpdates.values()];
+          this.pendingPartUpdates.clear();
+          for (const event of batch) {
+            await this.capture(event);
+          }
         }
-      }
-    })().finally(() => {
-      this.pendingPartUpdateFlushPromise = undefined;
-      if (this.pendingPartUpdates.size > 0) this.scheduleDeferredPartUpdateFlush();
-    });
+      })().finally(() => {
+        this.pendingPartUpdateFlushPromise = undefined;
+        if (this.pendingPartUpdates.size > 0) this.scheduleDeferredPartUpdateFlush();
+      });
 
-    return this.pendingPartUpdateFlushPromise;
+      return this.pendingPartUpdateFlushPromise;
+    });
   }
 
   private async ensureDbReady(): Promise<void> {
@@ -1048,11 +1073,11 @@ export class SqliteLcmStore {
     if (this.deferredInitCompleted) return Promise.resolve();
     if (this.deferredInitPromise) return this.deferredInitPromise;
 
-    this.deferredInitPromise = Promise.resolve()
-      .then(() => {
-        logStartupPhase('deferred-init:start');
-        this.completeDeferredInit();
-      })
+    this.deferredInitPromise = this.withStoreActivity(async () => {
+      this.deferredInitRequested = false;
+      logStartupPhase('deferred-init:start');
+      this.completeDeferredInit();
+    })
       .catch((error) => {
         getLogger().warn('Deferred LCM maintenance failed', {
           message: error instanceof Error ? error.message : String(error),
@@ -1066,18 +1091,20 @@ export class SqliteLcmStore {
   }
 
   private scheduleDeferredInit(): void {
-    if (
-      !this.db ||
-      this.deferredInitCompleted ||
-      this.deferredInitTimer ||
-      this.deferredInitPromise
-    ) {
+    if (!this.db || this.deferredInitCompleted || this.deferredInitPromise) {
       return;
     }
+
+    this.deferredInitRequested = true;
+    if (this.activeOperationCount > 0 || this.deferredInitTimer) return;
 
     logStartupPhase('deferred-init:scheduled');
     this.deferredInitTimer = setTimeout(() => {
       this.deferredInitTimer = undefined;
+      if (this.activeOperationCount > 0) {
+        this.scheduleDeferredInit();
+        return;
+      }
       void this.runDeferredInit();
     }, 0);
     unrefTimer(this.deferredInitTimer);
@@ -1167,65 +1194,70 @@ export class SqliteLcmStore {
   }
 
   async capture(event: Event): Promise<void> {
-    const normalized = normalizeEvent(event);
-    if (!normalized) return;
+    return this.withStoreActivity(async () => {
+      const normalized = normalizeEvent(event);
+      if (!normalized) return;
 
-    const shouldRecord = this.shouldRecordEvent(normalized.type);
-    const shouldPersistSession =
-      Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
-    if (!shouldRecord && !shouldPersistSession) return;
+      const shouldRecord = this.shouldRecordEvent(normalized.type);
+      const shouldPersistSession =
+        Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
+      if (!shouldRecord && !shouldPersistSession) return;
 
-    await this.ensureDeferredInitComplete();
+      await this.ensureDeferredInitComplete();
 
-    if (shouldRecord) {
-      this.writeEvent(normalized);
-    }
-
-    if (!normalized.sessionID || !shouldPersistSession) return;
-
-    const session =
-      resolveCaptureHydrationMode() === 'targeted'
-        ? this.readSessionForCaptureSync(normalized)
-        : this.readSessionSync(normalized.sessionID);
-    const previousParentSessionID = session.parentSessionID;
-    const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(session, normalized);
-    let next = this.applyEvent(session, normalized);
-    next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
-    next.eventCount += 1;
-    next = this.prepareSessionForPersistence(next);
-
-    await this.persistCapturedSession(next, normalized);
-
-    if (this.shouldRefreshLineageForEvent(normalized.type)) {
-      this.refreshAllLineageSync();
-      const refreshed = this.readSessionHeaderSync(normalized.sessionID);
-      if (refreshed) {
-        next = {
-          ...next,
-          parentSessionID: refreshed.parentSessionID,
-          rootSessionID: refreshed.rootSessionID,
-          lineageDepth: refreshed.lineageDepth,
-        };
+      if (shouldRecord) {
+        this.writeEvent(normalized);
       }
-    }
 
-    if (shouldSyncDerivedState) {
-      this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
-    }
+      if (!normalized.sessionID || !shouldPersistSession) return;
 
-    if (
-      this.shouldSyncDerivedLineageSubtree(
-        normalized.type,
-        previousParentSessionID,
-        next.parentSessionID,
-      )
-    ) {
-      this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
-    }
+      const session =
+        resolveCaptureHydrationMode() === 'targeted'
+          ? this.readSessionForCaptureSync(normalized)
+          : this.readSessionSync(normalized.sessionID);
+      const previousParentSessionID = session.parentSessionID;
+      const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
+        session,
+        normalized,
+      );
+      let next = this.applyEvent(session, normalized);
+      next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
+      next.eventCount += 1;
+      next = this.prepareSessionForPersistence(next);
 
-    if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
-      this.deleteOrphanArtifactBlobsSync();
-    }
+      await this.persistCapturedSession(next, normalized);
+
+      if (this.shouldRefreshLineageForEvent(normalized.type)) {
+        this.refreshAllLineageSync();
+        const refreshed = this.readSessionHeaderSync(normalized.sessionID);
+        if (refreshed) {
+          next = {
+            ...next,
+            parentSessionID: refreshed.parentSessionID,
+            rootSessionID: refreshed.rootSessionID,
+            lineageDepth: refreshed.lineageDepth,
+          };
+        }
+      }
+
+      if (shouldSyncDerivedState) {
+        this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
+      }
+
+      if (
+        this.shouldSyncDerivedLineageSubtree(
+          normalized.type,
+          previousParentSessionID,
+          next.parentSessionID,
+        )
+      ) {
+        this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
+      }
+
+      if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
+        this.deleteOrphanArtifactBlobsSync();
+      }
+    });
   }
 
   async stats(): Promise<StoreStats> {
@@ -2581,71 +2613,73 @@ export class SqliteLcmStore {
     vacuum?: boolean;
     limit?: number;
   }): Promise<string> {
-    await this.prepareForRead();
-    const apply = input?.apply ?? false;
-    const vacuum = input?.vacuum ?? true;
-    const limit = clamp(input?.limit ?? 10, 1, 50);
-    const candidates = this.readPrunableEventTypeCountsSync();
-    const candidateEvents = candidates.reduce((sum, row) => sum + row.count, 0);
-    const beforeSizes = await this.readStoreFileSizes();
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const apply = input?.apply ?? false;
+      const vacuum = input?.vacuum ?? true;
+      const limit = clamp(input?.limit ?? 10, 1, 50);
+      const candidates = this.readPrunableEventTypeCountsSync();
+      const candidateEvents = candidates.reduce((sum, row) => sum + row.count, 0);
+      const beforeSizes = await this.readStoreFileSizes();
 
-    if (!apply || candidateEvents === 0) {
+      if (!apply || candidateEvents === 0) {
+        return [
+          `candidate_events=${candidateEvents}`,
+          `apply=false`,
+          `vacuum_requested=${vacuum}`,
+          `db_bytes=${beforeSizes.dbBytes}`,
+          `wal_bytes=${beforeSizes.walBytes}`,
+          `shm_bytes=${beforeSizes.shmBytes}`,
+          `total_bytes=${beforeSizes.totalBytes}`,
+          ...(candidates.length > 0
+            ? [
+                'candidate_event_types:',
+                ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
+              ]
+            : ['candidate_event_types:', '- none']),
+        ].join('\n');
+      }
+
+      const eventTypes = candidates.map((row) => row.eventType);
+      if (eventTypes.length > 0) {
+        const placeholders = eventTypes.map(() => '?').join(', ');
+        this.getDb()
+          .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
+          .run(...eventTypes);
+      }
+
+      let vacuumApplied = false;
+      this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      if (vacuum) {
+        this.getDb().exec('VACUUM');
+        this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        vacuumApplied = true;
+      }
+
+      const afterSizes = await this.readStoreFileSizes();
+
       return [
         `candidate_events=${candidateEvents}`,
-        `apply=false`,
+        `deleted_events=${candidateEvents}`,
+        `apply=true`,
         `vacuum_requested=${vacuum}`,
-        `db_bytes=${beforeSizes.dbBytes}`,
-        `wal_bytes=${beforeSizes.walBytes}`,
-        `shm_bytes=${beforeSizes.shmBytes}`,
-        `total_bytes=${beforeSizes.totalBytes}`,
+        `vacuum_applied=${vacuumApplied}`,
+        `db_bytes_before=${beforeSizes.dbBytes}`,
+        `wal_bytes_before=${beforeSizes.walBytes}`,
+        `shm_bytes_before=${beforeSizes.shmBytes}`,
+        `total_bytes_before=${beforeSizes.totalBytes}`,
+        `db_bytes_after=${afterSizes.dbBytes}`,
+        `wal_bytes_after=${afterSizes.walBytes}`,
+        `shm_bytes_after=${afterSizes.shmBytes}`,
+        `total_bytes_after=${afterSizes.totalBytes}`,
         ...(candidates.length > 0
           ? [
-              'candidate_event_types:',
+              'deleted_event_types:',
               ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
             ]
-          : ['candidate_event_types:', '- none']),
+          : ['deleted_event_types:', '- none']),
       ].join('\n');
-    }
-
-    const eventTypes = candidates.map((row) => row.eventType);
-    if (eventTypes.length > 0) {
-      const placeholders = eventTypes.map(() => '?').join(', ');
-      this.getDb()
-        .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
-        .run(...eventTypes);
-    }
-
-    let vacuumApplied = false;
-    this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    if (vacuum) {
-      this.getDb().exec('VACUUM');
-      this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
-      vacuumApplied = true;
-    }
-
-    const afterSizes = await this.readStoreFileSizes();
-
-    return [
-      `candidate_events=${candidateEvents}`,
-      `deleted_events=${candidateEvents}`,
-      `apply=true`,
-      `vacuum_requested=${vacuum}`,
-      `vacuum_applied=${vacuumApplied}`,
-      `db_bytes_before=${beforeSizes.dbBytes}`,
-      `wal_bytes_before=${beforeSizes.walBytes}`,
-      `shm_bytes_before=${beforeSizes.shmBytes}`,
-      `total_bytes_before=${beforeSizes.totalBytes}`,
-      `db_bytes_after=${afterSizes.dbBytes}`,
-      `wal_bytes_after=${afterSizes.walBytes}`,
-      `shm_bytes_after=${afterSizes.shmBytes}`,
-      `total_bytes_after=${afterSizes.totalBytes}`,
-      ...(candidates.length > 0
-        ? [
-            'deleted_event_types:',
-            ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
-          ]
-        : ['deleted_event_types:', '- none']),
-    ].join('\n');
+    });
   }
 
   async retentionReport(input?: {
@@ -2815,24 +2849,26 @@ export class SqliteLcmStore {
     sessionID?: string;
     scope?: string;
   }): Promise<string> {
-    await this.prepareForRead();
-    return exportStoreSnapshot(
-      {
-        workspaceDirectory: this.workspaceDirectory,
-        normalizeScope: this.normalizeScope.bind(this),
-        resolveScopeSessionIDs: this.resolveScopeSessionIDs.bind(this),
-        readScopedSessionRowsSync: this.readScopedSessionRowsSync.bind(this),
-        readScopedMessageRowsSync: this.readScopedMessageRowsSync.bind(this),
-        readScopedPartRowsSync: this.readScopedPartRowsSync.bind(this),
-        readScopedResumeRowsSync: this.readScopedResumeRowsSync.bind(this),
-        readScopedArtifactRowsSync: this.readScopedArtifactRowsSync.bind(this),
-        readScopedArtifactBlobRowsSync: this.readScopedArtifactBlobRowsSync.bind(this),
-        readScopedSummaryRowsSync: this.readScopedSummaryRowsSync.bind(this),
-        readScopedSummaryEdgeRowsSync: this.readScopedSummaryEdgeRowsSync.bind(this),
-        readScopedSummaryStateRowsSync: this.readScopedSummaryStateRowsSync.bind(this),
-      },
-      input,
-    );
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return exportStoreSnapshot(
+        {
+          workspaceDirectory: this.workspaceDirectory,
+          normalizeScope: this.normalizeScope.bind(this),
+          resolveScopeSessionIDs: this.resolveScopeSessionIDs.bind(this),
+          readScopedSessionRowsSync: this.readScopedSessionRowsSync.bind(this),
+          readScopedMessageRowsSync: this.readScopedMessageRowsSync.bind(this),
+          readScopedPartRowsSync: this.readScopedPartRowsSync.bind(this),
+          readScopedResumeRowsSync: this.readScopedResumeRowsSync.bind(this),
+          readScopedArtifactRowsSync: this.readScopedArtifactRowsSync.bind(this),
+          readScopedArtifactBlobRowsSync: this.readScopedArtifactBlobRowsSync.bind(this),
+          readScopedSummaryRowsSync: this.readScopedSummaryRowsSync.bind(this),
+          readScopedSummaryEdgeRowsSync: this.readScopedSummaryEdgeRowsSync.bind(this),
+          readScopedSummaryStateRowsSync: this.readScopedSummaryStateRowsSync.bind(this),
+        },
+        input,
+      );
+    });
   }
 
   async importSnapshot(input: {
@@ -2840,31 +2876,35 @@ export class SqliteLcmStore {
     mode?: 'replace' | 'merge';
     worktreeMode?: SnapshotWorktreeMode;
   }): Promise<string> {
-    await this.prepareForRead();
-    return importStoreSnapshot(
-      {
-        workspaceDirectory: this.workspaceDirectory,
-        getDb: () => this.getDb(),
-        clearSessionDataSync: this.clearSessionDataSync.bind(this),
-        backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
-        refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
-        syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
-        refreshSearchIndexesSync: this.refreshSearchIndexesSync.bind(this),
-      },
-      input,
-    );
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return importStoreSnapshot(
+        {
+          workspaceDirectory: this.workspaceDirectory,
+          getDb: () => this.getDb(),
+          clearSessionDataSync: this.clearSessionDataSync.bind(this),
+          backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
+          refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
+          syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
+          refreshSearchIndexesSync: this.refreshSearchIndexesSync.bind(this),
+        },
+        input,
+      );
+    });
   }
 
   async resume(sessionID?: string): Promise<string> {
-    await this.prepareForRead();
-    const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
-    if (!resolvedSessionID) return 'No stored resume snapshots yet.';
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+      if (!resolvedSessionID) return 'No stored resume snapshots yet.';
 
-    const existing = this.getResumeSync(resolvedSessionID);
-    if (existing && !this.isManagedResumeNote(existing)) return existing;
+      const existing = this.getResumeSync(resolvedSessionID);
+      if (existing && !this.isManagedResumeNote(existing)) return existing;
 
-    const generated = await this.buildCompactionContext(resolvedSessionID);
-    return generated ?? existing ?? 'No stored resume snapshot for that session.';
+      const generated = await this.buildCompactionContext(resolvedSessionID);
+      return generated ?? existing ?? 'No stored resume snapshot for that session.';
+    });
   }
 
   async expand(input: {
@@ -2948,54 +2988,56 @@ export class SqliteLcmStore {
   }
 
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
-    if (messages.length < this.options.minMessagesForTransform) return false;
+    return this.withStoreActivity(async () => {
+      if (messages.length < this.options.minMessagesForTransform) return false;
 
-    const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
-    if (!window) return false;
+      const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
+      if (!window) return false;
 
-    await this.prepareForRead();
+      await this.prepareForRead();
 
-    const { anchor, archived, recent } = window;
+      const { anchor, archived, recent } = window;
 
-    const roots = this.ensureSummaryGraphSync(anchor.info.sessionID, archived);
-    if (roots.length === 0) return false;
+      const roots = this.ensureSummaryGraphSync(anchor.info.sessionID, archived);
+      if (roots.length === 0) return false;
 
-    const summary = buildActiveSummaryText(roots, archived.length, this.options.summaryCharBudget);
-    const retrieval = await this.buildAutomaticRetrievalContext(
-      anchor.info.sessionID,
-      recent,
-      anchor,
-    );
-    for (const message of archived) {
-      this.compactMessageInPlace(message);
-    }
+      const summary = buildActiveSummaryText(roots, archived.length, this.options.summaryCharBudget);
+      const retrieval = await this.buildAutomaticRetrievalContext(
+        anchor.info.sessionID,
+        recent,
+        anchor,
+      );
+      for (const message of archived) {
+        this.compactMessageInPlace(message);
+      }
 
-    anchor.parts = anchor.parts.filter(
-      (part) => !isSyntheticLcmTextPart(part, ['archive-summary', 'retrieved-context']),
-    );
-    const syntheticParts: Part[] = [];
-    if (retrieval) {
+      anchor.parts = anchor.parts.filter(
+        (part) => !isSyntheticLcmTextPart(part, ['archive-summary', 'retrieved-context']),
+      );
+      const syntheticParts: Part[] = [];
+      if (retrieval) {
+        syntheticParts.push({
+          id: `lcm-memory-${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+          sessionID: anchor.info.sessionID,
+          messageID: anchor.info.id,
+          type: 'text',
+          text: retrieval,
+          synthetic: true,
+          metadata: { opencodeLcm: 'retrieved-context' },
+        });
+      }
       syntheticParts.push({
-        id: `lcm-memory-${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+        id: `lcm-summary-${randomUUID().replace(/-/g, '').slice(0, 12)}`,
         sessionID: anchor.info.sessionID,
         messageID: anchor.info.id,
         type: 'text',
-        text: retrieval,
+        text: summary,
         synthetic: true,
-        metadata: { opencodeLcm: 'retrieved-context' },
+        metadata: { opencodeLcm: 'archive-summary' },
       });
-    }
-    syntheticParts.push({
-      id: `lcm-summary-${randomUUID().replace(/-/g, '').slice(0, 12)}`,
-      sessionID: anchor.info.sessionID,
-      messageID: anchor.info.id,
-      type: 'text',
-      text: summary,
-      synthetic: true,
-      metadata: { opencodeLcm: 'archive-summary' },
+      anchor.parts.push(...syntheticParts);
+      return true;
     });
-    anchor.parts.push(...syntheticParts);
-    return true;
   }
 
   systemHint(): string | undefined {

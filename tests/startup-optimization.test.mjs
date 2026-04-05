@@ -7,6 +7,7 @@ import test from 'node:test';
 import { SqliteLcmStore } from '../dist/store.js';
 
 import {
+  captureMessage,
   cleanupWorkspace,
   conversationMessage,
   createSession,
@@ -95,6 +96,128 @@ test('capture completes pending maintenance before the first write', async () =>
     assert.equal(store.deferredInitCompleted, true);
   } finally {
     store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('transformMessages keeps deferred maintenance idle until the async read finishes', async () => {
+  const workspace = makeWorkspace('lcm-startup-transform-idle-maintenance');
+  let writerStore;
+  let readerStore;
+
+  try {
+    writerStore = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
+    );
+    await writerStore.init();
+
+    await createSession(writerStore, workspace, 's1', 1);
+    await captureMessage(writerStore, {
+      sessionID: 's1',
+      messageID: 'm1',
+      created: 2,
+      parts: [textPart('s1', 'm1', 'm1-p', 'tenant mapping sqlite lives in the billing cache')],
+    });
+    await captureMessage(writerStore, {
+      sessionID: 's1',
+      messageID: 'm2',
+      created: 3,
+      role: 'assistant',
+      parts: [textPart('s1', 'm2', 'm2-p', 'confirmed the tenant mapping sqlite flow')],
+    });
+    await captureMessage(writerStore, {
+      sessionID: 's1',
+      messageID: 'm3',
+      created: 4,
+      parts: [textPart('s1', 'm3', 'm3-p', 'other archived context')],
+    });
+    await captureMessage(writerStore, {
+      sessionID: 's1',
+      messageID: 'm4',
+      created: 5,
+      parts: [textPart('s1', 'm4', 'm4-p', 'tenant mapping sqlite')],
+    });
+    writerStore.close();
+    writerStore = undefined;
+
+    readerStore = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
+    );
+    await readerStore.init();
+
+    let deferredRuns = 0;
+    const originalCompleteDeferredInit = readerStore.completeDeferredInit.bind(readerStore);
+    readerStore.completeDeferredInit = () => {
+      deferredRuns += 1;
+      originalCompleteDeferredInit();
+    };
+
+    const originalGrep = readerStore.grep.bind(readerStore);
+    let releaseFirstGrep;
+    const firstGrepBlocked = new Promise((resolve) => {
+      releaseFirstGrep = resolve;
+    });
+    let signalFirstGrep;
+    const firstGrepStarted = new Promise((resolve) => {
+      signalFirstGrep = resolve;
+    });
+    let grepCalls = 0;
+    readerStore.grep = async (...args) => {
+      grepCalls += 1;
+      if (grepCalls === 1) {
+        signalFirstGrep();
+        await firstGrepBlocked;
+      }
+      return originalGrep(...args);
+    };
+
+    const messages = [
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm1',
+        created: 2,
+        parts: [textPart('s1', 'm1', 'm1-p', 'tenant mapping sqlite lives in the billing cache')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm2',
+        created: 3,
+        role: 'assistant',
+        parts: [textPart('s1', 'm2', 'm2-p', 'confirmed the tenant mapping sqlite flow')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm3',
+        created: 4,
+        parts: [textPart('s1', 'm3', 'm3-p', 'other archived context')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm4',
+        created: 5,
+        parts: [textPart('s1', 'm4', 'm4-p', 'tenant mapping sqlite')],
+      }),
+    ];
+
+    const transformPromise = readerStore.transformMessages(messages);
+    await firstGrepStarted;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(
+      deferredRuns,
+      0,
+      'deferred maintenance should stay idle while transformMessages is still awaiting retrieval',
+    );
+
+    releaseFirstGrep();
+    await transformPromise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(deferredRuns, 1);
+  } finally {
+    writerStore?.close();
+    readerStore?.close();
     await cleanupWorkspace(workspace);
   }
 });
