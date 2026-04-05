@@ -3001,7 +3001,11 @@ export class SqliteLcmStore {
       const roots = this.ensureSummaryGraphSync(anchor.info.sessionID, archived);
       if (roots.length === 0) return false;
 
-      const summary = buildActiveSummaryText(roots, archived.length, this.options.summaryCharBudget);
+      const summary = buildActiveSummaryText(
+        roots,
+        archived.length,
+        this.options.summaryCharBudget,
+      );
       const retrieval = await this.buildAutomaticRetrievalContext(
         anchor.info.sessionID,
         recent,
