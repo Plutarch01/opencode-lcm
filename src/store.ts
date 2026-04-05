@@ -528,6 +528,12 @@ function logStartupPhase(phase: string, context?: Record<string, unknown>): void
   getLogger().info(`startup phase: ${phase}`, context);
 }
 
+function unrefTimer(timer: ReturnType<typeof setTimeout> | undefined): void {
+  if (typeof timer === 'object' && timer && 'unref' in timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+}
+
 type SqliteRuntime = 'bun' | 'node';
 type SqliteRuntimeOptions = {
   envOverride?: string | undefined;
@@ -707,6 +713,8 @@ export class SqliteLcmStore {
   private readonly workspaceDirectory: string;
   private db?: SqlDatabaseLike;
   private dbReadyPromise?: Promise<void>;
+  private deferredInitTimer?: ReturnType<typeof setTimeout>;
+  private deferredInitPromise?: Promise<void>;
   private readonly pendingPartUpdates = new Map<string, Event>();
   private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
   private pendingPartUpdateFlushPromise?: Promise<void>;
@@ -737,15 +745,7 @@ export class SqliteLcmStore {
       this.pendingPartUpdateTimer = undefined;
       void this.flushDeferredPartUpdates();
     }, SqliteLcmStore.deferredPartUpdateDelayMs);
-
-    if (
-      typeof this.pendingPartUpdateTimer === 'object' &&
-      this.pendingPartUpdateTimer &&
-      'unref' in this.pendingPartUpdateTimer &&
-      typeof this.pendingPartUpdateTimer.unref === 'function'
-    ) {
-      this.pendingPartUpdateTimer.unref();
-    }
+    unrefTimer(this.pendingPartUpdateTimer);
   }
 
   private clearDeferredPartUpdateTimer(): void {
@@ -843,10 +843,16 @@ export class SqliteLcmStore {
   }
 
   private async ensureDbReady(): Promise<void> {
-    if (this.db) return;
-    if (this.dbReadyPromise) return this.dbReadyPromise;
-    this.dbReadyPromise = this.openAndInitializeDb();
-    return this.dbReadyPromise;
+    if (!this.dbReadyPromise) {
+      if (this.db) {
+        this.scheduleDeferredInit();
+        return;
+      }
+      this.dbReadyPromise = this.openAndInitializeDb();
+    }
+
+    await this.dbReadyPromise;
+    this.scheduleDeferredInit();
   }
 
   private async openAndInitializeDb(): Promise<void> {
@@ -1024,8 +1030,6 @@ export class SqliteLcmStore {
       await this.migrateLegacyArtifacts();
       logStartupPhase('open-db:write-schema-version', { schemaVersion: STORE_SCHEMA_VERSION });
       this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
-      logStartupPhase('open-db:deferred-init:start');
-      this.completeDeferredInit();
       logStartupPhase('open-db:ready');
     } catch (error) {
       logStartupPhase('open-db:error', {
@@ -1039,6 +1043,57 @@ export class SqliteLcmStore {
   }
 
   private deferredInitCompleted = false;
+
+  private runDeferredInit(): Promise<void> {
+    if (this.deferredInitCompleted) return Promise.resolve();
+    if (this.deferredInitPromise) return this.deferredInitPromise;
+
+    this.deferredInitPromise = Promise.resolve()
+      .then(() => {
+        logStartupPhase('deferred-init:start');
+        this.completeDeferredInit();
+      })
+      .catch((error) => {
+        getLogger().warn('Deferred LCM maintenance failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        this.deferredInitPromise = undefined;
+      });
+
+    return this.deferredInitPromise;
+  }
+
+  private scheduleDeferredInit(): void {
+    if (
+      !this.db ||
+      this.deferredInitCompleted ||
+      this.deferredInitTimer ||
+      this.deferredInitPromise
+    ) {
+      return;
+    }
+
+    logStartupPhase('deferred-init:scheduled');
+    this.deferredInitTimer = setTimeout(() => {
+      this.deferredInitTimer = undefined;
+      void this.runDeferredInit();
+    }, 0);
+    unrefTimer(this.deferredInitTimer);
+  }
+
+  private async ensureDeferredInitComplete(): Promise<void> {
+    await this.ensureDbReady();
+    if (this.deferredInitCompleted) return;
+
+    if (this.deferredInitTimer) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = undefined;
+    }
+
+    await this.runDeferredInit();
+  }
 
   private readSchemaVersionSync(): number {
     return firstFiniteNumber(this.getDb().prepare('PRAGMA user_version').get()) ?? 0;
@@ -1101,6 +1156,10 @@ export class SqliteLcmStore {
   close(): void {
     this.clearDeferredPartUpdateTimer();
     this.pendingPartUpdates.clear();
+    if (this.deferredInitTimer) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = undefined;
+    }
     if (!this.db) return;
     this.db.close();
     this.db = undefined;
@@ -1108,17 +1167,21 @@ export class SqliteLcmStore {
   }
 
   async capture(event: Event): Promise<void> {
-    await this.ensureDbReady();
-
     const normalized = normalizeEvent(event);
     if (!normalized) return;
 
-    if (this.shouldRecordEvent(normalized.type)) {
+    const shouldRecord = this.shouldRecordEvent(normalized.type);
+    const shouldPersistSession =
+      Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
+    if (!shouldRecord && !shouldPersistSession) return;
+
+    await this.ensureDeferredInitComplete();
+
+    if (shouldRecord) {
       this.writeEvent(normalized);
     }
 
-    if (!normalized.sessionID) return;
-    if (!this.shouldPersistSessionForEvent(normalized.type)) return;
+    if (!normalized.sessionID || !shouldPersistSession) return;
 
     const session =
       resolveCaptureHydrationMode() === 'targeted'
@@ -1167,6 +1230,7 @@ export class SqliteLcmStore {
 
   async stats(): Promise<StoreStats> {
     await this.prepareForRead();
+    await this.ensureDeferredInitComplete();
     const db = this.getDb();
     const totalRow = validateRow<{ count: number; latest: number | null }>(
       db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
@@ -1283,12 +1347,13 @@ export class SqliteLcmStore {
     scope?: string;
     limit?: number;
   }): Promise<SearchResult[]> {
-    await this.prepareForRead();
     const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
-    const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
     const limit = input.limit ?? 5;
     const needle = input.query.trim();
     if (!needle) return [];
+
+    await this.prepareForRead();
+    const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
 
     const ftsResults = this.searchWithFts(needle, sessionIDs, limit);
     if (ftsResults.length > 0) return ftsResults;
@@ -2883,11 +2948,12 @@ export class SqliteLcmStore {
   }
 
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
-    await this.prepareForRead();
     if (messages.length < this.options.minMessagesForTransform) return false;
 
     const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
     if (!window) return false;
+
+    await this.prepareForRead();
 
     const { anchor, archived, recent } = window;
 
@@ -4240,17 +4306,40 @@ export class SqliteLcmStore {
   ): { rootSessionID: string; lineageDepth: number } {
     if (!parentSessionID) return { rootSessionID: sessionID, lineageDepth: 0 };
 
-    const parent = this.getDb()
-      .prepare('SELECT root_session_id, lineage_depth FROM sessions WHERE session_id = ?')
-      .get(parentSessionID) as
-      | { root_session_id: string | null; lineage_depth: number | null }
-      | undefined;
+    const seen = new Set<string>([sessionID]);
+    let currentSessionID: string | undefined = parentSessionID;
+    let lineageDepth = 1;
 
-    if (!parent) return { rootSessionID: parentSessionID, lineageDepth: 1 };
-    return {
-      rootSessionID: parent.root_session_id ?? parentSessionID,
-      lineageDepth: (parent.lineage_depth ?? 0) + 1,
-    };
+    while (currentSessionID && !seen.has(currentSessionID)) {
+      seen.add(currentSessionID);
+      const parent = this.getDb()
+        .prepare(
+          'SELECT parent_session_id, root_session_id, lineage_depth FROM sessions WHERE session_id = ?',
+        )
+        .get(currentSessionID) as
+        | {
+            parent_session_id: string | null;
+            root_session_id: string | null;
+            lineage_depth: number | null;
+          }
+        | undefined;
+
+      if (!parent) return { rootSessionID: currentSessionID, lineageDepth };
+      if (parent.root_session_id && parent.lineage_depth !== null) {
+        return {
+          rootSessionID: parent.root_session_id,
+          lineageDepth: parent.lineage_depth + lineageDepth,
+        };
+      }
+      if (!parent.parent_session_id) {
+        return { rootSessionID: currentSessionID, lineageDepth };
+      }
+
+      currentSessionID = parent.parent_session_id;
+      lineageDepth += 1;
+    }
+
+    return { rootSessionID: parentSessionID, lineageDepth };
   }
 
   private applyEvent(session: NormalizedSession, event: CapturedEvent): NormalizedSession {
@@ -4322,6 +4411,33 @@ export class SqliteLcmStore {
     return row?.note;
   }
 
+  private materializeSessionRow(
+    row: SessionRow,
+    messages: ConversationMessage[] = [],
+  ): NormalizedSession {
+    const parentSessionID = row.parent_session_id ?? undefined;
+    const derivedLineage =
+      row.root_session_id === null || row.lineage_depth === null
+        ? this.resolveLineageSync(row.session_id, parentSessionID)
+        : undefined;
+
+    return {
+      sessionID: row.session_id,
+      title: row.title ?? undefined,
+      directory: row.session_directory ?? undefined,
+      parentSessionID,
+      rootSessionID: row.root_session_id ?? derivedLineage?.rootSessionID,
+      lineageDepth: row.lineage_depth ?? derivedLineage?.lineageDepth,
+      pinned: Boolean(row.pinned),
+      pinReason: row.pin_reason ?? undefined,
+      updatedAt: row.updated_at,
+      compactedAt: row.compacted_at ?? undefined,
+      deleted: Boolean(row.deleted),
+      eventCount: row.event_count,
+      messages,
+    };
+  }
+
   private readSessionHeaderSync(sessionID: string): NormalizedSession | undefined {
     const row = safeQueryOne<SessionRow>(
       this.getDb().prepare('SELECT * FROM sessions WHERE session_id = ?'),
@@ -4330,21 +4446,7 @@ export class SqliteLcmStore {
     );
     if (!row) return undefined;
 
-    return {
-      sessionID: row.session_id,
-      title: row.title ?? undefined,
-      directory: row.session_directory ?? undefined,
-      parentSessionID: row.parent_session_id ?? undefined,
-      rootSessionID: row.root_session_id ?? undefined,
-      lineageDepth: row.lineage_depth ?? undefined,
-      pinned: Boolean(row.pinned),
-      pinReason: row.pin_reason ?? undefined,
-      updatedAt: row.updated_at,
-      compactedAt: row.compacted_at ?? undefined,
-      deleted: Boolean(row.deleted),
-      eventCount: row.event_count,
-      messages: [],
-    };
+    return this.materializeSessionRow(row);
   }
 
   private clearSessionDataSync(sessionID: string): void {
@@ -4507,21 +4609,7 @@ export class SqliteLcmStore {
       if (!row) {
         return { ...emptySession(sessionID), messages };
       }
-      return {
-        sessionID: row.session_id,
-        title: row.title ?? undefined,
-        directory: row.session_directory ?? undefined,
-        parentSessionID: row.parent_session_id ?? undefined,
-        rootSessionID: row.root_session_id ?? undefined,
-        lineageDepth: row.lineage_depth ?? undefined,
-        pinned: Boolean(row.pinned),
-        pinReason: row.pin_reason ?? undefined,
-        updatedAt: row.updated_at,
-        compactedAt: row.compacted_at ?? undefined,
-        deleted: Boolean(row.deleted),
-        eventCount: row.event_count,
-        messages,
-      };
+      return this.materializeSessionRow(row, messages);
     });
   }
 
@@ -4568,21 +4656,7 @@ export class SqliteLcmStore {
       return { ...emptySession(sessionID), messages };
     }
 
-    return {
-      sessionID: row.session_id,
-      title: row.title ?? undefined,
-      directory: row.session_directory ?? undefined,
-      parentSessionID: row.parent_session_id ?? undefined,
-      rootSessionID: row.root_session_id ?? undefined,
-      lineageDepth: row.lineage_depth ?? undefined,
-      pinned: Boolean(row.pinned),
-      pinReason: row.pin_reason ?? undefined,
-      updatedAt: row.updated_at,
-      compactedAt: row.compacted_at ?? undefined,
-      deleted: Boolean(row.deleted),
-      eventCount: row.event_count,
-      messages,
-    };
+    return this.materializeSessionRow(row, messages);
   }
 
   private prepareSessionForPersistence(session: NormalizedSession): NormalizedSession {
