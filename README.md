@@ -74,7 +74,7 @@ Appends a compact resume note during compaction so important context survives th
 - **Snapshot export/import** — portable snapshots with safe merge and worktree modes
 - **Privacy controls** — tool-output exclusion, path-based capture exclusion, regex redaction
 - **Configurable retrieval** — scope ordering, per-scope budgets, stop rules, recency-aware ranking
-- **16 tools** — `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, `lcm_import_snapshot`
+- **19 tools** — `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, `lcm_import_snapshot`, `lcm_task`, `lcm_tasks`, `lcm_agentic_map`
 - **Legacy migration** — auto-migrates `.lcm/events.jsonl`, `.lcm/resume.json`, `.lcm/sessions/*.json`
 
 ## Configuration

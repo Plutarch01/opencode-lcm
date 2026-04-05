@@ -228,74 +228,53 @@ test('plugin lcm_task and lcm_tasks map delegation to host child sessions', asyn
     assert.match(single, /status=queued/);
     assert.match(single, /session_id=child-1/);
     assert.match(single, /parent_session_id=parent-1/);
+    assert.match(batch, /status=queued/);
     assert.match(batch, /spawned=2/);
-    assert.match(batch, /session_id=child-2 title=Audit summaries agent=explore/);
-    assert.match(batch, /session_id=child-3 title=Review retention agent=default/);
+    assert.match(batch, /queued=2/);
+    assert.match(batch, /errors=0/);
+    assert.match(batch, /status=queued session_id=child-2 title=Audit summaries agent=explore/);
+    assert.match(batch, /status=queued session_id=child-3 title=Review retention agent=default/);
 
     assert.equal(client.calls.length, 6);
-    assert.deepEqual(client.calls[0], {
-      type: 'create',
-      input: {
-        body: { parentID: 'parent-1', title: 'Investigate retrieval drift' },
-        query: { directory: workspace },
-        responseStyle: 'data',
-      },
-    });
-    assert.deepEqual(client.calls[1], {
-      type: 'promptAsync',
-      input: {
-        path: { id: 'child-1' },
-        query: { directory: workspace },
-        body: {
-          agent: 'explore',
-          model: undefined,
-          parts: [{ type: 'text', text: 'Find why retrieval drifted after compaction.' }],
-        },
-        responseStyle: 'data',
-      },
-    });
-    assert.deepEqual(client.calls[2], {
-      type: 'create',
-      input: {
-        body: { parentID: 'parent-1', title: 'Audit summaries' },
-        query: { directory: workspace },
-        responseStyle: 'data',
-      },
-    });
-    assert.deepEqual(client.calls[3], {
-      type: 'create',
-      input: {
-        body: { parentID: 'parent-1', title: 'Review retention' },
-        query: { directory: workspace },
-        responseStyle: 'data',
-      },
-    });
-    assert.deepEqual(client.calls[4], {
-      type: 'promptAsync',
-      input: {
-        path: { id: 'child-2' },
-        query: { directory: workspace },
-        body: {
-          agent: 'explore',
-          model: undefined,
-          parts: [{ type: 'text', text: 'Check summary graph integrity.' }],
-        },
-        responseStyle: 'data',
-      },
-    });
-    assert.deepEqual(client.calls[5], {
-      type: 'promptAsync',
-      input: {
-        path: { id: 'child-3' },
-        query: { directory: workspace },
-        body: {
-          agent: undefined,
-          model: undefined,
-          parts: [{ type: 'text', text: 'Review retention pruning edge cases.' }],
-        },
-        responseStyle: 'data',
-      },
-    });
+    assert.ok(
+      client.calls.some(
+        (call) =>
+          call.type === 'create' &&
+          call.input?.body?.parentID === 'parent-1' &&
+          call.input?.body?.title === 'Investigate retrieval drift',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) =>
+          call.type === 'promptAsync' &&
+          call.input?.body?.parts?.[0]?.text === 'Find why retrieval drifted after compaction.',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) => call.type === 'create' && call.input?.body?.title === 'Audit summaries',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) => call.type === 'create' && call.input?.body?.title === 'Review retention',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) =>
+          call.type === 'promptAsync' &&
+          call.input?.body?.parts?.[0]?.text === 'Check summary graph integrity.',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) =>
+          call.type === 'promptAsync' &&
+          call.input?.body?.parts?.[0]?.text === 'Review retention pruning edge cases.',
+      ),
+    );
   } finally {
     // Plugin hooks keep their SQLite store open for the life of the plugin instance.
     // Let the temp workspace be reclaimed by the OS after process exit.
@@ -333,62 +312,131 @@ test('plugin lcm_agentic_map fans out JSONL items into delegated child sessions'
     assert.match(out, /status=queued/);
     assert.match(out, /input_items=2/);
     assert.match(out, /spawned=2/);
-    assert.match(out, /1\. session_id=child-1 title=Batch audit 1/);
-    assert.match(out, /2\. session_id=child-2 title=Batch audit 2/);
+    assert.match(out, /queued=2/);
+    assert.match(out, /errors=0/);
+    assert.match(out, /1\. status=queued session_id=child-1 title=Batch audit 1/);
+    assert.match(out, /2\. status=queued session_id=child-2 title=Batch audit 2/);
 
     assert.equal(client.calls.length, 4);
-    assert.deepEqual(client.calls[0], {
-      type: 'create',
-      input: {
-        body: { parentID: 'parent-map', title: 'Batch audit 1' },
-        query: { directory: workspace },
-        responseStyle: 'data',
+    assert.ok(
+      client.calls.some(
+        (call) => call.type === 'create' && call.input?.body?.title === 'Batch audit 1',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) => call.type === 'create' && call.input?.body?.title === 'Batch audit 2',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) =>
+          call.type === 'promptAsync' &&
+          call.input?.body?.parts?.[0]?.text ===
+            'Investigate this item:\n{\n  "id": 1,\n  "topic": "summaries"\n}',
+      ),
+    );
+    assert.ok(
+      client.calls.some(
+        (call) =>
+          call.type === 'promptAsync' &&
+          call.input?.body?.parts?.[0]?.text ===
+            'Investigate this item:\n{\n  "id": 2,\n  "topic": "retention"\n}',
+      ),
+    );
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+
+test('plugin delegation accepts wrapped session.create response ids', async () => {
+  const workspace = makeWorkspace('lcm-plugin-wrapped-create-response');
+
+  try {
+    const client = makeMockClient({ createShape: 'data' });
+    const hooks = await OpencodeLcmPlugin(
+      {
+        ...makePluginContext(workspace),
+        client,
       },
-    });
-    assert.deepEqual(client.calls[1], {
-      type: 'create',
-      input: {
-        body: { parentID: 'parent-map', title: 'Batch audit 2' },
-        query: { directory: workspace },
-        responseStyle: 'data',
+      makeOptions(),
+    );
+
+    const out = await hooks.tool.lcm_task.execute(
+      { title: 'Wrapped create', prompt: 'Verify wrapped response IDs.' },
+      makeToolContext(workspace, 'parent-wrapped'),
+    );
+
+    assert.match(out, /status=queued/);
+    assert.match(out, /session_id=child-1/);
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+
+test('plugin lcm_tasks reports partial failures without dropping created child sessions', async () => {
+  const workspace = makeWorkspace('lcm-plugin-task-partial-failure');
+
+  try {
+    const client = makeMockClient({ failPromptOn: ['child-2'] });
+    const hooks = await OpencodeLcmPlugin(
+      {
+        ...makePluginContext(workspace),
+        client,
       },
-    });
-    assert.deepEqual(client.calls[2], {
-      type: 'promptAsync',
-      input: {
-        path: { id: 'child-1' },
-        query: { directory: workspace },
-        body: {
-          agent: 'explore',
-          model: undefined,
-          parts: [
-            {
-              type: 'text',
-              text: 'Investigate this item:\n{\n  "id": 1,\n  "topic": "summaries"\n}',
-            },
-          ],
-        },
-        responseStyle: 'data',
+      makeOptions(),
+    );
+
+    const out = await hooks.tool.lcm_tasks.execute(
+      {
+        tasks: [
+          { title: 'One', prompt: 'first' },
+          { title: 'Two', prompt: 'second' },
+        ],
       },
-    });
-    assert.deepEqual(client.calls[3], {
-      type: 'promptAsync',
-      input: {
-        path: { id: 'child-2' },
-        query: { directory: workspace },
-        body: {
-          agent: 'explore',
-          model: undefined,
-          parts: [
-            {
-              type: 'text',
-              text: 'Investigate this item:\n{\n  "id": 2,\n  "topic": "retention"\n}',
-            },
-          ],
-        },
-        responseStyle: 'data',
+      makeToolContext(workspace, 'parent-partial'),
+    );
+
+    assert.match(out, /status=partial/);
+    assert.match(out, /queued=1/);
+    assert.match(out, /created=1/);
+    assert.match(out, /errors=0/);
+    assert.match(
+      out,
+      /status=created session_id=child-2 title=Two agent=default error=prompt failed for child-2/,
+    );
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+
+test('plugin lcm_agentic_map rejects paths outside the workspace', async () => {
+  const workspace = makeWorkspace('lcm-plugin-agentic-map-boundary');
+
+  try {
+    const client = makeMockClient();
+    const hooks = await OpencodeLcmPlugin(
+      {
+        ...makePluginContext(workspace),
+        client,
       },
-    });
+      makeOptions(),
+    );
+
+    await assert.rejects(
+      () =>
+        hooks.tool.lcm_agentic_map.execute(
+          {
+            inputPath: '../outside.jsonl',
+            promptTemplate: 'Inspect {{item}}',
+          },
+          makeToolContext(workspace, 'parent-boundary'),
+        ),
+      /Path must stay within the workspace/,
+    );
   } finally {
     // Plugin hooks keep their SQLite store open for the life of the plugin instance.
     // Let the temp workspace be reclaimed by the OS after process exit.

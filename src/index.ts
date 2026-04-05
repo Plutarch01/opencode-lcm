@@ -1,10 +1,10 @@
 import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 
 import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
 
 import { resolveOptions } from './options.js';
 import { SqliteLcmStore } from './store.js';
+import { resolveWorkspacePath } from './workspace-path.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
 
@@ -30,7 +30,7 @@ async function createDelegatedSession(input: {
   prompt: string;
   agent?: string;
   model?: { providerID: string; modelID: string };
-}): Promise<string> {
+}): Promise<{ sessionID?: string; status: 'queued' | 'created' | 'error'; error?: string }> {
   const created = await input.client.session.create({
     body: {
       parentID: input.parentID,
@@ -40,26 +40,44 @@ async function createDelegatedSession(input: {
     responseStyle: 'data',
   });
 
-  const sessionID = (created as { id?: string } | undefined)?.id;
-  if (!sessionID) throw new Error('Failed to create delegated session.');
+  const result = created as { id?: string; data?: { id?: string } } | undefined;
+  const sessionID = result?.id ?? result?.data?.id;
+  if (!sessionID) {
+    return {
+      status: 'error',
+      error: 'Failed to create delegated session.',
+    };
+  }
 
-  await input.client.session.promptAsync({
-    path: { id: sessionID },
-    query: { directory: input.directory },
-    body: {
-      agent: input.agent,
-      model: input.model,
-      parts: [
-        {
-          type: 'text',
-          text: input.prompt,
-        },
-      ],
-    },
-    responseStyle: 'data',
-  });
+  try {
+    await input.client.session.promptAsync({
+      path: { id: sessionID },
+      query: { directory: input.directory },
+      body: {
+        agent: input.agent,
+        model: input.model,
+        parts: [
+          {
+            type: 'text',
+            text: input.prompt,
+          },
+        ],
+      },
+      responseStyle: 'data',
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      sessionID,
+      status: 'created',
+      error: message,
+    };
+  }
 
-  return sessionID;
+  return {
+    sessionID,
+    status: 'queued',
+  };
 }
 
 function stringifyMapItem(value: unknown): string {
@@ -67,7 +85,7 @@ function stringifyMapItem(value: unknown): string {
 }
 
 async function readJsonlItems(inputPath: string, directory: string): Promise<unknown[]> {
-  const resolvedPath = path.isAbsolute(inputPath) ? inputPath : path.resolve(directory, inputPath);
+  const resolvedPath = resolveWorkspacePath(directory, inputPath);
   const content = await readFile(resolvedPath, 'utf8');
   return content
     .split(/\r?\n/)
@@ -173,7 +191,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             args.providerID && args.modelID
               ? { providerID: args.providerID, modelID: args.modelID }
               : undefined;
-          const sessionID = await createDelegatedSession({
+          const result = await createDelegatedSession({
             client: ctx.client,
             directory: context.directory,
             parentID: context.sessionID,
@@ -184,11 +202,12 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           });
 
           return [
-            'status=queued',
-            `session_id=${sessionID}`,
+            `status=${result.status}`,
+            `session_id=${result.sessionID ?? 'n/a'}`,
             `parent_session_id=${context.sessionID}`,
             `title=${args.title}`,
             `agent=${args.agent ?? 'default'}`,
+            ...(result.error ? [`error=${result.error}`] : []),
           ].join('\n');
         },
       }),
@@ -223,7 +242,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             args.tasks.map(async (task) => ({
               title: task.title,
               agent: task.agent,
-              sessionID: await createDelegatedSession({
+              ...(await createDelegatedSession({
                 client: ctx.client,
                 directory: context.directory,
                 parentID: context.sessionID,
@@ -231,17 +250,24 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
                 prompt: task.prompt,
                 agent: task.agent,
                 model,
-              }),
+              })),
             })),
           );
 
+          const queued = spawned.filter((task) => task.status === 'queued').length;
+          const created = spawned.filter((task) => task.status === 'created').length;
+          const errors = spawned.filter((task) => task.status === 'error').length;
+
           return [
-            `status=queued`,
+            `status=${errors > 0 ? (queued > 0 || created > 0 ? 'partial' : 'error') : created > 0 ? 'partial' : 'queued'}`,
             `parent_session_id=${context.sessionID}`,
             `spawned=${spawned.length}`,
+            `queued=${queued}`,
+            `created=${created}`,
+            `errors=${errors}`,
             ...spawned.map(
               (task, index) =>
-                `${index + 1}. session_id=${task.sessionID} title=${task.title} agent=${task.agent ?? 'default'}`,
+                `${index + 1}. status=${task.status} session_id=${task.sessionID ?? 'n/a'} title=${task.title} agent=${task.agent ?? 'default'}${task.error ? ` error=${task.error}` : ''}`,
             ),
           ].join('\n');
         },
@@ -274,7 +300,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           const spawned = await Promise.all(
             limitedItems.map(async (item, index) => ({
               index: index + 1,
-              sessionID: await createDelegatedSession({
+              ...(await createDelegatedSession({
                 client: ctx.client,
                 directory: context.directory,
                 parentID: context.sessionID,
@@ -282,18 +308,25 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
                 prompt: renderMapPrompt(args.promptTemplate, item),
                 agent: args.agent,
                 model,
-              }),
+              })),
             })),
           );
 
+          const queued = spawned.filter((entry) => entry.status === 'queued').length;
+          const created = spawned.filter((entry) => entry.status === 'created').length;
+          const errors = spawned.filter((entry) => entry.status === 'error').length;
+
           return [
-            'status=queued',
+            `status=${errors > 0 ? (queued > 0 || created > 0 ? 'partial' : 'error') : created > 0 ? 'partial' : 'queued'}`,
             `parent_session_id=${context.sessionID}`,
             `input_items=${items.length}`,
             `spawned=${spawned.length}`,
+            `queued=${queued}`,
+            `created=${created}`,
+            `errors=${errors}`,
             ...spawned.map(
               (entry) =>
-                `${entry.index}. session_id=${entry.sessionID} title=${args.titlePrefix ?? 'Map item'} ${entry.index}`,
+                `${entry.index}. status=${entry.status} session_id=${entry.sessionID ?? 'n/a'} title=${args.titlePrefix ?? 'Map item'} ${entry.index}${entry.error ? ` error=${entry.error}` : ''}`,
             ),
           ].join('\n');
         },

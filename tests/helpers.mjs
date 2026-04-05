@@ -277,19 +277,25 @@ export function makePluginContext(directory) {
   };
 }
 
-export function makeMockClient() {
+export function makeMockClient(options = {}) {
   const calls = [];
   let counter = 0;
+  const createShape = options.createShape ?? 'id';
+  const failPromptOn = new Set(options.failPromptOn ?? []);
   return {
     calls,
     session: {
       async create(input) {
         counter += 1;
         calls.push({ type: 'create', input });
-        return { id: `child-${counter}` };
+        return createShape === 'data'
+          ? { data: { id: `child-${counter}` } }
+          : { id: `child-${counter}` };
       },
       async promptAsync(input) {
         calls.push({ type: 'promptAsync', input });
+        const id = input?.path?.id;
+        if (failPromptOn.has(id)) throw new Error(`prompt failed for ${id}`);
       },
     },
   };
