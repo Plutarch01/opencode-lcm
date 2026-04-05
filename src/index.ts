@@ -1,3 +1,6 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
 
 import { resolveOptions } from './options.js';
@@ -57,6 +60,33 @@ async function createDelegatedSession(input: {
   });
 
   return sessionID;
+}
+
+function stringifyMapItem(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+async function readJsonlItems(inputPath: string, directory: string): Promise<unknown[]> {
+  const resolvedPath = path.isAbsolute(inputPath) ? inputPath : path.resolve(directory, inputPath);
+  const content = await readFile(resolvedPath, 'utf8');
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line) as unknown;
+      } catch {
+        return line;
+      }
+    });
+}
+
+function renderMapPrompt(template: string, item: unknown): string {
+  const serialized = stringifyMapItem(item);
+  return template.includes('{{item}}')
+    ? template.replaceAll('{{item}}', serialized)
+    : `${template}\n\nItem:\n${serialized}`;
 }
 
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
@@ -212,6 +242,58 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             ...spawned.map(
               (task, index) =>
                 `${index + 1}. session_id=${task.sessionID} title=${task.title} agent=${task.agent ?? 'default'}`,
+            ),
+          ].join('\n');
+        },
+      }),
+
+      lcm_agentic_map: tool({
+        description:
+          'Read JSONL items and spawn one OMO/OpenCode-compatible delegated child session per item',
+        args: {
+          inputPath: tool.schema.string().min(1),
+          promptTemplate: tool.schema.string().min(1),
+          titlePrefix: tool.schema.string().min(1).optional(),
+          agent: tool.schema.string().min(1).optional(),
+          providerID: tool.schema.string().min(1).optional(),
+          modelID: tool.schema.string().min(1).optional(),
+          limit: tool.schema.number().int().min(1).max(20).optional(),
+        },
+        async execute(args, context) {
+          if (!hasSessionPromptClient(ctx.client)) {
+            return 'Delegation client unavailable: host session.create/promptAsync support is missing.';
+          }
+
+          const items = await readJsonlItems(args.inputPath, context.directory);
+          const limitedItems = items.slice(0, args.limit ?? items.length);
+          const model =
+            args.providerID && args.modelID
+              ? { providerID: args.providerID, modelID: args.modelID }
+              : undefined;
+
+          const spawned = await Promise.all(
+            limitedItems.map(async (item, index) => ({
+              index: index + 1,
+              sessionID: await createDelegatedSession({
+                client: ctx.client,
+                directory: context.directory,
+                parentID: context.sessionID,
+                title: `${args.titlePrefix ?? 'Map item'} ${index + 1}`,
+                prompt: renderMapPrompt(args.promptTemplate, item),
+                agent: args.agent,
+                model,
+              }),
+            })),
+          );
+
+          return [
+            'status=queued',
+            `parent_session_id=${context.sessionID}`,
+            `input_items=${items.length}`,
+            `spawned=${spawned.length}`,
+            ...spawned.map(
+              (entry) =>
+                `${entry.index}. session_id=${entry.sessionID} title=${args.titlePrefix ?? 'Map item'} ${entry.index}`,
             ),
           ].join('\n');
         },

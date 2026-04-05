@@ -15,6 +15,7 @@ import {
   sessionInfo,
   textPart,
   toolCompletedPart,
+  writeFixtureFile,
 } from './helpers.mjs';
 
 test('resolveOptions normalizes malformed plugin config', () => {
@@ -116,6 +117,7 @@ test('plugin exposes tools, records events, and appends compaction context once'
       toolKeys,
       [
         'lcm_artifact',
+        'lcm_agentic_map',
         'lcm_blob_gc',
         'lcm_blob_stats',
         'lcm_describe',
@@ -248,6 +250,141 @@ test('plugin lcm_task and lcm_tasks map delegation to host child sessions', asyn
           agent: 'explore',
           model: undefined,
           parts: [{ type: 'text', text: 'Find why retrieval drifted after compaction.' }],
+        },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[2], {
+      type: 'create',
+      input: {
+        body: { parentID: 'parent-1', title: 'Audit summaries' },
+        query: { directory: workspace },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[3], {
+      type: 'create',
+      input: {
+        body: { parentID: 'parent-1', title: 'Review retention' },
+        query: { directory: workspace },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[4], {
+      type: 'promptAsync',
+      input: {
+        path: { id: 'child-2' },
+        query: { directory: workspace },
+        body: {
+          agent: 'explore',
+          model: undefined,
+          parts: [{ type: 'text', text: 'Check summary graph integrity.' }],
+        },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[5], {
+      type: 'promptAsync',
+      input: {
+        path: { id: 'child-3' },
+        query: { directory: workspace },
+        body: {
+          agent: undefined,
+          model: undefined,
+          parts: [{ type: 'text', text: 'Review retention pruning edge cases.' }],
+        },
+        responseStyle: 'data',
+      },
+    });
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+
+test('plugin lcm_agentic_map fans out JSONL items into delegated child sessions', async () => {
+  const workspace = makeWorkspace('lcm-plugin-agentic-map');
+
+  try {
+    const client = makeMockClient();
+    const inputPath = writeFixtureFile(
+      workspace,
+      'fixtures/items.jsonl',
+      '{"id":1,"topic":"summaries"}\n{"id":2,"topic":"retention"}\n',
+    );
+    const hooks = await OpencodeLcmPlugin(
+      {
+        ...makePluginContext(workspace),
+        client,
+      },
+      makeOptions(),
+    );
+
+    const out = await hooks.tool.lcm_agentic_map.execute(
+      {
+        inputPath,
+        promptTemplate: 'Investigate this item:\n{{item}}',
+        titlePrefix: 'Batch audit',
+        agent: 'explore',
+      },
+      makeToolContext(workspace, 'parent-map'),
+    );
+
+    assert.match(out, /status=queued/);
+    assert.match(out, /input_items=2/);
+    assert.match(out, /spawned=2/);
+    assert.match(out, /1\. session_id=child-1 title=Batch audit 1/);
+    assert.match(out, /2\. session_id=child-2 title=Batch audit 2/);
+
+    assert.equal(client.calls.length, 4);
+    assert.deepEqual(client.calls[0], {
+      type: 'create',
+      input: {
+        body: { parentID: 'parent-map', title: 'Batch audit 1' },
+        query: { directory: workspace },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[1], {
+      type: 'create',
+      input: {
+        body: { parentID: 'parent-map', title: 'Batch audit 2' },
+        query: { directory: workspace },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[2], {
+      type: 'promptAsync',
+      input: {
+        path: { id: 'child-1' },
+        query: { directory: workspace },
+        body: {
+          agent: 'explore',
+          model: undefined,
+          parts: [
+            {
+              type: 'text',
+              text: 'Investigate this item:\n{\n  "id": 1,\n  "topic": "summaries"\n}',
+            },
+          ],
+        },
+        responseStyle: 'data',
+      },
+    });
+    assert.deepEqual(client.calls[3], {
+      type: 'promptAsync',
+      input: {
+        path: { id: 'child-2' },
+        query: { directory: workspace },
+        body: {
+          agent: 'explore',
+          model: undefined,
+          parts: [
+            {
+              type: 'text',
+              text: 'Investigate this item:\n{\n  "id": 2,\n  "topic": "retention"\n}',
+            },
+          ],
         },
         responseStyle: 'data',
       },
