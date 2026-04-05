@@ -237,3 +237,35 @@ test('plugin system and message transform hooks respect options', async () => {
     // Let the temp workspace be reclaimed by the OS after process exit.
   }
 });
+
+test('plugin ignores malformed message.part.updated events instead of crashing', async () => {
+  const workspace = makeWorkspace('lcm-plugin-malformed-event');
+
+  try {
+    const hooks = await OpencodeLcmPlugin(makePluginContext(workspace), makeOptions());
+
+    await hooks.event({
+      event: {
+        type: 'session.created',
+        properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+      },
+    });
+
+    await assert.doesNotReject(async () => {
+      await hooks.event({
+        event: {
+          type: 'message.part.updated',
+          properties: {},
+        },
+      });
+    });
+
+    const toolContext = makeToolContext(workspace, 's1');
+    const status = await hooks.tool.lcm_status.execute({}, toolContext);
+    assert.match(status, /session_count=1/);
+    assert.doesNotMatch(status, /message\.part\.updated=1/);
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});

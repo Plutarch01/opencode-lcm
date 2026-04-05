@@ -16,6 +16,7 @@ import {
   sessionInfo,
   textPart,
   toolCompletedPart,
+  userInfo,
 } from './helpers.mjs';
 
 test('transformMessages is a no-op below the configured threshold', async () => {
@@ -253,6 +254,99 @@ test('automatic retrieval ignores framing words like "say" and recalls the archi
     assert.match(retrievalPart.text, /Archived hits:/);
     assert.match(retrievalPart.text, /billing cache/);
     assert.ok(!retrievalPart.text.includes('session=s1 id=m4'));
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('automatic retrieval falls back to the stored latest user turn when live anchor has only compacted tool_result', async () => {
+  const workspace = makeWorkspace('lcm-auto-retrieval-tool-result-anchor');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 3 }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, 's1', 1);
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm1',
+      created: 2,
+      parts: [
+        textPart(
+          's1',
+          'm1',
+          'm1-p',
+          'the exact root cause marker ZX729ALBATROSS lives in billing_42',
+        ),
+      ],
+    });
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm2',
+      created: 3,
+      role: 'assistant',
+      parts: [textPart('s1', 'm2', 'm2-p', 'stored')],
+    });
+    await store.capture({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm3', 4) },
+    });
+
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm4',
+      created: 5,
+      role: 'assistant',
+      parts: [textPart('s1', 'm4', 'm4-p', 'noted')],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm1',
+        created: 2,
+        parts: [
+          textPart(
+            's1',
+            'm1',
+            'm1-p',
+            'the exact root cause marker ZX729ALBATROSS lives in billing_42',
+          ),
+        ],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm2',
+        created: 3,
+        role: 'assistant',
+        parts: [textPart('s1', 'm2', 'm2-p', 'stored')],
+      }),
+      {
+        info: { role: 'user', sessionID: 's1' },
+        parts: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_tool_result',
+            content: 'Tool output unavailable (context compacted)',
+          },
+        ],
+      },
+    ];
+
+    const changed = await store.transformMessages(messages);
+    const retrievalPart = messages[2].parts.find(
+      (part) => part.type === 'text' && part.metadata?.opencodeLcm === 'retrieved-context',
+    );
+
+    assert.equal(changed, true);
+    assert.ok(retrievalPart);
+    assert.match(retrievalPart.text, /ZX729ALBATROSS/);
+    assert.ok(!retrievalPart.text.includes('id=m3'));
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);

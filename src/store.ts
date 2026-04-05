@@ -351,9 +351,45 @@ function normalizeEvent(event: unknown): CapturedEvent | null {
   };
 }
 
+function eventPropertiesRecord(event: Event): Record<string, unknown> | undefined {
+  return asRecord(event.properties);
+}
+
+function eventInfoRecord(event: Event): Record<string, unknown> | undefined {
+  return asRecord(eventPropertiesRecord(event)?.info);
+}
+
+function eventPartRecord(event: Event): Record<string, unknown> | undefined {
+  return asRecord(eventPropertiesRecord(event)?.part);
+}
+
+function eventPartSessionID(event: Event): string | undefined {
+  const part = eventPartRecord(event);
+  return typeof part?.sessionID === 'string' ? part.sessionID : undefined;
+}
+
+function eventPartMessageID(event: Event): string | undefined {
+  const part = eventPartRecord(event);
+  return typeof part?.messageID === 'string' ? part.messageID : undefined;
+}
+
+function eventPartID(event: Event): string | undefined {
+  const part = eventPartRecord(event);
+  return typeof part?.id === 'string' ? part.id : undefined;
+}
+
+function eventMessageID(event: Event): string | undefined {
+  const properties = eventPropertiesRecord(event);
+  return typeof properties?.messageID === 'string' ? properties.messageID : undefined;
+}
+
 function getDeferredPartUpdateKey(event: Event): string | undefined {
   if (event.type !== 'message.part.updated') return undefined;
-  return `${event.properties.part.sessionID}:${event.properties.part.messageID}:${event.properties.part.id}`;
+  const sessionID = eventPartSessionID(event);
+  const messageID = eventPartMessageID(event);
+  const partID = eventPartID(event);
+  if (!sessionID || !messageID || !partID) return undefined;
+  return `${sessionID}:${messageID}:${partID}`;
 }
 
 function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
@@ -759,7 +795,7 @@ export class SqliteLcmStore {
 
     for (const [key, event] of this.pendingPartUpdates.entries()) {
       if (event.type !== 'message.part.updated') continue;
-      if (event.properties.part.sessionID !== sessionID) continue;
+      if (eventPartSessionID(event) !== sessionID) continue;
       this.pendingPartUpdates.delete(key);
     }
 
@@ -771,8 +807,8 @@ export class SqliteLcmStore {
 
     for (const [key, event] of this.pendingPartUpdates.entries()) {
       if (event.type !== 'message.part.updated') continue;
-      if (event.properties.part.sessionID !== sessionID) continue;
-      if (event.properties.part.messageID !== messageID) continue;
+      if (eventPartSessionID(event) !== sessionID) continue;
+      if (eventPartMessageID(event) !== messageID) continue;
       this.pendingPartUpdates.delete(key);
     }
 
@@ -793,22 +829,26 @@ export class SqliteLcmStore {
     switch (event.type) {
       case 'message.part.updated': {
         const key = getDeferredPartUpdateKey(event);
-        if (!key) return await this.capture(event);
+        if (!key) return;
         this.pendingPartUpdates.set(key, event);
         this.scheduleDeferredPartUpdateFlush();
         return;
       }
       case 'message.part.removed':
+        {
+          const properties = eventPropertiesRecord(event);
+          const partID = typeof properties?.partID === 'string' ? properties.partID : undefined;
         this.clearDeferredPartUpdateForPart(
-          event.properties.sessionID,
-          event.properties.messageID,
-          event.properties.partID,
+          extractSessionID(event),
+          eventMessageID(event),
+          partID,
         );
+        }
         break;
       case 'message.removed':
         this.clearDeferredPartUpdatesForMessage(
-          event.properties.sessionID,
-          event.properties.messageID,
+          extractSessionID(event),
+          eventMessageID(event),
         );
         break;
       case 'session.deleted':
@@ -1671,11 +1711,16 @@ export class SqliteLcmStore {
     event: CapturedEvent,
   ): boolean {
     const payload = event.payload as Event;
+    const info = eventInfoRecord(payload);
+    const partSessionMessageID = eventPartMessageID(payload);
+    const messageID = eventMessageID(payload);
 
     switch (payload.type) {
       case 'message.updated': {
+        const infoID = typeof info?.id === 'string' ? info.id : undefined;
+        if (!infoID) return false;
         const existing = session.messages.find(
-          (message) => message.info.id === payload.properties.info.id,
+          (message) => message.info.id === infoID,
         );
         if (existing) {
           return this.isMessageArchivedSync(
@@ -1688,19 +1733,21 @@ export class SqliteLcmStore {
         return this.readMessageCountSync(session.sessionID) >= this.options.freshTailMessages;
       }
       case 'message.removed': {
+        if (!messageID) return false;
         const existing = safeQueryOne<{ created_at: number }>(
           this.getDb().prepare(
             'SELECT created_at FROM messages WHERE session_id = ? AND message_id = ?',
           ),
-          [session.sessionID, payload.properties.messageID],
+          [session.sessionID, messageID],
           'shouldSyncDerivedSessionStateForEvent.messageRemoved',
         );
         if (!existing) return false;
         return this.readMessageCountSync(session.sessionID) > this.options.freshTailMessages;
       }
       case 'message.part.updated': {
+        if (!partSessionMessageID) return false;
         const message = session.messages.find(
-          (entry) => entry.info.id === payload.properties.part.messageID,
+          (entry) => entry.info.id === partSessionMessageID,
         );
         if (!message) return false;
         return this.isMessageArchivedSync(
@@ -1710,8 +1757,9 @@ export class SqliteLcmStore {
         );
       }
       case 'message.part.removed': {
+        if (!messageID) return false;
         const message = session.messages.find(
-          (entry) => entry.info.id === payload.properties.messageID,
+          (entry) => entry.info.id === messageID,
         );
         if (!message) return false;
         return this.isMessageArchivedSync(
@@ -2950,7 +2998,7 @@ export class SqliteLcmStore {
   ): Promise<string | undefined> {
     if (!this.options.automaticRetrieval.enabled) return undefined;
 
-    const query = this.buildAutomaticRetrievalQuery(anchor, recent);
+    const query = this.buildAutomaticRetrievalQuery(sessionID, anchor, recent);
     if (!query) return undefined;
 
     const allowedHits =
@@ -2970,7 +3018,16 @@ export class SqliteLcmStore {
       selectedHits: number;
     }> = [];
     let stopReason = 'scope-order-exhausted';
-    let hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+    let hits = this.selectAutomaticRetrievalHits(
+      sessionID,
+      recent,
+      query.tokens,
+      results,
+      query.freshMessageIDs,
+    );
+    if (hits.length === 0 && query.usedFallback) {
+      hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+    }
 
     for (const scope of this.buildAutomaticRetrievalScopeOrder(sessionID)) {
       const budget = this.resolveAutomaticRetrievalScopeBudget(scope);
@@ -3003,7 +3060,16 @@ export class SqliteLcmStore {
           scopeRawResults += 1;
         }
 
-        hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+        hits = this.selectAutomaticRetrievalHits(
+          sessionID,
+          recent,
+          query.tokens,
+          results,
+          query.freshMessageIDs,
+        );
+        if (hits.length === 0 && query.usedFallback) {
+          hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+        }
         scopeSelectedHits += this.countNewAutomaticRetrievalHits(previousHits, hits);
 
         if (hits.length >= allowedHits) {
@@ -3063,19 +3129,26 @@ export class SqliteLcmStore {
   }
 
   private buildAutomaticRetrievalQuery(
+    sessionID: string,
     anchor: ConversationMessage,
     recent: ConversationMessage[],
-  ): { queries: string[]; tokens: string[] } | undefined {
+  ):
+    | { queries: string[]; tokens: string[]; freshMessageIDs: string[]; usedFallback: boolean }
+    | undefined {
     const minTokens = clamp(
       this.options.automaticRetrieval.minTokens,
       1,
       AUTOMATIC_RETRIEVAL_QUERY_TOKENS,
     );
     const tokens: string[] = [];
+    const querySource = this.resolveAutomaticRetrievalQuerySource(sessionID, anchor);
+    const fallbackTitle = querySource.usedFallback
+      ? this.readSessionHeaderSync(sessionID)?.title
+      : undefined;
     const anchorText = sanitizeAutomaticRetrievalSourceText(
-      guessMessageText(anchor, this.options.interop.ignoreToolPrefixes),
+      guessMessageText(querySource.message, this.options.interop.ignoreToolPrefixes),
     );
-    const anchorFiles = listFiles(anchor);
+    const anchorFiles = listFiles(querySource.message);
     const pushTokens = (value?: string) => {
       if (!value || tokens.length >= AUTOMATIC_RETRIEVAL_QUERY_TOKENS) return;
       const sanitized = sanitizeAutomaticRetrievalSourceText(value);
@@ -3087,6 +3160,7 @@ export class SqliteLcmStore {
       }
     };
 
+    pushTokens(fallbackTitle);
     pushTokens(anchorText);
     for (const file of anchorFiles) pushTokens(path.basename(file));
     const anchorSignalCount = tokens.length;
@@ -3126,7 +3200,35 @@ export class SqliteLcmStore {
     return {
       queries: this.buildAutomaticRetrievalQueries(weightedTokens, minTokens),
       tokens: weightedTokens,
+      freshMessageIDs: querySource.usedFallback ? [] : [querySource.message.info.id],
+      usedFallback: querySource.usedFallback,
     };
+  }
+
+  private resolveAutomaticRetrievalQuerySource(
+    sessionID: string,
+    anchor: ConversationMessage,
+  ): { message: ConversationMessage; usedFallback: boolean } {
+    const anchorText = sanitizeAutomaticRetrievalSourceText(
+      guessMessageText(anchor, this.options.interop.ignoreToolPrefixes),
+    );
+    const anchorFiles = listFiles(anchor);
+    if (anchorText || anchorFiles.length > 0) return { message: anchor, usedFallback: false };
+
+    const session = this.readSessionSync(sessionID);
+    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+      const candidate = session.messages[index];
+      if (candidate.info.role !== 'user') continue;
+      const candidateText = sanitizeAutomaticRetrievalSourceText(
+        guessMessageText(candidate, this.options.interop.ignoreToolPrefixes),
+      );
+      const candidateFiles = listFiles(candidate);
+      if (candidateText || candidateFiles.length > 0) {
+        return { message: candidate, usedFallback: true };
+      }
+    }
+
+    return { message: anchor, usedFallback: false };
   }
 
   private buildAutomaticRetrievalQueries(tokens: string[], minTokens: number): string[] {
@@ -3212,9 +3314,12 @@ export class SqliteLcmStore {
     recent: ConversationMessage[],
     tokens: string[],
     results: SearchResult[],
+    additionalFreshMessageIDs: string[] = [],
   ) {
+    const additionalFresh = new Set(additionalFreshMessageIDs.filter(Boolean));
     const filteredResults = results.filter(
-      (result) => !this.isAutomaticRetrievalNoiseResult(result),
+      (result) =>
+        !this.isAutomaticRetrievalNoiseResult(result) && !additionalFresh.has(result.id),
     );
     return selectAutomaticRetrievalHits({
       recent,
@@ -4255,57 +4360,70 @@ export class SqliteLcmStore {
 
   private applyEvent(session: NormalizedSession, event: CapturedEvent): NormalizedSession {
     const payload = event.payload as Event;
+    const info = eventInfoRecord(payload);
+    const messageID = eventMessageID(payload);
+    const part = eventPartRecord(payload) as Part | undefined;
+    const partMessageID = eventPartMessageID(payload);
+    const properties = eventPropertiesRecord(payload);
+    const partID = typeof properties?.partID === 'string' ? properties.partID : undefined;
 
     switch (payload.type) {
       case 'session.created':
       case 'session.updated':
-        session.title = payload.properties.info.title;
-        session.directory = payload.properties.info.directory;
-        session.parentSessionID = payload.properties.info.parentID ?? undefined;
+        if (!info) return session;
+        session.title = typeof info.title === 'string' ? info.title : session.title;
+        session.directory = typeof info.directory === 'string' ? info.directory : session.directory;
+        session.parentSessionID = typeof info.parentID === 'string' ? info.parentID : undefined;
         session.deleted = false;
         return session;
       case 'session.deleted':
-        session.title = payload.properties.info.title;
-        session.directory = payload.properties.info.directory;
-        session.parentSessionID = payload.properties.info.parentID ?? session.parentSessionID;
+        if (!info) return session;
+        session.title = typeof info.title === 'string' ? info.title : session.title;
+        session.directory = typeof info.directory === 'string' ? info.directory : session.directory;
+        session.parentSessionID =
+          typeof info.parentID === 'string' ? info.parentID : session.parentSessionID;
         session.deleted = true;
         return session;
       case 'session.compacted':
         session.compactedAt = event.timestamp;
         return session;
       case 'message.updated': {
+        if (!info || typeof info.id !== 'string') return session;
         const existing = session.messages.find(
-          (message) => message.info.id === payload.properties.info.id,
+          (message) => message.info.id === info.id,
         );
-        if (existing) existing.info = payload.properties.info;
+        if (existing) existing.info = info as Message;
         else {
-          session.messages.push({ info: payload.properties.info, parts: [] });
+          session.messages.push({ info: info as Message, parts: [] });
           session.messages.sort(compareMessages);
         }
         return session;
       }
       case 'message.removed':
+        if (!messageID) return session;
         session.messages = session.messages.filter(
-          (message) => message.info.id !== payload.properties.messageID,
+          (message) => message.info.id !== messageID,
         );
         return session;
       case 'message.part.updated': {
+        if (!part || !partMessageID || typeof part.id !== 'string') return session;
         const message = session.messages.find(
-          (entry) => entry.info.id === payload.properties.part.messageID,
+          (entry) => entry.info.id === partMessageID,
         );
         if (!message) return session;
 
-        const existing = message.parts.findIndex((part) => part.id === payload.properties.part.id);
-        if (existing >= 0) message.parts[existing] = payload.properties.part;
-        else message.parts.push(payload.properties.part);
+        const existing = message.parts.findIndex((entry) => entry.id === part.id);
+        if (existing >= 0) message.parts[existing] = part;
+        else message.parts.push(part);
         return session;
       }
       case 'message.part.removed': {
+        if (!messageID || !partID) return session;
         const message = session.messages.find(
-          (entry) => entry.info.id === payload.properties.messageID,
+          (entry) => entry.info.id === messageID,
         );
         if (!message) return session;
-        message.parts = message.parts.filter((part) => part.id !== payload.properties.partID);
+        message.parts = message.parts.filter((entry) => entry.id !== partID);
         return session;
       }
       default:
