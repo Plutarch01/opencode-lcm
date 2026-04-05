@@ -736,7 +736,6 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
 }
 
 export class SqliteLcmStore {
-  private static readonly deferredPartUpdateDelayMs = 250;
   private readonly baseDir: string;
   private readonly dbPath: string;
   private readonly privacy: CompiledPrivacyOptions;
@@ -772,7 +771,7 @@ export class SqliteLcmStore {
     this.pendingPartUpdateTimer = setTimeout(() => {
       this.pendingPartUpdateTimer = undefined;
       void this.flushDeferredPartUpdates();
-    }, SqliteLcmStore.deferredPartUpdateDelayMs);
+    }, this.options.deferredPartUpdateDelayMs);
 
     if (
       typeof this.pendingPartUpdateTimer === 'object' &&
@@ -838,18 +837,15 @@ export class SqliteLcmStore {
         {
           const properties = eventPropertiesRecord(event);
           const partID = typeof properties?.partID === 'string' ? properties.partID : undefined;
-        this.clearDeferredPartUpdateForPart(
-          extractSessionID(event),
-          eventMessageID(event),
-          partID,
-        );
+          this.clearDeferredPartUpdateForPart(
+            extractSessionID(event),
+            eventMessageID(event),
+            partID,
+          );
         }
         break;
       case 'message.removed':
-        this.clearDeferredPartUpdatesForMessage(
-          extractSessionID(event),
-          eventMessageID(event),
-        );
+        this.clearDeferredPartUpdatesForMessage(extractSessionID(event), eventMessageID(event));
         break;
       case 'session.deleted':
         this.clearDeferredPartUpdatesForSession(extractSessionID(event));
@@ -1719,9 +1715,7 @@ export class SqliteLcmStore {
       case 'message.updated': {
         const infoID = typeof info?.id === 'string' ? info.id : undefined;
         if (!infoID) return false;
-        const existing = session.messages.find(
-          (message) => message.info.id === infoID,
-        );
+        const existing = session.messages.find((message) => message.info.id === infoID);
         if (existing) {
           return this.isMessageArchivedSync(
             session.sessionID,
@@ -1746,9 +1740,7 @@ export class SqliteLcmStore {
       }
       case 'message.part.updated': {
         if (!partSessionMessageID) return false;
-        const message = session.messages.find(
-          (entry) => entry.info.id === partSessionMessageID,
-        );
+        const message = session.messages.find((entry) => entry.info.id === partSessionMessageID);
         if (!message) return false;
         return this.isMessageArchivedSync(
           session.sessionID,
@@ -1758,9 +1750,7 @@ export class SqliteLcmStore {
       }
       case 'message.part.removed': {
         if (!messageID) return false;
-        const message = session.messages.find(
-          (entry) => entry.info.id === messageID,
-        );
+        const message = session.messages.find((entry) => entry.info.id === messageID);
         if (!message) return false;
         return this.isMessageArchivedSync(
           session.sessionID,
@@ -3318,8 +3308,7 @@ export class SqliteLcmStore {
   ) {
     const additionalFresh = new Set(additionalFreshMessageIDs.filter(Boolean));
     const filteredResults = results.filter(
-      (result) =>
-        !this.isAutomaticRetrievalNoiseResult(result) && !additionalFresh.has(result.id),
+      (result) => !this.isAutomaticRetrievalNoiseResult(result) && !additionalFresh.has(result.id),
     );
     return selectAutomaticRetrievalHits({
       recent,
@@ -4389,9 +4378,7 @@ export class SqliteLcmStore {
         return session;
       case 'message.updated': {
         if (!info || typeof info.id !== 'string') return session;
-        const existing = session.messages.find(
-          (message) => message.info.id === info.id,
-        );
+        const existing = session.messages.find((message) => message.info.id === info.id);
         if (existing) existing.info = info as Message;
         else {
           session.messages.push({ info: info as Message, parts: [] });
@@ -4401,15 +4388,11 @@ export class SqliteLcmStore {
       }
       case 'message.removed':
         if (!messageID) return session;
-        session.messages = session.messages.filter(
-          (message) => message.info.id !== messageID,
-        );
+        session.messages = session.messages.filter((message) => message.info.id !== messageID);
         return session;
       case 'message.part.updated': {
         if (!part || !partMessageID || typeof part.id !== 'string') return session;
-        const message = session.messages.find(
-          (entry) => entry.info.id === partMessageID,
-        );
+        const message = session.messages.find((entry) => entry.info.id === partMessageID);
         if (!message) return session;
 
         const existing = message.parts.findIndex((entry) => entry.id === part.id);
@@ -4419,9 +4402,7 @@ export class SqliteLcmStore {
       }
       case 'message.part.removed': {
         if (!messageID || !partID) return session;
-        const message = session.messages.find(
-          (entry) => entry.info.id === messageID,
-        );
+        const message = session.messages.find((entry) => entry.info.id === messageID);
         if (!message) return session;
         message.parts = message.parts.filter((entry) => entry.id !== partID);
         return session;

@@ -65,6 +65,7 @@ export type OpencodeLcmOptions = {
   compactContextLimit: number;
   systemHint: boolean;
   storeDir?: string;
+  deferredPartUpdateDelayMs: number;
   freshTailMessages: number;
   minMessagesForTransform: number;
   summaryCharBudget: number;

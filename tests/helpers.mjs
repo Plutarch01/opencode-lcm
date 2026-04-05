@@ -23,6 +23,7 @@ const BASE_OPTIONS = {
   compactContextLimit: 1200,
   systemHint: true,
   storeDir: '.lcm',
+  deferredPartUpdateDelayMs: 250,
   freshTailMessages: 2,
   minMessagesForTransform: 4,
   summaryCharBudget: 900,

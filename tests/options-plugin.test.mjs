@@ -54,6 +54,7 @@ test('resolveOptions normalizes malformed plugin config', () => {
       stop: { targetHits: -1, stopOnFirstScopeWithHits: true },
     },
     compactContextLimit: Number.NaN,
+    deferredPartUpdateDelayMs: Number.NaN,
     previewBytePeek: Number.NaN,
     systemHint: false,
     binaryPreviewProviders: [],
@@ -94,6 +95,7 @@ test('resolveOptions normalizes malformed plugin config', () => {
     stopOnFirstScopeWithHits: true,
   });
   assert.equal(resolved.compactContextLimit, DEFAULT_OPTIONS.compactContextLimit);
+  assert.equal(resolved.deferredPartUpdateDelayMs, DEFAULT_OPTIONS.deferredPartUpdateDelayMs);
   assert.equal(resolved.previewBytePeek, DEFAULT_OPTIONS.previewBytePeek);
   assert.equal(resolved.systemHint, false);
   assert.deepEqual(resolved.binaryPreviewProviders, DEFAULT_OPTIONS.binaryPreviewProviders);
@@ -158,6 +160,7 @@ test('plugin exposes tools, records events, and appends compaction context once'
     assert.match(status, /automatic_retrieval_scope_budgets=session:16,root:12,worktree:8,all:6/);
     assert.match(status, /automatic_retrieval_stop_target_hits=3/);
     assert.match(status, /automatic_retrieval_stop_on_first_scope_with_hits=false/);
+    assert.match(status, /deferred_part_update_delay_ms=250/);
     assert.match(describe, /Session: s1/);
     assert.match(describe, /plugin hook body/);
     assert.match(doctor, /checked_scope=session:s1/);

@@ -96,7 +96,8 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
         "staleSessionDays": 90,
         "deletedSessionDays": 30,
         "orphanBlobDays": 14
-      }
+      },
+      "deferredPartUpdateDelayMs": 250
     }]
   ]
 }
@@ -144,6 +145,7 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
         "maxSummaryHits": 1,
         "maxArtifactHits": 1
       },
+      "deferredPartUpdateDelayMs": 250,
       "freshTailMessages": 10,
       "minMessagesForTransform": 16,
       "summaryCharBudget": 1500,
@@ -166,6 +168,18 @@ Privacy patterns run before archived content is stored or indexed.
 - **`redactPatterns`** — replace matching content with `[REDACTED]` before storage and indexing
 
 These controls are not encryption and not retroactive. Existing archived rows keep their previous content until rewritten.
+
+## Paper Alignment / OMO Compatibility
+
+`opencode-lcm` implements the paper's memory-layer ideas inside the plugin boundary and maps runtime concerns onto OpenCode/OMO primitives instead of reimplementing a second host runtime.
+
+- **Dual-state memory** — SQLite archive is the immutable store; active prompt context is rebuilt per turn through retrieved context, archive summaries, and compaction resume notes.
+- **Hierarchical summaries** — archived conversation is materialized into a deterministic summary DAG (`summary_nodes`, `summary_edges`, `summary_state`) with stable node IDs and `lcm_expand` reachability.
+- **Large-file handling** — oversized payloads are externalized into artifacts/blobs with previews and recall through `lcm_artifact`.
+- **Escalating retrieval scopes** — automatic recall starts at `session`, then widens to `root` and `worktree`, which is the plugin-safe analogue of broader paper-level context escalation.
+- **Host/runtime features** — orchestration concepts like `Task`, `Tasks`, `llm_map`, and `agentic_map` belong to the OpenCode/OMO runtime. This plugin archives their traces and recalled outputs, but does not replace the host agent scheduler.
+
+For upstream use, treat `opencode-lcm` as the paper-aligned memory substrate for OpenCode/OMO rather than a full reimplementation of the Volt runtime.
 
 ## context-mode Interop
 

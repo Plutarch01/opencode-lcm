@@ -53,6 +53,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `automatic_retrieval_scope_budgets=session:${options.automaticRetrieval.scopeBudgets.session},root:${options.automaticRetrieval.scopeBudgets.root},worktree:${options.automaticRetrieval.scopeBudgets.worktree},all:${options.automaticRetrieval.scopeBudgets.all}`,
             `automatic_retrieval_stop_target_hits=${options.automaticRetrieval.stop.targetHits}`,
             `automatic_retrieval_stop_on_first_scope_with_hits=${options.automaticRetrieval.stop.stopOnFirstScopeWithHits}`,
+            `deferred_part_update_delay_ms=${options.deferredPartUpdateDelayMs}`,
             `fresh_tail_messages=${options.freshTailMessages}`,
             `min_messages_for_transform=${options.minMessagesForTransform}`,
             `large_content_threshold=${options.largeContentThreshold}`,

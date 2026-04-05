@@ -63,6 +63,7 @@ export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   automaticRetrieval: DEFAULT_AUTOMATIC_RETRIEVAL,
   compactContextLimit: 1200,
   systemHint: true,
+  deferredPartUpdateDelayMs: 250,
   freshTailMessages: 10,
   minMessagesForTransform: 16,
   summaryCharBudget: 1500,
@@ -272,6 +273,10 @@ export function resolveOptions(raw: unknown): OpencodeLcmOptions {
       typeof options?.storeDir === 'string' && options.storeDir.length > 0
         ? options.storeDir
         : undefined,
+    deferredPartUpdateDelayMs: asNonNegativeNumber(
+      options?.deferredPartUpdateDelayMs,
+      DEFAULT_OPTIONS.deferredPartUpdateDelayMs,
+    ),
     freshTailMessages: asNumber(options?.freshTailMessages, DEFAULT_OPTIONS.freshTailMessages),
     minMessagesForTransform: asNumber(
       options?.minMessagesForTransform,
