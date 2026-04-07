@@ -338,6 +338,66 @@ function extractTimestamp(event: unknown): number {
   return Date.now();
 }
 
+type MessageValidationContext = {
+  operation: string;
+  sessionID?: string;
+  eventType?: string;
+};
+
+function logMalformedMessage(
+  message: string,
+  context: MessageValidationContext,
+  extra?: Record<string, unknown>,
+): void {
+  getLogger().warn(message, {
+    operation: context.operation,
+    sessionID: context.sessionID,
+    eventType: context.eventType,
+    ...extra,
+  });
+}
+
+function getValidMessageInfo(info: unknown): Message | undefined {
+  const record = asRecord(info);
+  if (!record) return undefined;
+
+  const time = asRecord(record.time);
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.sessionID !== 'string' ||
+    typeof record.role !== 'string' ||
+    typeof time?.created !== 'number' ||
+    !Number.isFinite(time.created)
+  ) {
+    return undefined;
+  }
+
+  return info as Message;
+}
+
+function filterValidConversationMessages(
+  messages: ConversationMessage[],
+  context?: MessageValidationContext,
+): ConversationMessage[] {
+  const valid = messages.filter((message) => Boolean(getValidMessageInfo(message?.info)));
+  const dropped = messages.length - valid.length;
+  if (dropped > 0 && context) {
+    logMalformedMessage('Skipping malformed conversation messages', context, { dropped });
+  }
+  return valid;
+}
+
+function isValidMessagePartUpdate(event: Event): boolean {
+  if (event.type !== 'message.part.updated') return false;
+  const part = asRecord(event.properties.part);
+  if (!part) return false;
+  return (
+    typeof part.id === 'string' &&
+    typeof part.messageID === 'string' &&
+    typeof part.sessionID === 'string'
+  );
+}
+
 function normalizeEvent(event: unknown): CapturedEvent | null {
   const record = asRecord(event);
   if (!record || typeof record.type !== 'string') return null;
@@ -357,7 +417,13 @@ function getDeferredPartUpdateKey(event: Event): string | undefined {
 }
 
 function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
-  return a.info.time.created - b.info.time.created;
+  const aInfo = getValidMessageInfo(a.info);
+  const bInfo = getValidMessageInfo(b.info);
+  if (!aInfo && !bInfo) return 0;
+  if (!aInfo) return 1;
+  if (!bInfo) return -1;
+
+  return aInfo.time.created - bInfo.time.created || aInfo.id.localeCompare(bInfo.id);
 }
 
 function emptySession(sessionID: string): NormalizedSession {
@@ -513,7 +579,9 @@ function listFiles(message: ConversationMessage): string[] {
 function makeSessionTitle(session: NormalizedSession): string | undefined {
   if (session.title) return session.title;
 
-  const firstUser = session.messages.find((message) => message.info.role === 'user');
+  const firstUser = session.messages.find(
+    (message) => getValidMessageInfo(message.info)?.role === 'user',
+  );
   if (!firstUser) return undefined;
 
   return truncate(guessMessageText(firstUser, []), 80);
@@ -1198,6 +1266,8 @@ export class SqliteLcmStore {
       const normalized = normalizeEvent(event);
       if (!normalized) return;
 
+      if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
+
       const shouldRecord = this.shouldRecordEvent(normalized.type);
       const shouldPersistSession =
         Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
@@ -1832,11 +1902,12 @@ export class SqliteLcmStore {
     session: NormalizedSession,
     preserveExistingResume = false,
   ): SummaryNodeData[] {
+    const sanitizedSession = this.sanitizeSessionMessages(session, 'syncDerivedSessionStateSync');
     const roots = this.ensureSummaryGraphSync(
-      session.sessionID,
-      this.getArchivedMessages(session.messages),
+      sanitizedSession.sessionID,
+      this.getArchivedMessages(sanitizedSession.messages),
     );
-    this.writeResumeSync(session, roots, preserveExistingResume);
+    this.writeResumeSync(sanitizedSession, roots, preserveExistingResume);
     return roots;
   }
 
@@ -2989,9 +3060,12 @@ export class SqliteLcmStore {
 
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
     return this.withStoreActivity(async () => {
-      if (messages.length < this.options.minMessagesForTransform) return false;
+      const validMessages = filterValidConversationMessages(messages, {
+        operation: 'transformMessages',
+      });
+      if (validMessages.length < this.options.minMessagesForTransform) return false;
 
-      const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
+      const window = resolveArchiveTransformWindow(validMessages, this.options.freshTailMessages);
       if (!window) return false;
 
       await this.prepareForRead();
@@ -3053,6 +3127,44 @@ export class SqliteLcmStore {
       'Use lcm_describe, lcm_grep, lcm_resume, lcm_expand, or lcm_artifact only when deeper archive inspection is still needed.',
       'Keep ctx_* usage selective and treat those calls as infrastructure, not task intent.',
     ].join(' ');
+  }
+
+  private sanitizeSessionMessages(
+    session: NormalizedSession,
+    operation: string,
+  ): NormalizedSession {
+    const messages = filterValidConversationMessages(session.messages, {
+      operation,
+      sessionID: session.sessionID,
+    });
+    return messages.length === session.messages.length ? session : { ...session, messages };
+  }
+
+  private shouldSkipMalformedCapturedEvent(event: CapturedEvent): boolean {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case 'message.updated': {
+        if (getValidMessageInfo(payload.properties.info)) return false;
+        logMalformedMessage('Skipping malformed message.updated event', {
+          operation: 'capture',
+          sessionID: event.sessionID,
+          eventType: payload.type,
+        });
+        return true;
+      }
+      case 'message.part.updated': {
+        if (isValidMessagePartUpdate(payload)) return false;
+        logMalformedMessage('Skipping malformed message.part.updated event', {
+          operation: 'capture',
+          sessionID: event.sessionID,
+          eventType: payload.type,
+        });
+        return true;
+      }
+      default:
+        return false;
+    }
   }
 
   private async buildAutomaticRetrievalContext(
@@ -4184,10 +4296,22 @@ export class SqliteLcmStore {
   }
 
   private replaceMessageSearchRowsSync(session: NormalizedSession): void {
-    replaceMessageSearchRowsModule(this.searchDeps(), redactStructuredValue(session, this.privacy));
+    const sanitizedSession = this.sanitizeSessionMessages(session, 'replaceMessageSearchRowsSync');
+    replaceMessageSearchRowsModule(
+      this.searchDeps(),
+      redactStructuredValue(sanitizedSession, this.privacy),
+    );
   }
 
   private replaceMessageSearchRowSync(sessionID: string, message: ConversationMessage): void {
+    if (!getValidMessageInfo(message.info)) {
+      logMalformedMessage('Skipping malformed message search row', {
+        operation: 'replaceMessageSearchRowSync',
+        sessionID,
+      });
+      return;
+    }
+
     replaceMessageSearchRowModule(
       this.searchDeps(),
       sessionID,
@@ -4651,7 +4775,10 @@ export class SqliteLcmStore {
     // Build NormalizedSession results
     return sessionIDs.map((sessionID) => {
       const row = sessionMap.get(sessionID);
-      const messages = messagesBySession.get(sessionID) ?? [];
+      const messages = filterValidConversationMessages(messagesBySession.get(sessionID) ?? [], {
+        operation: 'readSessionsBatchSync',
+        sessionID,
+      });
       if (!row) {
         return { ...emptySession(sessionID), messages };
       }
@@ -4693,10 +4820,13 @@ export class SqliteLcmStore {
       partsByMessage.set(partRow.message_id, parts);
     }
 
-    const messages = messageRows.map((messageRow) => ({
-      info: parseJson<Message>(messageRow.info_json),
-      parts: partsByMessage.get(messageRow.message_id) ?? [],
-    }));
+    const messages = filterValidConversationMessages(
+      messageRows.map((messageRow) => ({
+        info: parseJson<Message>(messageRow.info_json),
+        parts: partsByMessage.get(messageRow.message_id) ?? [],
+      })),
+      { operation: 'readSessionSync', sessionID },
+    );
 
     if (!row) {
       return { ...emptySession(sessionID), messages };
@@ -4789,8 +4919,21 @@ export class SqliteLcmStore {
       )
       .all(sessionID, messageID) as PartRow[];
 
+    const info = parseJson<Message>(row.info_json);
+    if (!getValidMessageInfo(info)) {
+      logMalformedMessage(
+        'Skipping malformed stored message',
+        {
+          operation: 'readMessageSync',
+          sessionID,
+        },
+        { messageID },
+      );
+      return undefined;
+    }
+
     return {
-      info: parseJson<Message>(row.info_json),
+      info,
       parts: parts.map((partRow) => {
         const part = parseJson<Part>(partRow.part_json);
         hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
@@ -4952,7 +5095,16 @@ export class SqliteLcmStore {
   }
 
   private upsertMessageInfoSync(sessionID: string, message: ConversationMessage): void {
-    const info = redactStructuredValue(message.info, this.privacy);
+    const validated = getValidMessageInfo(message.info);
+    if (!validated) {
+      logMalformedMessage('Skipping malformed message metadata', {
+        operation: 'upsertMessageInfoSync',
+        sessionID,
+      });
+      return;
+    }
+
+    const info = redactStructuredValue(validated, this.privacy);
     this.getDb()
       .prepare(
         `INSERT INTO messages (message_id, session_id, created_at, info_json)
@@ -5004,7 +5156,10 @@ export class SqliteLcmStore {
   }
 
   private async externalizeSession(session: NormalizedSession): Promise<ExternalizedSession> {
-    return externalizeSessionModule(this.artifactDeps(), session);
+    return externalizeSessionModule(
+      this.artifactDeps(),
+      this.sanitizeSessionMessages(session, 'externalizeSession'),
+    );
   }
 
   private writeEvent(event: CapturedEvent): void {
