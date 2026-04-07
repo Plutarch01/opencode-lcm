@@ -1648,14 +1648,18 @@ test('transformMessages skips malformed messages without required info fields', 
     ];
 
     const changed = await store.transformMessages(messages);
-    const summaryPart = messages[4].parts.find(
+    const summaryPart = messages[3].parts.find(
       (part) => part.type === 'text' && part.metadata?.opencodeLcm === 'archive-summary',
     );
 
     assert.equal(changed, true);
+    assert.equal(messages.length, 4);
+    assert.equal(
+      messages.some((message) => message.info?.id === 'broken-message'),
+      false,
+    );
     assert.ok(summaryPart);
     assert.match(messages[0].parts[0].text, /^\[Archived by opencode-lcm:/);
-    assert.equal(malformed.parts[0].text, 'broken metadata stays visible');
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);

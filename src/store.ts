@@ -3063,9 +3063,12 @@ export class SqliteLcmStore {
       const validMessages = filterValidConversationMessages(messages, {
         operation: 'transformMessages',
       });
-      if (validMessages.length < this.options.minMessagesForTransform) return false;
+      if (validMessages.length !== messages.length) {
+        messages.splice(0, messages.length, ...validMessages);
+      }
+      if (messages.length < this.options.minMessagesForTransform) return false;
 
-      const window = resolveArchiveTransformWindow(validMessages, this.options.freshTailMessages);
+      const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
       if (!window) return false;
 
       await this.prepareForRead();
