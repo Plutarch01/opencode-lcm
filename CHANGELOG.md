@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-04-07
+
+### Fixed
+- Archive transform now removes malformed messages from the outbound message array before returning control to OpenCode, preventing follow-on backend `Bad Request` failures
+- Archive, resume, describe, search indexing, and capture paths now skip malformed `message.info` metadata defensively instead of throwing when required fields are missing
+
 ### Added
 - Opt-in `perf:archive` harness for large-archive regression coverage across transform, grep, snapshot, reopen, resume, and retention paths
 - Separate advisory `Archive Performance` workflow for scheduled/manual perf runs with JSON artifact upload
