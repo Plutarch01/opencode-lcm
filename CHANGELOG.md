@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-04-08
+
+### Fixed
+- Republish of 0.13.1 malformed-message hardening through CI with provenance
+
 ## [0.13.1] - 2026-04-07
 
 ### Fixed
