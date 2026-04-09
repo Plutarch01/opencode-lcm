@@ -296,7 +296,7 @@ export function searchByScan(
         id: message.info.id,
         type: message.info.role,
         sessionID: session.sessionID,
-        timestamp: message.info.time.created,
+        timestamp: message.info?.time?.created ?? 0,
         snippet: buildSnippet(blob, query),
         content: blob,
         sourceKind: 'message',
@@ -361,7 +361,7 @@ function insertMessageSearchRowsSync(deps: FtsDeps, session: NormalizedSession):
       session.sessionID,
       message.info.id,
       message.info.role,
-      String(message.info.time.created),
+      String(message.info?.time?.created ?? 0),
       content,
     );
   }
@@ -380,7 +380,13 @@ export function replaceMessageSearchRowSync(
 
   db.prepare(
     'INSERT INTO message_fts (session_id, message_id, role, created_at, content) VALUES (?, ?, ?, ?, ?)',
-  ).run(sessionID, message.info.id, message.info.role, String(message.info.time.created), content);
+  ).run(
+    sessionID,
+    message.info.id,
+    message.info.role,
+    String(message.info?.time?.created ?? 0),
+    content,
+  );
 }
 
 export function replaceSummarySearchRowsSync(deps: FtsDeps, sessionIDs?: string[]): void {

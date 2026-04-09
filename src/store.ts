@@ -1710,7 +1710,7 @@ export class SqliteLcmStore {
       return issues.length > 0 ? { sessionID: session.sessionID, issues } : undefined;
     }
 
-    const latestMessageCreated = archived.at(-1)?.info.time.created ?? 0;
+    const latestMessageCreated = archived.at(-1)?.info?.time?.created ?? 0;
     const archivedSignature = this.buildArchivedSignature(archived);
     const rootIDs = state ? parseJson<string[]>(state.root_node_ids_json) : [];
     const roots = rootIDs
@@ -1863,7 +1863,7 @@ export class SqliteLcmStore {
           return this.isMessageArchivedSync(
             session.sessionID,
             existing.info.id,
-            existing.info.time.created,
+            existing.info?.time?.created ?? 0,
           );
         }
 
@@ -1888,7 +1888,7 @@ export class SqliteLcmStore {
         return this.isMessageArchivedSync(
           session.sessionID,
           message.info.id,
-          message.info.time.created,
+          message.info?.time?.created ?? 0,
         );
       }
       case 'message.part.removed': {
@@ -1899,7 +1899,7 @@ export class SqliteLcmStore {
         return this.isMessageArchivedSync(
           session.sessionID,
           message.info.id,
-          message.info.time.created,
+          message.info?.time?.created ?? 0,
         );
       }
       default:
@@ -3634,7 +3634,7 @@ export class SqliteLcmStore {
     for (const message of messages) {
       hash.update(message.info.id);
       hash.update(message.info.role);
-      hash.update(String(message.info.time.created));
+      hash.update(String(message.info?.time?.created ?? 0));
       hash.update(guessMessageText(message, this.options.interop.ignoreToolPrefixes));
       hash.update(JSON.stringify(listFiles(message)));
       hash.update(JSON.stringify(this.listTools([message])));
@@ -3665,7 +3665,7 @@ export class SqliteLcmStore {
       return [];
     }
 
-    const latestMessageCreated = archivedMessages.at(-1)?.info.time.created ?? 0;
+    const latestMessageCreated = archivedMessages.at(-1)?.info?.time?.created ?? 0;
     const archivedSignature = this.buildArchivedSignature(archivedMessages);
     const state = safeQueryOne<SummaryStateRow>(
       this.getDb().prepare('SELECT * FROM summary_state WHERE session_id = ?'),
@@ -3905,7 +3905,7 @@ export class SqliteLcmStore {
       ).run(
         sessionID,
         archivedMessages.length,
-        archivedMessages.at(-1)?.info.time.created ?? 0,
+        archivedMessages.at(-1)?.info?.time?.created ?? 0,
         archivedSignature,
         JSON.stringify(roots.map((node) => node.nodeID)),
         now,
