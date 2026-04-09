@@ -261,9 +261,17 @@ test('Bun on Windows keeps part-update capture on the lightweight message path',
   let store;
   const hadBun = 'Bun' in globalThis;
   const previousBun = globalThis.Bun;
+  const previousSqliteRuntime = process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 
   try {
     globalThis.Bun = {};
+    process.env.OPENCODE_LCM_SQLITE_RUNTIME = 'node';
+    Object.defineProperty(process, 'platform', {
+      configurable: true,
+      enumerable: true,
+      value: 'win32',
+    });
     store = new SqliteLcmStore(
       workspace,
       makeOptions({ freshTailMessages: 10, largeContentThreshold: 200 }),
@@ -318,6 +326,14 @@ test('Bun on Windows keeps part-update capture on the lightweight message path',
       new Set(['B'.repeat(360), 'C'.repeat(340)]),
     );
   } finally {
+    if (platformDescriptor) {
+      Object.defineProperty(process, 'platform', platformDescriptor);
+    }
+    if (previousSqliteRuntime === undefined) {
+      delete process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+    } else {
+      process.env.OPENCODE_LCM_SQLITE_RUNTIME = previousSqliteRuntime;
+    }
     if (hadBun) globalThis.Bun = previousBun;
     else delete globalThis.Bun;
     store?.close();
