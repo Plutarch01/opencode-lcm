@@ -255,3 +255,72 @@ test('lineage derives missing root metadata before background refresh runs', asy
     await cleanupWorkspace(workspace);
   }
 });
+
+test('Bun on Windows keeps part-update capture on the lightweight message path', async () => {
+  const workspace = makeWorkspace('lcm-startup-bun-win-part-capture');
+  let store;
+  const hadBun = 'Bun' in globalThis;
+  const previousBun = globalThis.Bun;
+
+  try {
+    globalThis.Bun = {};
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 10, largeContentThreshold: 200 }),
+    );
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm1',
+      created: 2,
+      role: 'assistant',
+      parts: [
+        textPart('s1', 'm1', 'm1-p1', 'A'.repeat(320)),
+        textPart('s1', 'm1', 'm1-p2', 'C'.repeat(340)),
+      ],
+    });
+
+    let fullSessionReads = 0;
+    const hydrateFlags = [];
+    const originalReadSessionSync = store.readSessionSync.bind(store);
+    const originalReadMessageSync = store.readMessageSync.bind(store);
+
+    store.readSessionSync = function (...args) {
+      fullSessionReads += 1;
+      return originalReadSessionSync(...args);
+    };
+    store.readMessageSync = function (sessionID, messageID, options) {
+      hydrateFlags.push(options?.hydrateArtifacts ?? true);
+      return originalReadMessageSync(sessionID, messageID, options);
+    };
+
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 3,
+        part: textPart('s1', 'm1', 'm1-p1', 'B'.repeat(360)),
+      },
+    });
+
+    assert.equal(fullSessionReads, 0);
+    assert.deepEqual(hydrateFlags, [false]);
+
+    const message = originalReadMessageSync('s1', 'm1');
+    assert.equal(message.parts.find((part) => part.id === 'm1-p1')?.text, 'B'.repeat(360));
+    assert.equal(message.parts.find((part) => part.id === 'm1-p2')?.text, 'C'.repeat(340));
+
+    const artifacts = store.readArtifactsForMessageSync('m1');
+    assert.equal(artifacts.length, 2);
+    assert.deepEqual(
+      new Set(artifacts.map((artifact) => artifact.contentText)),
+      new Set(['B'.repeat(360), 'C'.repeat(340)]),
+    );
+  } finally {
+    if (hadBun) globalThis.Bun = previousBun;
+    else delete globalThis.Bun;
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});

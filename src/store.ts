@@ -613,6 +613,9 @@ type CaptureHydrationOptions = {
   isBunRuntime?: boolean;
   platform?: string | undefined;
 };
+type ReadMessageOptions = {
+  hydrateArtifacts?: boolean;
+};
 
 function normalizeSqliteRuntimeOverride(value: string | undefined): SqliteRuntime | 'auto' {
   const normalized = value?.trim().toLowerCase();
@@ -650,6 +653,17 @@ export function resolveCaptureHydrationMode(
   // reported native crashes in this hot path. Keep the older full-session
   // hydration there until Bun/Windows is proven stable again.
   return isBunRuntime && platform === 'win32' ? 'full' : 'targeted';
+}
+
+function shouldUseLightweightPartCapture(
+  event: CapturedEvent,
+  options?: CaptureHydrationOptions,
+): boolean {
+  const isBunRuntime =
+    options?.isBunRuntime ?? (typeof globalThis === 'object' && 'Bun' in globalThis);
+  const platform = options?.platform ?? process.platform;
+  if (!isBunRuntime || platform !== 'win32') return false;
+  return event.type === 'message.part.updated' || event.type === 'message.part.removed';
 }
 
 function isSqliteRuntimeImportError(runtime: SqliteRuntime, error: unknown): boolean {
@@ -1281,8 +1295,9 @@ export class SqliteLcmStore {
 
       if (!normalized.sessionID || !shouldPersistSession) return;
 
-      const session =
-        resolveCaptureHydrationMode() === 'targeted'
+      const session = shouldUseLightweightPartCapture(normalized)
+        ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
+        : resolveCaptureHydrationMode() === 'targeted'
           ? this.readSessionForCaptureSync(normalized)
           : this.readSessionSync(normalized.sessionID);
       const previousParentSessionID = session.parentSessionID;
@@ -4872,7 +4887,10 @@ export class SqliteLcmStore {
     return parentSessionID;
   }
 
-  private readSessionForCaptureSync(event: CapturedEvent): NormalizedSession {
+  private readSessionForCaptureSync(
+    event: CapturedEvent,
+    options?: ReadMessageOptions,
+  ): NormalizedSession {
     const sessionID = event.sessionID;
     if (!sessionID) return emptySession('');
 
@@ -4881,17 +4899,17 @@ export class SqliteLcmStore {
 
     switch (payload.type) {
       case 'message.updated': {
-        const message = this.readMessageSync(sessionID, payload.properties.info.id);
+        const message = this.readMessageSync(sessionID, payload.properties.info.id, options);
         if (message) session.messages = [message];
         return session;
       }
       case 'message.part.updated': {
-        const message = this.readMessageSync(sessionID, payload.properties.part.messageID);
+        const message = this.readMessageSync(sessionID, payload.properties.part.messageID, options);
         if (message) session.messages = [message];
         return session;
       }
       case 'message.part.removed': {
-        const message = this.readMessageSync(sessionID, payload.properties.messageID);
+        const message = this.readMessageSync(sessionID, payload.properties.messageID, options);
         if (message) session.messages = [message];
         return session;
       }
@@ -4900,7 +4918,11 @@ export class SqliteLcmStore {
     }
   }
 
-  private readMessageSync(sessionID: string, messageID: string): ConversationMessage | undefined {
+  private readMessageSync(
+    sessionID: string,
+    messageID: string,
+    options?: ReadMessageOptions,
+  ): ConversationMessage | undefined {
     const db = this.getDb();
     const row = safeQueryOne<MessageRow>(
       db.prepare('SELECT * FROM messages WHERE session_id = ? AND message_id = ?'),
@@ -4909,11 +4931,14 @@ export class SqliteLcmStore {
     );
     if (!row) return undefined;
 
+    const hydrateArtifacts = options?.hydrateArtifacts ?? true;
     const artifactsByPart = new Map<string, ArtifactData[]>();
-    for (const artifact of this.readArtifactsForMessageSync(messageID)) {
-      const list = artifactsByPart.get(artifact.partID) ?? [];
-      list.push(artifact);
-      artifactsByPart.set(artifact.partID, list);
+    if (hydrateArtifacts) {
+      for (const artifact of this.readArtifactsForMessageSync(messageID)) {
+        const list = artifactsByPart.get(artifact.partID) ?? [];
+        list.push(artifact);
+        artifactsByPart.set(artifact.partID, list);
+      }
     }
 
     const parts = db
@@ -4939,7 +4964,7 @@ export class SqliteLcmStore {
       info,
       parts: parts.map((partRow) => {
         const part = parseJson<Part>(partRow.part_json);
-        hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
+        if (hydrateArtifacts) hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
         return part;
       }),
     };
@@ -5002,6 +5027,11 @@ export class SqliteLcmStore {
         const message = session.messages.find(
           (entry) => entry.info.id === payload.properties.part.messageID,
         );
+        const preservedArtifacts = message
+          ? this.readArtifactsForMessageSync(message.info.id).filter(
+              (artifact) => artifact.partID !== payload.properties.part.id,
+            )
+          : [];
         const externalized = message ? await this.externalizeMessage(message) : undefined;
         withTransaction(this.getDb(), 'capture', () => {
           this.upsertSessionRowSync(session);
@@ -5009,7 +5039,7 @@ export class SqliteLcmStore {
             this.replaceStoredMessageSync(
               session.sessionID,
               externalized.storedMessage,
-              externalized.artifacts,
+              [...preservedArtifacts, ...externalized.artifacts],
             );
           }
         });
@@ -5019,6 +5049,11 @@ export class SqliteLcmStore {
         const message = session.messages.find(
           (entry) => entry.info.id === payload.properties.messageID,
         );
+        const preservedArtifacts = message
+          ? this.readArtifactsForMessageSync(message.info.id).filter(
+              (artifact) => artifact.partID !== payload.properties.partID,
+            )
+          : [];
         const externalized = message ? await this.externalizeMessage(message) : undefined;
         withTransaction(this.getDb(), 'capture', () => {
           this.upsertSessionRowSync(session);
@@ -5026,7 +5061,7 @@ export class SqliteLcmStore {
             this.replaceStoredMessageSync(
               session.sessionID,
               externalized.storedMessage,
-              externalized.artifacts,
+              [...preservedArtifacts, ...externalized.artifacts],
             );
           }
         });
