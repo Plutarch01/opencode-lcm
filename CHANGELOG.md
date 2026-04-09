@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-04-09
+
+### Fixed
+- Publish validation now keeps the Bun-on-Windows lightweight capture regression test portable across non-Windows CI runners
+- Republish the current malformed-message and Bun Windows capture fixes to npm after the failed 0.13.3 release check
+
 ## [0.13.3] - 2026-04-09
 
 ### Fixed
