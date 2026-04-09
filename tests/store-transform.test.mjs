@@ -1719,6 +1719,54 @@ test('resume and describe skip stored messages with malformed metadata', async (
   }
 });
 
+test('grep scan fallback skips stored messages with malformed metadata', async () => {
+  const workspace = makeWorkspace('lcm-grep-malformed-info');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+  let store;
+  let db;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await createSession(store, workspace, 's1', 1);
+    for (const [messageID, created, text] of [
+      ['m1', 2, 'fallback => keep this result'],
+      ['m2', 3, 'fallback => skip this result'],
+    ]) {
+      await captureMessage(store, {
+        sessionID: 's1',
+        messageID,
+        created,
+        parts: [textPart('s1', messageID, `${messageID}-p`, text)],
+      });
+    }
+
+    db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.prepare('UPDATE messages SET info_json = ? WHERE session_id = ? AND message_id = ?').run(
+      JSON.stringify({ id: 'm2' }),
+      's1',
+      'm2',
+    );
+    db.close();
+    db = undefined;
+
+    const results = await store.grep({ query: '=>', sessionID: 's1', limit: 5 });
+
+    assert.deepEqual(
+      results.map((result) => result.id),
+      ['m1'],
+    );
+  } finally {
+    db?.close();
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('capture ignores malformed message and part update events', async () => {
   const workspace = makeWorkspace('lcm-capture-malformed-events');
   let store;
