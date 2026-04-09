@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-04-09
+
+### Fixed
+- Bun on Windows now tolerates part-update capture when the parent message has not been materialized yet
+- Additional malformed-message hardening now covers `message.info.time.created` reads and grep scan fallback paths
+- Restored CI-clean formatting after the PR #5 merge so release validation and publish can complete
+
 ## [0.13.2] - 2026-04-08
 
 ### Fixed
