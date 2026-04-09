@@ -5036,11 +5036,10 @@ export class SqliteLcmStore {
         withTransaction(this.getDb(), 'capture', () => {
           this.upsertSessionRowSync(session);
           if (externalized) {
-            this.replaceStoredMessageSync(
-              session.sessionID,
-              externalized.storedMessage,
-              [...preservedArtifacts, ...externalized.artifacts],
-            );
+            this.replaceStoredMessageSync(session.sessionID, externalized.storedMessage, [
+              ...preservedArtifacts,
+              ...externalized.artifacts,
+            ]);
           }
         });
         return;
@@ -5058,11 +5057,10 @@ export class SqliteLcmStore {
         withTransaction(this.getDb(), 'capture', () => {
           this.upsertSessionRowSync(session);
           if (externalized) {
-            this.replaceStoredMessageSync(
-              session.sessionID,
-              externalized.storedMessage,
-              [...preservedArtifacts, ...externalized.artifacts],
-            );
+            this.replaceStoredMessageSync(session.sessionID, externalized.storedMessage, [
+              ...preservedArtifacts,
+              ...externalized.artifacts,
+            ]);
           }
         });
         return;
