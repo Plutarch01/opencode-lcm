@@ -479,7 +479,7 @@ export async function externalizeMessage(
     const { storedPart, artifacts: nextArtifacts } = await externalizePart(
       bindings,
       part,
-      message.info.time.created,
+      message.info?.time?.created ?? 0,
     );
     artifacts.push(...nextArtifacts);
     storedParts.push(storedPart);
@@ -509,7 +509,7 @@ export async function externalizeSession(
       const { storedPart, artifacts: nextArtifacts } = await externalizePart(
         bindings,
         part,
-        message.info.time.created,
+        message.info?.time?.created ?? 0,
       );
       artifacts.push(...nextArtifacts);
       storedParts.push(storedPart);
@@ -607,7 +607,7 @@ export function persistStoredSessionSync(
     insertMessage.run(
       message.info.id,
       storedSession.sessionID,
-      message.info.time.created,
+      message.info?.time?.created ?? 0,
       JSON.stringify(message.info),
     );
 
