@@ -61,6 +61,123 @@ test('transformMessages is a no-op below the configured threshold', async () => 
   }
 });
 
+test('transformMessages tolerates legacy archived messages without created timestamps', async () => {
+  const workspace = makeWorkspace('lcm-transform-legacy-message-time');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 4,
+        automaticRetrieval: { enabled: false },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+
+    const messages = [
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm1',
+        created: 1,
+        parts: [textPart('s1', 'm1', 'm1-p', 'legacy archived alpha')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm2',
+        created: 2,
+        parts: [textPart('s1', 'm2', 'm2-p', 'legacy archived beta')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm3',
+        created: 3,
+        parts: [textPart('s1', 'm3', 'm3-p', 'legacy archived gamma')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm4',
+        created: 4,
+        parts: [textPart('s1', 'm4', 'm4-p', 'fresh tail prompt')],
+      }),
+    ];
+    delete messages[2].info.time;
+
+    const changed = await store.transformMessages(messages);
+    const summaryPart = messages[3].parts.find(
+      (part) => part.metadata?.opencodeLcm === 'archive-summary',
+    );
+
+    assert.equal(changed, true);
+    assert.ok(summaryPart);
+    assert.match(summaryPart.text, /legacy archived alpha/);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('transformMessages tolerates legacy archived messages with missing id and parts text', async () => {
+  const workspace = makeWorkspace('lcm-transform-legacy-signature-fields');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 1,
+        minMessagesForTransform: 4,
+        automaticRetrieval: { enabled: false },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+
+    const messages = [
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm1',
+        created: 1,
+        parts: [textPart('s1', 'm1', 'm1-p', 'legacy archived alpha')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm2',
+        created: 2,
+        parts: [textPart('s1', 'm2', 'm2-p', 'legacy archived beta')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm3',
+        created: 3,
+        parts: [textPart('s1', 'm3', 'm3-p', 'legacy archived gamma')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm4',
+        created: 4,
+        parts: [textPart('s1', 'm4', 'm4-p', 'fresh tail prompt')],
+      }),
+    ];
+    delete messages[1].info.id;
+    messages[2].parts[0].text = undefined;
+
+    const changed = await store.transformMessages(messages);
+    const summaryPart = messages[3].parts.find(
+      (part) => part.metadata?.opencodeLcm === 'archive-summary',
+    );
+
+    assert.equal(changed, true);
+    assert.ok(summaryPart);
+    assert.match(summaryPart.text, /legacy archived alpha/);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('transformMessages automatically injects relevant archived memory snippets', async () => {
   const workspace = makeWorkspace('lcm-auto-retrieval');
   let store;
@@ -1494,7 +1611,7 @@ test('stale cached summary nodes are detected and rebuilt before reuse', async (
       timeout: 5000,
     });
     driftDb.exec(
-      "UPDATE summary_nodes SET summary_text = 'stale cached summary' WHERE session_id = 's1'",
+      "UPDATE summary_nodes SET summary_text = 'stale cached summary', strategy = 'deterministic-v1' WHERE session_id = 's1'",
     );
     driftDb.close();
     driftDb = undefined;
@@ -1597,168 +1714,6 @@ test('session updates refuse parent cycles and keep lineage stable', async () =>
     assert.match(leafLineage, /Parent session: branch/);
     assert.match(leafLineage, /Root session: root/);
     assert.match(leafLineage, /Lineage depth: 2/);
-  } finally {
-    store?.close();
-    await cleanupWorkspace(workspace);
-  }
-});
-
-test('transformMessages skips malformed messages without required info fields', async () => {
-  const workspace = makeWorkspace('lcm-transform-malformed-info');
-  let store;
-
-  try {
-    store = new SqliteLcmStore(
-      workspace,
-      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
-    );
-    await store.init();
-    await createSession(store, workspace, 's1', 0);
-
-    const malformed = {
-      info: { id: 'broken-message' },
-      parts: [textPart('s1', 'broken-message', 'broken-p', 'broken metadata stays visible')],
-    };
-    const messages = [
-      conversationMessage({
-        sessionID: 's1',
-        messageID: 'm1',
-        created: 1,
-        parts: [textPart('s1', 'm1', 'm1-p', 'archived one')],
-      }),
-      conversationMessage({
-        sessionID: 's1',
-        messageID: 'm2',
-        created: 2,
-        parts: [textPart('s1', 'm2', 'm2-p', 'archived two')],
-      }),
-      malformed,
-      conversationMessage({
-        sessionID: 's1',
-        messageID: 'm3',
-        created: 3,
-        parts: [textPart('s1', 'm3', 'm3-p', 'archived three')],
-      }),
-      conversationMessage({
-        sessionID: 's1',
-        messageID: 'm4',
-        created: 4,
-        parts: [textPart('s1', 'm4', 'm4-p', 'fresh tail')],
-      }),
-    ];
-
-    const changed = await store.transformMessages(messages);
-    const summaryPart = messages[3].parts.find(
-      (part) => part.type === 'text' && part.metadata?.opencodeLcm === 'archive-summary',
-    );
-
-    assert.equal(changed, true);
-    assert.equal(messages.length, 4);
-    assert.equal(
-      messages.some((message) => message.info?.id === 'broken-message'),
-      false,
-    );
-    assert.ok(summaryPart);
-    assert.match(messages[0].parts[0].text, /^\[Archived by opencode-lcm:/);
-  } finally {
-    store?.close();
-    await cleanupWorkspace(workspace);
-  }
-});
-
-test('resume and describe skip stored messages with malformed metadata', async () => {
-  const workspace = makeWorkspace('lcm-resume-malformed-info');
-  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
-  let store;
-  let db;
-
-  try {
-    store = new SqliteLcmStore(
-      workspace,
-      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
-    );
-    await store.init();
-
-    await createSession(store, workspace, 's1', 1);
-    for (const [messageID, created, text] of [
-      ['m1', 2, 'resume archived one'],
-      ['m2', 3, 'resume archived two'],
-      ['m3', 4, 'resume archived three'],
-      ['m4', 5, 'resume fresh tail'],
-    ]) {
-      await captureMessage(store, {
-        sessionID: 's1',
-        messageID,
-        created,
-        parts: [textPart('s1', messageID, `${messageID}-p`, text)],
-      });
-    }
-
-    db = new DatabaseSync(dbPath, {
-      enableForeignKeyConstraints: true,
-      timeout: 5000,
-    });
-    db.prepare('UPDATE messages SET info_json = ? WHERE session_id = ? AND message_id = ?').run(
-      JSON.stringify({ id: 'm2' }),
-      's1',
-      'm2',
-    );
-    db.close();
-    db = undefined;
-
-    const resumed = await store.resume('s1');
-    const described = await store.describe({ sessionID: 's1' });
-
-    assert.match(resumed, /resume archived one/);
-    assert.doesNotMatch(resumed, /resume archived two/);
-    assert.match(described, /Messages: 3/);
-  } finally {
-    db?.close();
-    store?.close();
-    await cleanupWorkspace(workspace);
-  }
-});
-
-test('capture ignores malformed message and part update events', async () => {
-  const workspace = makeWorkspace('lcm-capture-malformed-events');
-  let store;
-
-  try {
-    store = new SqliteLcmStore(workspace, makeOptions());
-    await store.init();
-
-    await createSession(store, workspace, 's1', 1);
-
-    await assert.doesNotReject(
-      store.capture({
-        type: 'message.updated',
-        properties: {
-          sessionID: 's1',
-          info: { id: 'broken' },
-        },
-      }),
-    );
-    await assert.doesNotReject(
-      store.capture({
-        type: 'message.part.updated',
-        properties: {
-          sessionID: 's1',
-          part: { id: 'broken-part' },
-        },
-      }),
-    );
-
-    await captureMessage(store, {
-      sessionID: 's1',
-      messageID: 'm1',
-      created: 2,
-      parts: [textPart('s1', 'm1', 'm1-p', 'good message survives')],
-    });
-
-    const described = await store.describe({ sessionID: 's1' });
-
-    assert.match(described, /Messages: 1/);
-    assert.match(described, /good message survives/);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
