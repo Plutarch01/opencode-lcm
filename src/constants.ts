@@ -9,7 +9,7 @@ export const SUMMARY_BRANCH_FACTOR = 3;
 export const SUMMARY_NODE_CHAR_LIMIT = 260;
 
 // Store schema
-export const STORE_SCHEMA_VERSION = 1;
+export const STORE_SCHEMA_VERSION = 2;
 
 // Message retrieval limits
 export const EXPAND_MESSAGE_LIMIT = 6;

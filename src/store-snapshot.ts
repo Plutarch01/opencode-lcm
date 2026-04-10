@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { withTransaction } from './sql-utils.js';
 import type { SqlDatabaseLike } from './store-types.js';
+import type { SummaryStrategyName } from './types.js';
 import { resolveWorkspacePath } from './workspace-path.js';
 import { normalizeWorktreeKey } from './worktree-key.js';
 
@@ -50,6 +51,7 @@ export type SummaryNodeRow = {
   end_index: number;
   message_ids_json: string;
   summary_text: string;
+  strategy: SummaryStrategyName;
   created_at: number;
 };
 
@@ -254,8 +256,8 @@ export async function importStoreSnapshot(
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const insertNode = db.prepare(
-      `INSERT OR REPLACE INTO summary_nodes (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO summary_nodes (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, strategy, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const insertEdge = db.prepare(
       `INSERT OR REPLACE INTO summary_edges (session_id, parent_id, child_id, child_position) VALUES (?, ?, ?, ?)`,
@@ -315,6 +317,7 @@ export async function importStoreSnapshot(
         row.end_index,
         row.message_ids_json,
         row.summary_text,
+        row.strategy,
         row.created_at,
       );
     }
@@ -464,6 +467,10 @@ function parseSummaryNodeRow(value: unknown): SummaryNodeRow {
     end_index: expectNumber(row.end_index, 'summary_nodes[].end_index'),
     message_ids_json: expectString(row.message_ids_json, 'summary_nodes[].message_ids_json'),
     summary_text: expectString(row.summary_text, 'summary_nodes[].summary_text'),
+    strategy: expectString(
+      row.strategy ?? 'deterministic-v1',
+      'summary_nodes[].strategy',
+    ) as SummaryStrategyName,
     created_at: expectNumber(row.created_at, 'summary_nodes[].created_at'),
   };
 }

@@ -3,12 +3,15 @@ import type {
   AutomaticRetrievalScopeBudgets,
   AutomaticRetrievalStopOptions,
   InteropOptions,
+  LlmCliOptions,
   OpencodeLcmOptions,
   PrivacyOptions,
   RetentionPolicyOptions,
   ScopeDefaults,
   ScopeName,
   ScopeProfile,
+  SummaryStrategyName,
+  SummaryV2Options,
 } from './types.js';
 
 const DEFAULT_INTEROP: InteropOptions = {
@@ -54,6 +57,35 @@ const DEFAULT_AUTOMATIC_RETRIEVAL: AutomaticRetrievalOptions = {
   },
 };
 
+export const DEFAULT_SUMMARY_V2: SummaryV2Options = {
+  strategy: 'deterministic-v2',
+  maxChars: 260,
+  includeAllMessages: true,
+  perMessageBudget: 110,
+};
+
+/**
+ * Default LLM CLI backend: `opencode run` using the host's configured provider.
+ *
+ * Two supported invocation patterns:
+ *   1. `opencode run --pure -m <provider/model>` (default) — reuses host config, no extra setup.
+ *      The LCM plugin is disabled via `--pure` to prevent recursive summarization.
+ *   2. Any CLI tool the user installs (llm, ollama, claude) — configured via options overrides.
+ *
+ * Users override via opencode config: `llmCli: { enabled: true, command: 'llm', args: [...], ... }`
+ */
+export const DEFAULT_LLM_CLI: LlmCliOptions = {
+  enabled: false,
+  command: 'opencode',
+  args: ['run', '--pure', '--format', 'default', '-m', '{{MODEL}}'],
+  model: 'anthropic/claude-haiku-4-5',
+  promptMode: 'arg',
+  timeoutMs: 30_000,
+  maxPromptChars: 8_000,
+  fallbackOnError: true,
+  asyncEnhancement: true,
+};
+
 export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   interop: DEFAULT_INTEROP,
   scopeDefaults: DEFAULT_SCOPE_DEFAULTS,
@@ -78,6 +110,8 @@ export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
     'zip-metadata',
   ],
   previewBytePeek: 16,
+  summaryV2: DEFAULT_SUMMARY_V2,
+  llmCli: DEFAULT_LLM_CLI,
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -238,6 +272,46 @@ function asAutomaticRetrievalStopOptions(
   };
 }
 
+function asSummaryStrategy(value: unknown, fallback: SummaryStrategyName): SummaryStrategyName {
+  return value === 'deterministic-v1' || value === 'deterministic-v2' || value === 'llm-cli'
+    ? value
+    : fallback;
+}
+
+function asSummaryV2Options(value: unknown, fallback: SummaryV2Options): SummaryV2Options {
+  const record = asRecord(value);
+  return {
+    strategy: asSummaryStrategy(record?.strategy, fallback.strategy),
+    maxChars: asNumber(record?.maxChars, fallback.maxChars),
+    includeAllMessages: asBoolean(record?.includeAllMessages, fallback.includeAllMessages),
+    perMessageBudget: asNumber(record?.perMessageBudget, fallback.perMessageBudget),
+  };
+}
+
+function asLlmCliOptions(value: unknown, fallback: LlmCliOptions): LlmCliOptions {
+  const record = asRecord(value);
+  return {
+    enabled: asBoolean(record?.enabled, fallback.enabled),
+    command:
+      typeof record?.command === 'string' && record.command.length > 0
+        ? record.command
+        : fallback.command,
+    args: asStringArray(record?.args, fallback.args),
+    model:
+      typeof record?.model === 'string' && record.model.length > 0 ? record.model : fallback.model,
+    promptMode:
+      record?.promptMode === 'stdin'
+        ? 'stdin'
+        : record?.promptMode === 'arg'
+          ? 'arg'
+          : fallback.promptMode,
+    timeoutMs: asNonNegativeNumber(record?.timeoutMs, fallback.timeoutMs),
+    maxPromptChars: asNonNegativeNumber(record?.maxPromptChars, fallback.maxPromptChars),
+    fallbackOnError: asBoolean(record?.fallbackOnError, fallback.fallbackOnError),
+    asyncEnhancement: asBoolean(record?.asyncEnhancement, fallback.asyncEnhancement),
+  };
+}
+
 export function resolveOptions(raw: unknown): OpencodeLcmOptions {
   const options = asRecord(raw);
   const interop = asRecord(options?.interop);
@@ -293,5 +367,7 @@ export function resolveOptions(raw: unknown): OpencodeLcmOptions {
       DEFAULT_OPTIONS.binaryPreviewProviders,
     ),
     previewBytePeek: asNumber(options?.previewBytePeek, DEFAULT_OPTIONS.previewBytePeek),
+    summaryV2: asSummaryV2Options(options?.summaryV2, DEFAULT_SUMMARY_V2),
+    llmCli: asLlmCliOptions(options?.llmCli, DEFAULT_LLM_CLI),
   };
 }
