@@ -79,7 +79,7 @@ async function seedSession(store, workspace, sessionID = 's1') {
     messageID: 'm5',
     created: 6,
     role: 'user',
-    parts: [textPart(sessionID, 'm5', 'm5-p1', 'Test invoke-cli failures.')],
+    parts: [textPart(sessionID, 'm5', 'm5-p1', 'Test summary error handling.')],
   });
   await captureMessage(store, {
     sessionID,

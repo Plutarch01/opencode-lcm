@@ -55,30 +55,11 @@ export type AutomaticRetrievalOptions = {
   stop: AutomaticRetrievalStopOptions;
 };
 
-export type SummaryStrategyName = 'deterministic-v1' | 'deterministic-v2' | 'llm-cli';
+export type SummaryStrategyName = 'deterministic-v1' | 'deterministic-v2';
 
 export type SummaryV2Options = {
   strategy: SummaryStrategyName;
-  maxChars: number;
-  includeAllMessages: boolean;
   perMessageBudget: number;
-};
-
-export type LlmCliOptions = {
-  enabled: boolean;
-  command: string;
-  args: string[];
-  model: string;
-  /**
-   * How the prompt is delivered to the CLI command.
-   * - 'arg': prompt is appended as the final positional argument (default for `opencode run`).
-   * - 'stdin': prompt is piped via stdin (default for `llm`, `ollama`, `claude` etc).
-   */
-  promptMode: 'arg' | 'stdin';
-  timeoutMs: number;
-  maxPromptChars: number;
-  fallbackOnError: boolean;
-  asyncEnhancement: boolean;
 };
 
 export type OpencodeLcmOptions = {
@@ -101,7 +82,6 @@ export type OpencodeLcmOptions = {
   binaryPreviewProviders: string[];
   previewBytePeek: number;
   summaryV2: SummaryV2Options;
-  llmCli: LlmCliOptions;
 };
 
 export type CapturedEvent = {
