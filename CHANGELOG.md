@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-04-11
+
+### Fixed
+- Restored schema-v2 compatibility for persisted stores after the PR #6 merge
+- Removed the unfinished `llm-cli` summary configuration surface before shipping it
+- Restored Biome-clean formatting so the full cross-platform CI matrix passes again
+
 ## [0.13.4] - 2026-04-09
 
 ### Fixed
