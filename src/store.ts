@@ -71,8 +71,8 @@ import type {
   OpencodeLcmOptions,
   ScopeName,
   SearchResult,
-  SummaryStrategyName,
   StoreStats,
+  SummaryStrategyName,
 } from './types.js';
 import {
   asRecord,

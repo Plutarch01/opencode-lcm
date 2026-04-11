@@ -294,11 +294,11 @@ test('Bun on Windows keeps part-update capture on the lightweight message path',
     const originalReadSessionSync = store.readSessionSync.bind(store);
     const originalReadMessageSync = store.readMessageSync.bind(store);
 
-    store.readSessionSync = function (...args) {
+    store.readSessionSync = (...args) => {
       fullSessionReads += 1;
       return originalReadSessionSync(...args);
     };
-    store.readMessageSync = function (sessionID, messageID, options) {
+    store.readMessageSync = (sessionID, messageID, options) => {
       hydrateFlags.push(options?.hydrateArtifacts ?? true);
       return originalReadMessageSync(sessionID, messageID, options);
     };
