@@ -161,7 +161,7 @@ test('init stamps the current schema version on disk', async () => {
     await store.init();
 
     const stats = await store.stats();
-    assert.equal(stats.schemaVersion, 1);
+    assert.equal(stats.schemaVersion, 2);
 
     store.close();
     store = undefined;
@@ -173,7 +173,7 @@ test('init stamps the current schema version on disk', async () => {
     const versionRow = db.prepare('PRAGMA user_version').get();
     db.close();
 
-    assert.equal(Object.values(versionRow)[0], 1);
+    assert.equal(Object.values(versionRow)[0], 2);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
@@ -211,7 +211,7 @@ test('init is lazy and does not create the database until first operation', asyn
     await store.init();
 
     const stats = await store.stats();
-    assert.equal(stats.schemaVersion, 1);
+    assert.equal(stats.schemaVersion, 2);
     assert.equal(existsSync(path.join(workspace, '.lcm', 'lcm.db')), true);
   } finally {
     store?.close();

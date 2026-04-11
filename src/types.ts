@@ -55,6 +55,13 @@ export type AutomaticRetrievalOptions = {
   stop: AutomaticRetrievalStopOptions;
 };
 
+export type SummaryStrategyName = 'deterministic-v1' | 'deterministic-v2';
+
+export type SummaryV2Options = {
+  strategy: SummaryStrategyName;
+  perMessageBudget: number;
+};
+
 export type OpencodeLcmOptions = {
   interop: InteropOptions;
   scopeDefaults: ScopeDefaults;
@@ -74,6 +81,7 @@ export type OpencodeLcmOptions = {
   artifactViewChars: number;
   binaryPreviewProviders: string[];
   previewBytePeek: number;
+  summaryV2: SummaryV2Options;
 };
 
 export type CapturedEvent = {

@@ -9,6 +9,8 @@ import type {
   ScopeDefaults,
   ScopeName,
   ScopeProfile,
+  SummaryStrategyName,
+  SummaryV2Options,
 } from './types.js';
 
 const DEFAULT_INTEROP: InteropOptions = {
@@ -54,6 +56,11 @@ const DEFAULT_AUTOMATIC_RETRIEVAL: AutomaticRetrievalOptions = {
   },
 };
 
+export const DEFAULT_SUMMARY_V2: SummaryV2Options = {
+  strategy: 'deterministic-v2',
+  perMessageBudget: 110,
+};
+
 export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   interop: DEFAULT_INTEROP,
   scopeDefaults: DEFAULT_SCOPE_DEFAULTS,
@@ -78,6 +85,7 @@ export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
     'zip-metadata',
   ],
   previewBytePeek: 16,
+  summaryV2: DEFAULT_SUMMARY_V2,
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -238,6 +246,18 @@ function asAutomaticRetrievalStopOptions(
   };
 }
 
+function asSummaryStrategy(value: unknown, fallback: SummaryStrategyName): SummaryStrategyName {
+  return value === 'deterministic-v1' || value === 'deterministic-v2' ? value : fallback;
+}
+
+function asSummaryV2Options(value: unknown, fallback: SummaryV2Options): SummaryV2Options {
+  const record = asRecord(value);
+  return {
+    strategy: asSummaryStrategy(record?.strategy, fallback.strategy),
+    perMessageBudget: asNumber(record?.perMessageBudget, fallback.perMessageBudget),
+  };
+}
+
 export function resolveOptions(raw: unknown): OpencodeLcmOptions {
   const options = asRecord(raw);
   const interop = asRecord(options?.interop);
@@ -293,5 +313,6 @@ export function resolveOptions(raw: unknown): OpencodeLcmOptions {
       DEFAULT_OPTIONS.binaryPreviewProviders,
     ),
     previewBytePeek: asNumber(options?.previewBytePeek, DEFAULT_OPTIONS.previewBytePeek),
+    summaryV2: asSummaryV2Options(options?.summaryV2, DEFAULT_SUMMARY_V2),
   };
 }
