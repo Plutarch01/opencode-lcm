@@ -57,6 +57,10 @@ test('resolveOptions normalizes malformed plugin config', () => {
     previewBytePeek: Number.NaN,
     systemHint: false,
     binaryPreviewProviders: [],
+    summaryV2: {
+      strategy: 'bogus',
+      perMessageBudget: 90,
+    },
   });
 
   assert.equal(resolved.interop.contextMode, false);
@@ -97,6 +101,10 @@ test('resolveOptions normalizes malformed plugin config', () => {
   assert.equal(resolved.previewBytePeek, DEFAULT_OPTIONS.previewBytePeek);
   assert.equal(resolved.systemHint, false);
   assert.deepEqual(resolved.binaryPreviewProviders, DEFAULT_OPTIONS.binaryPreviewProviders);
+  assert.deepEqual(resolved.summaryV2, {
+    strategy: DEFAULT_OPTIONS.summaryV2.strategy,
+    perMessageBudget: 90,
+  });
 });
 
 test('plugin exposes tools, records events, and appends compaction context once', async () => {
@@ -152,7 +160,7 @@ test('plugin exposes tools, records events, and appends compaction context once'
     const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
     const doctor = await hooks.tool.lcm_doctor.execute({ sessionID: 's1' }, toolContext);
 
-    assert.match(status, /schema_version=1/);
+    assert.match(status, /schema_version=2/);
     assert.match(status, /session_count=1/);
     assert.match(status, /automatic_retrieval_scope_order=session,root,worktree/);
     assert.match(status, /automatic_retrieval_scope_budgets=session:16,root:12,worktree:8,all:6/);

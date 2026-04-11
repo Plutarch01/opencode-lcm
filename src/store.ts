@@ -71,6 +71,7 @@ import type {
   OpencodeLcmOptions,
   ScopeName,
   SearchResult,
+  SummaryStrategyName,
   StoreStats,
 } from './types.js';
 import {
@@ -101,6 +102,7 @@ type SummaryNodeData = {
   endIndex: number;
   messageIDs: string[];
   summaryText: string;
+  strategy: SummaryStrategyName;
   createdAt: number;
 };
 
@@ -379,6 +381,7 @@ function filterValidConversationMessages(
   messages: ConversationMessage[],
   context?: MessageValidationContext,
 ): ConversationMessage[] {
+  if (context?.operation === 'transformMessages') return messages;
   const valid = messages.filter((message) => Boolean(getValidMessageInfo(message?.info)));
   const dropped = messages.length - valid.length;
   if (dropped > 0 && context) {
@@ -416,14 +419,21 @@ function getDeferredPartUpdateKey(event: Event): string | undefined {
   return `${event.properties.part.sessionID}:${event.properties.part.messageID}:${event.properties.part.id}`;
 }
 
-function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
-  const aInfo = getValidMessageInfo(a.info);
-  const bInfo = getValidMessageInfo(b.info);
-  if (!aInfo && !bInfo) return 0;
-  if (!aInfo) return 1;
-  if (!bInfo) return -1;
+function messageCreatedAt(message: ConversationMessage | undefined): number {
+  const created = message?.info?.time?.created;
+  return typeof created === 'number' && Number.isFinite(created) ? created : 0;
+}
 
-  return aInfo.time.created - bInfo.time.created || aInfo.id.localeCompare(bInfo.id);
+function messageParts(message: ConversationMessage | undefined): Part[] {
+  return Array.isArray(message?.parts) ? message.parts : [];
+}
+
+function signatureString(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
+  return messageCreatedAt(a) - messageCreatedAt(b);
 }
 
 function emptySession(sessionID: string): NormalizedSession {
@@ -501,19 +511,21 @@ function isSyntheticLcmTextPart(part: Part, markers?: string[]): boolean {
 function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: string[]): string {
   const segments: string[] = [];
 
-  for (const part of message.parts) {
+  for (const part of messageParts(message)) {
     switch (part.type) {
       case 'text': {
         if (isSyntheticLcmTextPart(part, ['archive-summary', 'retrieved-context', 'archived-part']))
           break;
-        if (part.text.startsWith('[Archived by opencode-lcm:')) break;
-        const sanitized = sanitizeAutomaticRetrievalSourceText(part.text);
+        const text = typeof part.text === 'string' ? part.text : '';
+        if (text.startsWith('[Archived by opencode-lcm:')) break;
+        const sanitized = sanitizeAutomaticRetrievalSourceText(text);
         if (sanitized) segments.push(sanitized);
         break;
       }
       case 'reasoning': {
-        if (part.text.startsWith('[Archived by opencode-lcm:')) break;
-        const sanitized = sanitizeAutomaticRetrievalSourceText(part.text);
+        const text = typeof part.text === 'string' ? part.text : '';
+        if (text.startsWith('[Archived by opencode-lcm:')) break;
+        const sanitized = sanitizeAutomaticRetrievalSourceText(text);
         if (sanitized) segments.push(sanitized);
         break;
       }
@@ -525,12 +537,13 @@ function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: stri
         break;
       }
       case 'tool': {
-        if (ignoreToolPrefixes.some((prefix) => part.tool.startsWith(prefix))) break;
+        const toolName = typeof part.tool === 'string' ? part.tool : '';
+        if (ignoreToolPrefixes.some((prefix) => toolName.startsWith(prefix))) break;
         const state = part.state;
-        if (state.status === 'completed') segments.push(`${part.tool}: ${state.output}`);
-        if (state.status === 'error') segments.push(`${part.tool}: ${state.error}`);
+        if (state.status === 'completed') segments.push(`${toolName}: ${state.output}`);
+        if (state.status === 'error') segments.push(`${toolName}: ${state.error}`);
         if (state.status === 'pending' || state.status === 'running') {
-          segments.push(`${part.tool}: ${JSON.stringify(state.input)}`);
+          segments.push(`${toolName}: ${JSON.stringify(state.input)}`);
         }
         if (state.status === 'completed' && state.attachments && state.attachments.length > 0) {
           const attachmentNames = state.attachments
@@ -538,7 +551,7 @@ function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: stri
             .filter(Boolean)
             .slice(0, 4);
           if (attachmentNames.length > 0)
-            segments.push(`${part.tool} attachments: ${attachmentNames.join(', ')}`);
+            segments.push(`${toolName} attachments: ${attachmentNames.join(', ')}`);
         }
         break;
       }
@@ -1065,6 +1078,7 @@ export class SqliteLcmStore {
         end_index INTEGER NOT NULL,
         message_ids_json TEXT NOT NULL,
         summary_text TEXT NOT NULL,
+        strategy TEXT NOT NULL DEFAULT 'deterministic-v1',
         created_at INTEGER NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
       );
@@ -1121,6 +1135,7 @@ export class SqliteLcmStore {
 
       this.ensureSessionColumnsSync();
       this.ensureSummaryStateColumnsSync();
+      this.ensureSummaryNodeColumnsSync();
       this.ensureArtifactColumnsSync();
       logStartupPhase('open-db:create-indexes');
       db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)');
@@ -1710,7 +1725,7 @@ export class SqliteLcmStore {
       return issues.length > 0 ? { sessionID: session.sessionID, issues } : undefined;
     }
 
-    const latestMessageCreated = archived.at(-1)?.info?.time?.created ?? 0;
+    const latestMessageCreated = messageCreatedAt(archived.at(-1));
     const archivedSignature = this.buildArchivedSignature(archived);
     const rootIDs = state ? parseJson<string[]>(state.root_node_ids_json) : [];
     const roots = rootIDs
@@ -1863,7 +1878,7 @@ export class SqliteLcmStore {
           return this.isMessageArchivedSync(
             session.sessionID,
             existing.info.id,
-            existing.info?.time?.created ?? 0,
+            messageCreatedAt(existing),
           );
         }
 
@@ -1888,7 +1903,7 @@ export class SqliteLcmStore {
         return this.isMessageArchivedSync(
           session.sessionID,
           message.info.id,
-          message.info?.time?.created ?? 0,
+          messageCreatedAt(message),
         );
       }
       case 'message.part.removed': {
@@ -1899,7 +1914,7 @@ export class SqliteLcmStore {
         return this.isMessageArchivedSync(
           session.sessionID,
           message.info.id,
-          message.info?.time?.created ?? 0,
+          messageCreatedAt(message),
         );
       }
       default:
@@ -3589,6 +3604,16 @@ export class SqliteLcmStore {
     messages: ConversationMessage[],
     limit = SUMMARY_NODE_CHAR_LIMIT,
   ): string {
+    const strategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
+    return strategy === 'deterministic-v2'
+      ? this.summarizeMessagesDeterministicV2(messages, limit)
+      : this.summarizeMessagesDeterministicV1(messages, limit);
+  }
+
+  private summarizeMessagesDeterministicV1(
+    messages: ConversationMessage[],
+    limit = SUMMARY_NODE_CHAR_LIMIT,
+  ): string {
     const goals = messages
       .filter((message) => message.info.role === 'user')
       .map((message) => guessMessageText(message, this.options.interop.ignoreToolPrefixes))
@@ -3617,6 +3642,71 @@ export class SqliteLcmStore {
     return truncate(segments.join(' || '), limit);
   }
 
+  private summarizeMessagesDeterministicV2(
+    messages: ConversationMessage[],
+    limit = SUMMARY_NODE_CHAR_LIMIT,
+  ): string {
+    const perMsgBudget = this.options.summaryV2?.perMessageBudget ?? 110;
+    const ignoreToolPrefixes = this.options.interop.ignoreToolPrefixes;
+    const userTexts = messages
+      .filter((message) => message.info.role === 'user')
+      .map((message) => guessMessageText(message, ignoreToolPrefixes))
+      .filter(Boolean);
+    const assistantTexts = messages
+      .filter((message) => message.info.role === 'assistant')
+      .map((message) => guessMessageText(message, ignoreToolPrefixes))
+      .filter(Boolean);
+    const allFiles = [...new Set(messages.flatMap(listFiles))];
+    const allTools = [...new Set(this.listTools(messages))];
+    const hasErrors = messages.some((message) =>
+      message.parts.some(
+        (part) =>
+          (part.type === 'tool' && 'state' in part && part.state?.status === 'error') ||
+          (part.type === 'text' &&
+            /\b(?:error|exception|fail(?:ed|ure)?)\b/i.test(part.text ?? '')),
+      ),
+    );
+
+    const segments: string[] = [];
+    if (userTexts.length > 0) {
+      const first = truncate(userTexts[0], perMsgBudget);
+      if (userTexts.length > 1) {
+        const last = truncate(userTexts[userTexts.length - 1], perMsgBudget);
+        segments.push(`Goals: ${first} → ${last}`);
+      } else {
+        segments.push(`Goals: ${first}`);
+      }
+    }
+
+    if (assistantTexts.length > 0) {
+      const recent = assistantTexts
+        .slice(-2)
+        .map((text) => truncate(text, perMsgBudget))
+        .join(' | ');
+      segments.push(`Work: ${recent}`);
+    }
+
+    if (allFiles.length > 0) {
+      const shown = allFiles.slice(0, 6).join(', ');
+      segments.push(
+        allFiles.length > 6 ? `Files[${allFiles.length}]: ${shown}` : `Files: ${shown}`,
+      );
+    }
+
+    if (allTools.length > 0) {
+      const shown = allTools.slice(0, 6).join(', ');
+      segments.push(
+        allTools.length > 6 ? `Tools[${allTools.length}]: ${shown}` : `Tools: ${shown}`,
+      );
+    }
+
+    if (hasErrors) segments.push('⚠err');
+    segments.push(`${messages.length}msg(u:${userTexts.length}/a:${assistantTexts.length})`);
+
+    if (segments.length === 0) return truncate(`Archived ${messages.length} messages`, limit);
+    return truncate(segments.join(' || '), limit);
+  }
+
   private listTools(messages: ConversationMessage[]): string[] {
     const tools: string[] = [];
     for (const message of messages) {
@@ -3632,13 +3722,13 @@ export class SqliteLcmStore {
   private buildArchivedSignature(messages: ConversationMessage[]): string {
     const hash = createHash('sha256');
     for (const message of messages) {
-      hash.update(message.info.id);
-      hash.update(message.info.role);
-      hash.update(String(message.info?.time?.created ?? 0));
-      hash.update(guessMessageText(message, this.options.interop.ignoreToolPrefixes));
+      hash.update(signatureString(message.info?.id, 'unknown-message'));
+      hash.update(signatureString(message.info?.role, 'unknown-role'));
+      hash.update(String(messageCreatedAt(message)));
+      hash.update(String(guessMessageText(message, this.options.interop.ignoreToolPrefixes) ?? ''));
       hash.update(JSON.stringify(listFiles(message)));
       hash.update(JSON.stringify(this.listTools([message])));
-      hash.update(String(message.parts.length));
+      hash.update(String(messageParts(message).length));
     }
     return hash.digest('hex');
   }
@@ -3665,7 +3755,7 @@ export class SqliteLcmStore {
       return [];
     }
 
-    const latestMessageCreated = archivedMessages.at(-1)?.info?.time?.created ?? 0;
+    const latestMessageCreated = messageCreatedAt(archivedMessages.at(-1));
     const archivedSignature = this.buildArchivedSignature(archivedMessages);
     const state = safeQueryOne<SummaryStateRow>(
       this.getDb().prepare('SELECT * FROM summary_state WHERE session_id = ?'),
@@ -3729,6 +3819,7 @@ export class SqliteLcmStore {
         archivedMessages.slice(node.startIndex, node.endIndex + 1),
       );
       if (node.summaryText !== expectedSummaryText) return false;
+      if (node.strategy !== (this.options.summaryV2?.strategy ?? 'deterministic-v1')) return false;
 
       const children = this.readSummaryChildrenSync(node.nodeID);
       if (node.nodeKind === 'leaf') {
@@ -3768,6 +3859,7 @@ export class SqliteLcmStore {
     archivedSignature: string,
   ): SummaryNodeData[] {
     const now = Date.now();
+    const summaryStrategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
     let level = 0;
     const nodes: SummaryNodeData[] = [];
     const edges: Array<{
@@ -3794,6 +3886,7 @@ export class SqliteLcmStore {
       endIndex: input.endIndex,
       messageIDs: input.messageIDs,
       summaryText: input.summaryText,
+      strategy: summaryStrategy,
       createdAt: now,
     });
 
@@ -3857,8 +3950,8 @@ export class SqliteLcmStore {
 
       const insertNode = db.prepare(
         `INSERT INTO summary_nodes
-         (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, strategy, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const insertEdge = db.prepare(
         `INSERT INTO summary_edges (session_id, parent_id, child_id, child_position)
@@ -3878,6 +3971,7 @@ export class SqliteLcmStore {
           node.endIndex,
           JSON.stringify(node.messageIDs),
           node.summaryText,
+          node.strategy,
           node.createdAt,
         );
         insertSummaryFts.run(
@@ -3905,7 +3999,7 @@ export class SqliteLcmStore {
       ).run(
         sessionID,
         archivedMessages.length,
-        archivedMessages.at(-1)?.info?.time?.created ?? 0,
+        messageCreatedAt(archivedMessages.at(-1)),
         archivedSignature,
         JSON.stringify(roots.map((node) => node.nodeID)),
         now,
@@ -3932,6 +4026,7 @@ export class SqliteLcmStore {
       endIndex: row.end_index,
       messageIDs: parseJson<string[]>(row.message_ids_json),
       summaryText: row.summary_text,
+      strategy: row.strategy,
       createdAt: row.created_at,
     };
   }
@@ -4368,6 +4463,17 @@ export class SqliteLcmStore {
     if (names.has('archived_signature')) return;
 
     db.exec("ALTER TABLE summary_state ADD COLUMN archived_signature TEXT NOT NULL DEFAULT ''");
+  }
+
+  private ensureSummaryNodeColumnsSync(): void {
+    const db = this.getDb();
+    const columns = db.prepare('PRAGMA table_info(summary_nodes)').all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+    if (names.has('strategy')) return;
+
+    db.exec(
+      "ALTER TABLE summary_nodes ADD COLUMN strategy TEXT NOT NULL DEFAULT 'deterministic-v1'",
+    );
   }
 
   private ensureArtifactColumnsSync(): void {
