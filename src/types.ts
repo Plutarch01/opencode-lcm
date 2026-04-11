@@ -62,6 +62,10 @@ export type SummaryV2Options = {
   perMessageBudget: number;
 };
 
+export type RuntimeSafetyOptions = {
+  allowUnsafeBunWindows: boolean;
+};
+
 export type OpencodeLcmOptions = {
   interop: InteropOptions;
   scopeDefaults: ScopeDefaults;
@@ -82,6 +86,7 @@ export type OpencodeLcmOptions = {
   binaryPreviewProviders: string[];
   previewBytePeek: number;
   summaryV2: SummaryV2Options;
+  runtimeSafety: RuntimeSafetyOptions;
 };
 
 export type CapturedEvent = {

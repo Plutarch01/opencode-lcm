@@ -6,6 +6,7 @@ import type {
   OpencodeLcmOptions,
   PrivacyOptions,
   RetentionPolicyOptions,
+  RuntimeSafetyOptions,
   ScopeDefaults,
   ScopeName,
   ScopeProfile,
@@ -61,6 +62,10 @@ export const DEFAULT_SUMMARY_V2: SummaryV2Options = {
   perMessageBudget: 110,
 };
 
+const DEFAULT_RUNTIME_SAFETY: RuntimeSafetyOptions = {
+  allowUnsafeBunWindows: false,
+};
+
 export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   interop: DEFAULT_INTEROP,
   scopeDefaults: DEFAULT_SCOPE_DEFAULTS,
@@ -86,6 +91,7 @@ export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   ],
   previewBytePeek: 16,
   summaryV2: DEFAULT_SUMMARY_V2,
+  runtimeSafety: DEFAULT_RUNTIME_SAFETY,
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -258,6 +264,16 @@ function asSummaryV2Options(value: unknown, fallback: SummaryV2Options): Summary
   };
 }
 
+function asRuntimeSafetyOptions(
+  value: unknown,
+  fallback: RuntimeSafetyOptions,
+): RuntimeSafetyOptions {
+  const record = asRecord(value);
+  return {
+    allowUnsafeBunWindows: asBoolean(record?.allowUnsafeBunWindows, fallback.allowUnsafeBunWindows),
+  };
+}
+
 export function resolveOptions(raw: unknown): OpencodeLcmOptions {
   const options = asRecord(raw);
   const interop = asRecord(options?.interop);
@@ -314,5 +330,6 @@ export function resolveOptions(raw: unknown): OpencodeLcmOptions {
     ),
     previewBytePeek: asNumber(options?.previewBytePeek, DEFAULT_OPTIONS.previewBytePeek),
     summaryV2: asSummaryV2Options(options?.summaryV2, DEFAULT_SUMMARY_V2),
+    runtimeSafety: asRuntimeSafetyOptions(options?.runtimeSafety, DEFAULT_RUNTIME_SAFETY),
   };
 }

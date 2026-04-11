@@ -16,6 +16,38 @@ import {
   toolCompletedPart,
 } from './helpers.mjs';
 
+const ALLOW_UNSAFE_BUN_WINDOWS_ENV = 'OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS';
+
+async function withSimulatedBunWindows(run) {
+  const hadBun = 'Bun' in globalThis;
+  const previousBun = globalThis.Bun;
+  const previousAllowUnsafe = process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV];
+  const previousSqliteRuntime = process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+
+  try {
+    globalThis.Bun = { version: '1.3.11' };
+    delete process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV];
+    delete process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+    Object.defineProperty(process, 'platform', {
+      configurable: true,
+      enumerable: true,
+      value: 'win32',
+    });
+    await run();
+  } finally {
+    if (platformDescriptor) {
+      Object.defineProperty(process, 'platform', platformDescriptor);
+    }
+    if (previousAllowUnsafe === undefined) delete process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV];
+    else process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV] = previousAllowUnsafe;
+    if (previousSqliteRuntime === undefined) delete process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+    else process.env.OPENCODE_LCM_SQLITE_RUNTIME = previousSqliteRuntime;
+    if (hadBun) globalThis.Bun = previousBun;
+    else delete globalThis.Bun;
+  }
+}
+
 test('resolveOptions normalizes malformed plugin config', () => {
   const resolved = resolveOptions({
     interop: {
@@ -61,6 +93,9 @@ test('resolveOptions normalizes malformed plugin config', () => {
       strategy: 'bogus',
       perMessageBudget: 90,
     },
+    runtimeSafety: {
+      allowUnsafeBunWindows: 'yes',
+    },
   });
 
   assert.equal(resolved.interop.contextMode, false);
@@ -105,6 +140,105 @@ test('resolveOptions normalizes malformed plugin config', () => {
     strategy: DEFAULT_OPTIONS.summaryV2.strategy,
     perMessageBudget: 90,
   });
+  assert.deepEqual(resolved.runtimeSafety, {
+    allowUnsafeBunWindows: false,
+  });
+});
+
+test('plugin defaults to Bun on Windows safe mode before opening SQLite', async () => {
+  const workspace = makeWorkspace('lcm-plugin-bun-win-safe-mode');
+
+  try {
+    await withSimulatedBunWindows(async () => {
+      const hooks = await OpencodeLcmPlugin(makePluginContext(workspace), makeOptions());
+
+      assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), ['lcm_status']);
+      assert.equal(hooks.tool.lcm_describe, undefined);
+
+      await hooks.event({
+        event: {
+          type: 'session.created',
+          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+        },
+      });
+
+      const systemOutput = { system: [] };
+      await hooks['experimental.chat.system.transform'](
+        { sessionID: 's1', model: {} },
+        systemOutput,
+      );
+      assert.deepEqual(systemOutput.system, []);
+
+      const messagesOutput = {
+        messages: [
+          conversationMessage({
+            sessionID: 's1',
+            messageID: 'm1',
+            created: 1,
+            parts: [textPart('s1', 'm1', 'm1-p1', 'safe mode leaves messages untouched')],
+          }),
+        ],
+      };
+      await hooks['experimental.chat.messages.transform']({}, messagesOutput);
+      assert.equal(messagesOutput.messages[0].parts[0].text, 'safe mode leaves messages untouched');
+
+      const compactionOutput = { context: [], prompt: 'keep-default' };
+      await hooks['experimental.session.compacting']({ sessionID: 's1' }, compactionOutput);
+      assert.deepEqual(compactionOutput, { context: [], prompt: 'keep-default' });
+
+      const status = await hooks.tool.lcm_status.execute({}, makeToolContext(workspace, 's1'));
+      assert.match(status, /status=disabled/);
+      assert.match(status, /reason=bun_windows_runtime_guard/);
+      assert.match(status, /available_tools=lcm_status/);
+      assert.match(status, /runtime_safety_allow_unsafe_bun_windows=false/);
+      assert.match(status, /override_config=runtimeSafety\.allowUnsafeBunWindows=true/);
+      assert.match(status, /override_env=OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1/);
+    });
+  } finally {
+    // Safe mode does not open a store handle.
+  }
+});
+
+test('plugin allows explicit Bun on Windows override', async () => {
+  const workspace = makeWorkspace('lcm-plugin-bun-win-override');
+
+  try {
+    await withSimulatedBunWindows(async () => {
+      const hooks = await OpencodeLcmPlugin(
+        makePluginContext(workspace),
+        makeOptions({ runtimeSafety: { allowUnsafeBunWindows: true }, freshTailMessages: 1 }),
+      );
+
+      assert.ok(hooks.tool.lcm_describe);
+
+      await hooks.event({
+        event: {
+          type: 'session.created',
+          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+        },
+      });
+      await captureMessage(
+        { capture: (event) => hooks.event({ event }) },
+        {
+          sessionID: 's1',
+          messageID: 'm1',
+          created: 2,
+          parts: [textPart('s1', 'm1', 'm1-p', 'override-enabled body')],
+        },
+      );
+
+      const toolContext = makeToolContext(workspace, 's1');
+      const status = await hooks.tool.lcm_status.execute({}, toolContext);
+      const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
+
+      assert.match(status, /schema_version=2/);
+      assert.match(status, /runtime_safety_allow_unsafe_bun_windows=true/);
+      assert.match(describe, /override-enabled body/);
+    });
+  } finally {
+    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
 });
 
 test('plugin exposes tools, records events, and appends compaction context once', async () => {
