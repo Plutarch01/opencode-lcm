@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-04-11
+
+### Fixed
+- Bun on Windows now leaves the plugin in a pre-SQLite safe mode by default and requires an explicit override to enable the full archive hooks
+
 ## [0.13.5] - 2026-04-11
 
 ### Fixed

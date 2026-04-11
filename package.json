@@ -1,6 +1,6 @@
 {
   "name": "opencode-lcm",
-  "version": "0.13.5",
+  "version": "0.13.6",
   "description": "Long-memory plugin for OpenCode with context-mode interop",
   "type": "module",
   "main": "./dist/index.js",
