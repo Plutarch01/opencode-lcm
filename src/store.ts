@@ -83,6 +83,7 @@ import {
   hashContent,
   isAutomaticRetrievalNoise,
   parseJson,
+  parseJsonSafe,
   sanitizeAutomaticRetrievalSourceText,
   shortNodeID,
   shouldSuppressLowSignalAutomaticRetrievalAnchor,
@@ -388,6 +389,73 @@ function filterValidConversationMessages(
     logMalformedMessage('Skipping malformed conversation messages', context, { dropped });
   }
   return valid;
+}
+
+function parseStoredPart(
+  row: Pick<PartRow, 'session_id' | 'message_id' | 'part_id' | 'part_json'>,
+  operation: string,
+): Part | undefined {
+  return parseJsonSafe<Part>(row.part_json, (error, preview) => {
+    logMalformedMessage(
+      'Skipping corrupted stored part',
+      { operation, sessionID: row.session_id },
+      {
+        messageID: row.message_id,
+        partID: row.part_id,
+        error: error.message,
+        preview,
+      },
+    );
+  });
+}
+
+function parseStoredMessageInfo(
+  row: Pick<MessageRow, 'session_id' | 'message_id' | 'info_json'>,
+  operation: string,
+): Message | undefined {
+  const info = parseJsonSafe<Message>(row.info_json, (error, preview) => {
+    logMalformedMessage(
+      'Skipping corrupted stored message',
+      { operation, sessionID: row.session_id },
+      {
+        messageID: row.message_id,
+        error: error.message,
+        preview,
+      },
+    );
+  });
+  if (!info) return undefined;
+  if (!getValidMessageInfo(info)) {
+    logMalformedMessage(
+      'Skipping malformed stored message',
+      {
+        operation,
+        sessionID: row.session_id,
+      },
+      { messageID: row.message_id },
+    );
+    return undefined;
+  }
+  return info;
+}
+
+function parseArtifactMetadata(
+  row: Pick<ArtifactRow, 'artifact_id' | 'session_id' | 'message_id' | 'part_id' | 'metadata_json'>,
+  operation: string,
+): Record<string, unknown> {
+  return (
+    parseJsonSafe<Record<string, unknown>>(row.metadata_json || '{}', (error, preview) => {
+      getLogger().warn('Corrupted artifact metadata ignored', {
+        operation,
+        sessionID: row.session_id,
+        messageID: row.message_id,
+        partID: row.part_id,
+        artifactID: row.artifact_id,
+        error: error.message,
+        preview,
+      });
+    }) ?? {}
+  );
 }
 
 function isValidMessagePartUpdate(event: Event): boolean {
@@ -4860,7 +4928,7 @@ export class SqliteLcmStore {
         contentHash: contentHash ?? hashContent(contentText),
         charCount: blob?.char_count ?? row.char_count,
         createdAt: row.created_at,
-        metadata: parseJson<Record<string, unknown>>(row.metadata_json || '{}'),
+        metadata: parseArtifactMetadata(row, 'readSessionsBatchSync'),
       };
       const list = artifactsByPart.get(artifact.partID) ?? [];
       list.push(artifact);
@@ -4876,7 +4944,8 @@ export class SqliteLcmStore {
         partsByMessage = new Map();
         partsBySessionMessage.set(partRow.session_id, partsByMessage);
       }
-      const part = parseJson<Part>(partRow.part_json);
+      const part = parseStoredPart(partRow, 'readSessionsBatchSync');
+      if (!part) continue;
       const artifacts = artifactsByPart.get(part.id) ?? [];
       hydratePartFromArtifacts(part, artifacts);
       const parts = partsByMessage.get(partRow.message_id) ?? [];
@@ -4888,9 +4957,11 @@ export class SqliteLcmStore {
     const messagesBySession = new Map<string, Array<{ info: Message; parts: Part[] }>>();
     for (const messageRow of messageRows) {
       const sessionParts = partsBySessionMessage.get(messageRow.session_id);
+      const info = parseStoredMessageInfo(messageRow, 'readSessionsBatchSync');
+      if (!info) continue;
       const messages = messagesBySession.get(messageRow.session_id) ?? [];
       messages.push({
-        info: parseJson<Message>(messageRow.info_json),
+        info,
         parts: sessionParts?.get(messageRow.message_id) ?? [],
       });
       messagesBySession.set(messageRow.session_id, messages);
@@ -4937,7 +5008,8 @@ export class SqliteLcmStore {
     const partsByMessage = new Map<string, Part[]>();
     for (const partRow of partRows) {
       const parts = partsByMessage.get(partRow.message_id) ?? [];
-      const part = parseJson<Part>(partRow.part_json);
+      const part = parseStoredPart(partRow, 'readSessionSync');
+      if (!part) continue;
       const artifacts = artifactsByPart.get(part.id) ?? [];
       hydratePartFromArtifacts(part, artifacts);
       parts.push(part);
@@ -4945,10 +5017,16 @@ export class SqliteLcmStore {
     }
 
     const messages = filterValidConversationMessages(
-      messageRows.map((messageRow) => ({
-        info: parseJson<Message>(messageRow.info_json),
-        parts: partsByMessage.get(messageRow.message_id) ?? [],
-      })),
+      messageRows
+        .map((messageRow) => {
+          const info = parseStoredMessageInfo(messageRow, 'readSessionSync');
+          if (!info) return undefined;
+          return {
+            info,
+            parts: partsByMessage.get(messageRow.message_id) ?? [],
+          };
+        })
+        .filter((message): message is { info: Message; parts: Part[] } => Boolean(message)),
       { operation: 'readSessionSync', sessionID },
     );
 
@@ -5053,25 +5131,16 @@ export class SqliteLcmStore {
       )
       .all(sessionID, messageID) as PartRow[];
 
-    const info = parseJson<Message>(row.info_json);
-    if (!getValidMessageInfo(info)) {
-      logMalformedMessage(
-        'Skipping malformed stored message',
-        {
-          operation: 'readMessageSync',
-          sessionID,
-        },
-        { messageID },
-      );
-      return undefined;
-    }
+    const info = parseStoredMessageInfo(row, 'readMessageSync');
+    if (!info) return undefined;
 
     return {
       info,
-      parts: parts.map((partRow) => {
-        const part = parseJson<Part>(partRow.part_json);
+      parts: parts.flatMap((partRow) => {
+        const part = parseStoredPart(partRow, 'readMessageSync');
+        if (!part) return [];
         if (hydrateArtifacts) hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
-        return part;
+        return [part];
       }),
     };
   }

@@ -33,14 +33,29 @@ export function shortNodeID(nodeID: string): string {
   return nodeID.length <= 32 ? nodeID : `${nodeID.slice(0, 20)}...${nodeID.slice(-8)}`;
 }
 
+function jsonInputPreview(value: string): string {
+  return `${value.slice(0, 120)}${value.length > 120 ? '...' : ''}`;
+}
+
 export function parseJson<T>(value: string): T {
   try {
     return JSON.parse(value) as T;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Failed to parse JSON: ${message}\nInput: ${value.slice(0, 120)}${value.length > 120 ? '...' : ''}`,
-    );
+    throw new Error(`Failed to parse JSON: ${message}\nInput: ${jsonInputPreview(value)}`);
+  }
+}
+
+export function parseJsonSafe<T>(
+  value: string,
+  onError?: (error: Error, preview: string) => void,
+): T | undefined {
+  try {
+    return parseJson<T>(value);
+  } catch (error) {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    onError?.(normalized, jsonInputPreview(value));
+    return undefined;
   }
 }
 

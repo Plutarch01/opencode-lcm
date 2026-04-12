@@ -1836,6 +1836,59 @@ test('resume and describe skip stored messages with malformed metadata', async (
   }
 });
 
+test('resume and describe skip stored messages with corrupted info_json', async () => {
+  const workspace = makeWorkspace('lcm-resume-corrupted-info-json');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+  let store;
+  let db;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, 's1', 1);
+    for (const [messageID, created, text] of [
+      ['m1', 2, 'resume archived one'],
+      ['m2', 3, 'resume archived two'],
+      ['m3', 4, 'resume archived three'],
+      ['m4', 5, 'resume fresh tail'],
+    ]) {
+      await captureMessage(store, {
+        sessionID: 's1',
+        messageID,
+        created,
+        parts: [textPart('s1', messageID, `${messageID}-p`, text)],
+      });
+    }
+
+    db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.prepare('UPDATE messages SET info_json = ? WHERE session_id = ? AND message_id = ?').run(
+      '{"id":"m2","sessionID":"s1","role":"user","time":{"created":3}',
+      's1',
+      'm2',
+    );
+    db.close();
+    db = undefined;
+
+    const resumed = await store.resume('s1');
+    const described = await store.describe({ sessionID: 's1' });
+
+    assert.match(resumed, /resume archived one/);
+    assert.doesNotMatch(resumed, /resume archived two/);
+    assert.match(described, /Messages: 3/);
+  } finally {
+    db?.close();
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('grep scan fallback skips stored messages with malformed metadata', async () => {
   const workspace = makeWorkspace('lcm-grep-malformed-info');
   const dbPath = path.join(workspace, '.lcm', 'lcm.db');
@@ -1876,6 +1929,63 @@ test('grep scan fallback skips stored messages with malformed metadata', async (
     assert.deepEqual(
       results.map((result) => result.id),
       ['m1'],
+    );
+  } finally {
+    db?.close();
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('grep scan survives a single corrupted part_json row', async () => {
+  const workspace = makeWorkspace('lcm-grep-corrupted-part-json');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+  let store;
+  let db;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await createSession(store, workspace, 's1', 1);
+    for (const [messageID, created, text] of [
+      ['m1', 2, 'cosmic-ray keep alpha'],
+      ['m2', 3, 'cosmic-ray corrupt beta'],
+      ['m3', 4, 'cosmic-ray keep gamma'],
+    ]) {
+      await captureMessage(store, {
+        sessionID: 's1',
+        messageID,
+        created,
+        parts: [textPart('s1', messageID, `${messageID}-p`, text)],
+      });
+    }
+
+    db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    db.prepare('UPDATE parts SET part_json = ? WHERE session_id = ? AND message_id = ?').run(
+      '{"id":"m2-p","type":"text","text":"cosmic-ray corrupt b',
+      's1',
+      'm2',
+    );
+    db.prepare('DELETE FROM message_fts').run();
+    db.prepare('DELETE FROM summary_fts').run();
+    db.prepare('DELETE FROM artifact_fts').run();
+    db.close();
+    db = undefined;
+
+    const results = await store.grep({ query: 'cosmic-ray', sessionID: 's1', limit: 10 });
+    const messageResults = results.filter((result) => result.id.startsWith('m'));
+
+    assert.deepEqual(
+      messageResults.map((result) => result.id),
+      ['m1', 'm3'],
+    );
+    assert.equal(
+      results.some((result) => result.id === 'm2'),
+      false,
     );
   } finally {
     db?.close();
