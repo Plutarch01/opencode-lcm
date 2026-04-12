@@ -82,6 +82,7 @@ import {
   hashContent,
   isAutomaticRetrievalNoise,
   parseJson,
+  parseJsonSafe,
   sanitizeAutomaticRetrievalSourceText,
   shortNodeID,
   shouldSuppressLowSignalAutomaticRetrievalAnchor,
@@ -1697,7 +1698,15 @@ export class SqliteLcmStore {
 
     const latestMessageCreated = archived.at(-1)?.info.time.created ?? 0;
     const archivedSignature = this.buildArchivedSignature(archived);
-    const rootIDs = state ? parseJson<string[]>(state.root_node_ids_json) : [];
+    const rootIDs = state
+      ? (parseJsonSafe<string[]>(state.root_node_ids_json, (error) => {
+          getLogger().warn('Corrupted root_node_ids_json in summary_state', {
+            operation: 'diagnoseSummarySession',
+            sessionID: session.sessionID,
+            error: error.message,
+          });
+        }) ?? [])
+      : [];
     const roots = rootIDs
       .map((nodeID) => this.readSummaryNodeSync(nodeID))
       .filter((node): node is SummaryNodeData => Boolean(node));
@@ -3664,7 +3673,14 @@ export class SqliteLcmStore {
       state.latest_message_created === latestMessageCreated &&
       state.archived_signature === archivedSignature
     ) {
-      const rootIDs = parseJson<string[]>(state.root_node_ids_json);
+      const rootIDs =
+        parseJsonSafe<string[]>(state.root_node_ids_json, (error) => {
+          getLogger().warn('Corrupted root_node_ids_json in summary_state', {
+            operation: 'ensureSummaryGraphSync',
+            sessionID,
+            error: error.message,
+          });
+        }) ?? [];
       const roots = rootIDs
         .map((nodeID) => this.readSummaryNodeSync(nodeID))
         .filter((node): node is SummaryNodeData => Boolean(node));
@@ -3915,7 +3931,15 @@ export class SqliteLcmStore {
       nodeKind: row.node_kind === 'leaf' ? 'leaf' : 'internal',
       startIndex: row.start_index,
       endIndex: row.end_index,
-      messageIDs: parseJson<string[]>(row.message_ids_json),
+      messageIDs:
+        parseJsonSafe<string[]>(row.message_ids_json, (error) => {
+          getLogger().warn('Corrupted message_ids_json in summary_nodes', {
+            operation: 'readSummaryNodeSync',
+            nodeID: row.node_id,
+            sessionID: row.session_id,
+            error: error.message,
+          });
+        }) ?? [],
       summaryText: row.summary_text,
       createdAt: row.created_at,
     };
@@ -4739,7 +4763,7 @@ export class SqliteLcmStore {
         contentHash: contentHash ?? hashContent(contentText),
         charCount: blob?.char_count ?? row.char_count,
         createdAt: row.created_at,
-        metadata: parseJson<Record<string, unknown>>(row.metadata_json || '{}'),
+        metadata: parseJsonSafe<Record<string, unknown>>(row.metadata_json || '{}') ?? {},
       };
       const list = artifactsByPart.get(artifact.partID) ?? [];
       list.push(artifact);
@@ -4755,7 +4779,17 @@ export class SqliteLcmStore {
         partsByMessage = new Map();
         partsBySessionMessage.set(partRow.session_id, partsByMessage);
       }
-      const part = parseJson<Part>(partRow.part_json);
+      const part = parseJsonSafe<Part>(partRow.part_json, (error, preview) => {
+        getLogger().warn('Skipping corrupted part row', {
+          operation: 'readSessionsBatchSync',
+          sessionID: partRow.session_id,
+          messageID: partRow.message_id,
+          partID: partRow.part_id,
+          error: error.message,
+          preview,
+        });
+      });
+      if (!part) continue;
       const artifacts = artifactsByPart.get(part.id) ?? [];
       hydratePartFromArtifacts(part, artifacts);
       const parts = partsByMessage.get(partRow.message_id) ?? [];
@@ -4767,9 +4801,19 @@ export class SqliteLcmStore {
     const messagesBySession = new Map<string, Array<{ info: Message; parts: Part[] }>>();
     for (const messageRow of messageRows) {
       const sessionParts = partsBySessionMessage.get(messageRow.session_id);
+      const info = parseJsonSafe<Message>(messageRow.info_json, (error, preview) => {
+        getLogger().warn('Skipping corrupted message row', {
+          operation: 'readSessionsBatchSync',
+          sessionID: messageRow.session_id,
+          messageID: messageRow.message_id,
+          error: error.message,
+          preview,
+        });
+      });
+      if (!info) continue;
       const messages = messagesBySession.get(messageRow.session_id) ?? [];
       messages.push({
-        info: parseJson<Message>(messageRow.info_json),
+        info,
         parts: sessionParts?.get(messageRow.message_id) ?? [],
       });
       messagesBySession.set(messageRow.session_id, messages);
@@ -4816,7 +4860,17 @@ export class SqliteLcmStore {
     const partsByMessage = new Map<string, Part[]>();
     for (const partRow of partRows) {
       const parts = partsByMessage.get(partRow.message_id) ?? [];
-      const part = parseJson<Part>(partRow.part_json);
+      const part = parseJsonSafe<Part>(partRow.part_json, (error, preview) => {
+        getLogger().warn('Skipping corrupted part row', {
+          operation: 'readSessionSync',
+          sessionID: partRow.session_id,
+          messageID: partRow.message_id,
+          partID: partRow.part_id,
+          error: error.message,
+          preview,
+        });
+      });
+      if (!part) continue;
       const artifacts = artifactsByPart.get(part.id) ?? [];
       hydratePartFromArtifacts(part, artifacts);
       parts.push(part);
@@ -4824,10 +4878,24 @@ export class SqliteLcmStore {
     }
 
     const messages = filterValidConversationMessages(
-      messageRows.map((messageRow) => ({
-        info: parseJson<Message>(messageRow.info_json),
-        parts: partsByMessage.get(messageRow.message_id) ?? [],
-      })),
+      messageRows
+        .map((messageRow) => {
+          const info = parseJsonSafe<Message>(messageRow.info_json, (error, preview) => {
+            getLogger().warn('Skipping corrupted message row', {
+              operation: 'readSessionSync',
+              sessionID,
+              messageID: messageRow.message_id,
+              error: error.message,
+              preview,
+            });
+          });
+          if (!info) return undefined;
+          return {
+            info,
+            parts: partsByMessage.get(messageRow.message_id) ?? [],
+          };
+        })
+        .filter((entry): entry is { info: Message; parts: Part[] } => entry !== undefined),
       { operation: 'readSessionSync', sessionID },
     );
 
@@ -4922,25 +4990,45 @@ export class SqliteLcmStore {
       )
       .all(sessionID, messageID) as PartRow[];
 
-    const info = parseJson<Message>(row.info_json);
-    if (!getValidMessageInfo(info)) {
-      logMalformedMessage(
-        'Skipping malformed stored message',
-        {
-          operation: 'readMessageSync',
-          sessionID,
-        },
-        { messageID },
-      );
+    const info = parseJsonSafe<Message>(row.info_json, (error, preview) => {
+      getLogger().warn('Skipping corrupted message row', {
+        operation: 'readMessageSync',
+        sessionID,
+        messageID,
+        error: error.message,
+        preview,
+      });
+    });
+    if (!info || !getValidMessageInfo(info)) {
+      if (info) {
+        logMalformedMessage(
+          'Skipping malformed stored message',
+          {
+            operation: 'readMessageSync',
+            sessionID,
+          },
+          { messageID },
+        );
+      }
       return undefined;
     }
 
     return {
       info,
-      parts: parts.map((partRow) => {
-        const part = parseJson<Part>(partRow.part_json);
+      parts: parts.flatMap((partRow) => {
+        const part = parseJsonSafe<Part>(partRow.part_json, (error, preview) => {
+          getLogger().warn('Skipping corrupted part row', {
+            operation: 'readMessageSync',
+            sessionID,
+            messageID,
+            partID: partRow.part_id,
+            error: error.message,
+            preview,
+          });
+        });
+        if (!part) return [];
         hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
-        return part;
+        return [part];
       }),
     };
   }
@@ -5206,9 +5294,18 @@ export class SqliteLcmStore {
     try {
       const entries = await readdir(sessionsDir);
       for (const entry of entries.filter((item) => item.endsWith('.json'))) {
-        const content = await readFile(path.join(sessionsDir, entry), 'utf8');
-        const session = parseJson<NormalizedSession>(content);
-        await this.persistSession(session);
+        try {
+          const content = await readFile(path.join(sessionsDir, entry), 'utf8');
+          const session = parseJsonSafe<NormalizedSession>(content, (error) => {
+            getLogger().debug('Corrupted legacy session file skipped', {
+              entry,
+              error: error.message,
+            });
+          });
+          if (session) await this.persistSession(session);
+        } catch (error) {
+          getLogger().debug('Legacy session file migration failed', { entry, error });
+        }
       }
     } catch (error) {
       if (!hasErrorCode(error, 'ENOENT')) {
@@ -5219,15 +5316,19 @@ export class SqliteLcmStore {
     const resumePath = path.join(this.baseDir, 'resume.json');
     try {
       const content = await readFile(resumePath, 'utf8');
-      const resumes = parseJson<ResumeMap>(content);
-      const insertResume = db.prepare(
-        `INSERT INTO resumes (session_id, note, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
-      );
-      const now = Date.now();
-      for (const [sessionID, note] of Object.entries(resumes)) {
-        insertResume.run(sessionID, note, now);
+      const resumes = parseJsonSafe<ResumeMap>(content, (error) => {
+        getLogger().debug('Corrupted legacy resume.json skipped', { error: error.message });
+      });
+      if (resumes) {
+        const insertResume = db.prepare(
+          `INSERT INTO resumes (session_id, note, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
+        );
+        const now = Date.now();
+        for (const [sessionID, note] of Object.entries(resumes)) {
+          insertResume.run(sessionID, note, now);
+        }
       }
     } catch (error) {
       if (!hasErrorCode(error, 'ENOENT')) {

@@ -44,6 +44,35 @@ export function parseJson<T>(value: string): T {
   }
 }
 
+/**
+ * Parses JSON without throwing.
+ *
+ * Returns `undefined` if `value` is not valid JSON. Use this for stored rows
+ * (parts, messages, artifacts) where a single corrupted blob must not crash
+ * the whole batch load — callers are expected to skip the affected row and
+ * continue. For structural invariants where a failure should abort, use
+ * `parseJson` instead.
+ *
+ * The optional `onError` callback is invoked with the parse error and a
+ * truncated preview of the offending input so callers can log a warning
+ * with their own operation/session context.
+ */
+export function parseJsonSafe<T>(
+  value: string,
+  onError?: (error: Error, preview: string) => void,
+): T | undefined {
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    if (onError) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      const preview = `${value.slice(0, 120)}${value.length > 120 ? '...' : ''}`;
+      onError(normalized, preview);
+    }
+    return undefined;
+  }
+}
+
 // --- Number utilities ---
 
 export function clamp(value: number, min: number, max: number): number {

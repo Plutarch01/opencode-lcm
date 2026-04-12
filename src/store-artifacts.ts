@@ -23,6 +23,7 @@ import {
   inferFileExtension,
   inferUrlScheme,
   parseJson,
+  parseJsonSafe,
   sanitizeAutomaticRetrievalSourceText,
   truncate,
 } from './utils.js';
@@ -661,6 +662,6 @@ export function materializeArtifactRow(
     contentHash: row.content_hash ?? hashContent(contentText),
     charCount: blob?.char_count ?? row.char_count,
     createdAt: row.created_at,
-    metadata: parseJson<Record<string, unknown>>(row.metadata_json || '{}'),
+    metadata: parseJsonSafe<Record<string, unknown>>(row.metadata_json || '{}') ?? {},
   };
 }

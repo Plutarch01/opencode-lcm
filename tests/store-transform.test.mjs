@@ -1764,3 +1764,73 @@ test('capture ignores malformed message and part update events', async () => {
     await cleanupWorkspace(workspace);
   }
 });
+
+test('grep scan survives a single corrupted part_json row', async () => {
+  const workspace = makeWorkspace('lcm-grep-corrupted-part-json');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+  let store;
+  let db;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    await createSession(store, workspace, 's1', 1);
+    for (const [messageID, created, text] of [
+      ['m1', 2, 'cosmic-ray keep alpha'],
+      ['m2', 3, 'cosmic-ray corrupt beta'],
+      ['m3', 4, 'cosmic-ray keep gamma'],
+    ]) {
+      await captureMessage(store, {
+        sessionID: 's1',
+        messageID,
+        created,
+        parts: [textPart('s1', messageID, `${messageID}-p`, text)],
+      });
+    }
+
+    store.close();
+    store = undefined;
+
+    db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    // Simulate an on-disk corruption: truncate m2's part_json mid-string.
+    // This is the exact failure mode from the real crash report:
+    //   Failed to parse JSON: Unterminated string
+    //   at parseJson → readSessionsBatchSync → readScopedSessionsSync → searchByScan
+    const truncated = '{"id": "m2-p", "type": "text", "text": "cosmic-ray corrupt b';
+    const updated = db
+      .prepare('UPDATE parts SET part_json = ? WHERE session_id = ? AND message_id = ?')
+      .run(truncated, 's1', 'm2');
+    assert.equal(updated.changes, 1);
+    // Clear all FTS indexes so grep is forced down the scan path — that is
+    // the exact code path the user crashed on in production (searchByScan →
+    // readScopedSessionsSync → readSessionsBatchSync → parseJson).
+    db.prepare('DELETE FROM message_fts').run();
+    db.prepare('DELETE FROM summary_fts').run();
+    db.prepare('DELETE FROM artifact_fts').run();
+    db.close();
+    db = undefined;
+
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    // Warm up the lazy DB handle the way real plugin usage does before grep.
+    await store.stats();
+
+    const results = await store.grep({ query: 'cosmic-ray', sessionID: 's1', limit: 10 });
+
+    const ids = results.map((result) => result.id).sort();
+    assert.ok(ids.includes('m1'), 'm1 should still be searchable after corruption');
+    assert.ok(ids.includes('m3'), 'm3 should still be searchable after corruption');
+    // m2's part JSON is unparseable, so m2 has no searchable content left and
+    // must be silently skipped — but the scan itself must complete without
+    // throwing, which is what the fix protects.
+    assert.ok(!ids.includes('m2'), 'corrupted m2 should be skipped, not crash the scan');
+  } finally {
+    db?.close();
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
