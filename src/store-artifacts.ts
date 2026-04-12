@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { Message, Part } from '@opencode-ai/sdk';
+import { getLogger } from './logging.js';
 import { runBinaryPreviewProviders } from './preview-providers.js';
 import {
   type CompiledPrivacyOptions,
@@ -23,6 +24,7 @@ import {
   inferFileExtension,
   inferUrlScheme,
   parseJson,
+  parseJsonSafe,
   sanitizeAutomaticRetrievalSourceText,
   truncate,
 } from './utils.js';
@@ -649,6 +651,18 @@ export function materializeArtifactRow(
 ): ArtifactData {
   const blob = bindings.readArtifactBlobSync(row.content_hash);
   const contentText = blob?.content_text ?? row.content_text;
+  const metadata =
+    parseJsonSafe<Record<string, unknown>>(row.metadata_json || '{}', (error, preview) => {
+      getLogger().warn('Corrupted artifact metadata ignored', {
+        operation: 'materializeArtifactRow',
+        sessionID: row.session_id,
+        messageID: row.message_id,
+        partID: row.part_id,
+        artifactID: row.artifact_id,
+        error: error.message,
+        preview,
+      });
+    }) ?? {};
   return {
     artifactID: row.artifact_id,
     sessionID: row.session_id,
@@ -661,6 +675,6 @@ export function materializeArtifactRow(
     contentHash: row.content_hash ?? hashContent(contentText),
     charCount: blob?.char_count ?? row.char_count,
     createdAt: row.created_at,
-    metadata: parseJson<Record<string, unknown>>(row.metadata_json || '{}'),
+    metadata,
   };
 }
