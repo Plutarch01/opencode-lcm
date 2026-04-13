@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-04-13
+
+### Added
+- New `lcm_retrieval_debug` MCP tool surfaces the latest automatic-retrieval recall decision per session: status, query tokens, scope budgets, raw/selected hit counts, stop reason, and hit previews
+- `lcm_status` now reports `db_bytes`, `wal_bytes`, `shm_bytes`, `total_bytes`, `prunable_events`, top-10 prunable event-type breakdowns, and FTS row counts (`message_fts`, `summary_fts`, `artifact_fts`)
+- `StoreStats` type extended with storage-size, prunable-event, and FTS-index diagnostic fields
+
+### Fixed
+- Merged `fix/corrupted-json-row-loads-origin` branch: `readSessionSync`, `readMessageSync`, `readMessageSyncV2`, and grep scan paths now skip stored messages/parts with corrupted `info_json` or `part_json` instead of throwing
+- `lcm_doctor` detects and reports malformed stored rows and orphaned message-fts entries
+
 ## [0.13.6] - 2026-04-11
 
 ### Fixed
