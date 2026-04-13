@@ -2,11 +2,75 @@ import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
 
 import { resolveOptions } from './options.js';
 import { SqliteLcmStore } from './store.js';
+import type { OpencodeLcmOptions } from './types.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
 
+const ALLOW_UNSAFE_BUN_WINDOWS_ENV = 'OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS';
+
+function isTruthyEnvFlag(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function isBunRuntime(): boolean {
+  return typeof globalThis === 'object' && globalThis !== null && 'Bun' in globalThis;
+}
+
+function isUnsafeBunWindowsRuntime(): boolean {
+  return isBunRuntime() && process.platform === 'win32';
+}
+
+function resolveAllowUnsafeBunWindows(options: OpencodeLcmOptions): boolean {
+  return (
+    options.runtimeSafety.allowUnsafeBunWindows ||
+    isTruthyEnvFlag(process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV])
+  );
+}
+
+function buildSafeModeStatus(allowUnsafeBunWindows: boolean): string {
+  return [
+    'status=disabled',
+    'reason=bun_windows_runtime_guard',
+    'available_tools=lcm_status',
+    `platform=${process.platform}`,
+    `bun_runtime=${isBunRuntime()}`,
+    `runtime_safety_allow_unsafe_bun_windows=${allowUnsafeBunWindows}`,
+    'override_config=runtimeSafety.allowUnsafeBunWindows=true',
+    `override_env=${ALLOW_UNSAFE_BUN_WINDOWS_ENV}=1`,
+    'message=opencode-lcm disabled itself before opening SQLite because Bun on Windows has reported native crashes in this path',
+  ].join('\n');
+}
+
+function createSafeModeHooks(allowUnsafeBunWindows: boolean): Hooks {
+  return {
+    event: async () => {},
+
+    tool: {
+      lcm_status: tool({
+        description: 'Show archived LCM capture stats',
+        args: {},
+        async execute() {
+          return buildSafeModeStatus(allowUnsafeBunWindows);
+        },
+      }),
+    },
+
+    'experimental.chat.messages.transform': async () => {},
+    'experimental.chat.system.transform': async () => {},
+    'experimental.session.compacting': async () => {},
+  };
+}
+
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   const options = resolveOptions(rawOptions);
+  const allowUnsafeBunWindows = resolveAllowUnsafeBunWindows(options);
+
+  if (isUnsafeBunWindowsRuntime() && !allowUnsafeBunWindows) {
+    return createSafeModeHooks(allowUnsafeBunWindows);
+  }
+
   const store = new SqliteLcmStore(ctx.directory, options);
 
   await store.init();
@@ -64,6 +128,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `fresh_tail_messages=${options.freshTailMessages}`,
             `min_messages_for_transform=${options.minMessagesForTransform}`,
             `large_content_threshold=${options.largeContentThreshold}`,
+            `runtime_safety_allow_unsafe_bun_windows=${allowUnsafeBunWindows}`,
             `binary_preview_providers=${options.binaryPreviewProviders.join(',')}`,
             `preview_byte_peek=${options.previewBytePeek}`,
             `privacy_exclude_tool_prefixes=${options.privacy.excludeToolPrefixes.join(',')}`,

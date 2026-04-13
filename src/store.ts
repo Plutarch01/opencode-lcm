@@ -458,7 +458,6 @@ function parseArtifactMetadata(
     }) ?? {}
   );
 }
-
 function isValidMessagePartUpdate(event: Event): boolean {
   if (event.type !== 'message.part.updated') return false;
   const part = asRecord(event.properties.part);
