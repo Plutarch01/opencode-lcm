@@ -131,6 +131,7 @@ test('plugin exposes tools, records events, and appends compaction context once'
         'lcm_import_snapshot',
         'lcm_lineage',
         'lcm_pin_session',
+        'lcm_retrieval_debug',
         'lcm_retention_report',
         'lcm_retention_prune',
         'lcm_resume',
@@ -157,15 +158,20 @@ test('plugin exposes tools, records events, and appends compaction context once'
 
     const toolContext = makeToolContext(workspace, 's1');
     const status = await hooks.tool.lcm_status.execute({}, toolContext);
+    const retrieval = await hooks.tool.lcm_retrieval_debug.execute({}, toolContext);
     const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
     const doctor = await hooks.tool.lcm_doctor.execute({ sessionID: 's1' }, toolContext);
 
     assert.match(status, /schema_version=2/);
     assert.match(status, /session_count=1/);
+    assert.match(status, /db_bytes=\d+/);
+    assert.match(status, /prunable_events=0/);
+    assert.match(status, /message_fts=1/);
     assert.match(status, /automatic_retrieval_scope_order=session,root,worktree/);
     assert.match(status, /automatic_retrieval_scope_budgets=session:16,root:12,worktree:8,all:6/);
     assert.match(status, /automatic_retrieval_stop_target_hits=3/);
     assert.match(status, /automatic_retrieval_stop_on_first_scope_with_hits=false/);
+    assert.match(retrieval, /status=no-debug-data/);
     assert.match(describe, /Session: s1/);
     assert.match(describe, /plugin hook body/);
     assert.match(doctor, /checked_scope=session:s1/);
@@ -230,6 +236,10 @@ test('plugin system and message transform hooks respect options', async () => {
     };
 
     await hooks['experimental.chat.messages.transform']({}, output);
+    const retrieval = await hooks.tool.lcm_retrieval_debug.execute(
+      {},
+      makeToolContext(workspace, 's1'),
+    );
 
     assert.match(output.messages[0].parts[0].text, /Archived by opencode-lcm/);
     assert.match(output.messages[1].parts[0].state.output, /infrastructure tool output omitted/);
@@ -240,6 +250,8 @@ test('plugin system and message transform hooks respect options', async () => {
     assert.ok(summaryPart);
     assert.match(summaryPart.text, /Summary roots:/);
     assert.ok(!summaryPart.text.includes('ctx_search'));
+    assert.match(retrieval, /status=no-hits/);
+    assert.match(retrieval, /stop_reason=scope-order-exhausted/);
   } finally {
     // Plugin hooks keep their SQLite store open for the life of the plugin instance.
     // Let the temp workspace be reclaimed by the OS after process exit.

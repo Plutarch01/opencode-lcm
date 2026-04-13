@@ -116,6 +116,57 @@ export type StoreStats = {
   orphanArtifactBlobCount: number;
   worktreeCount: number;
   pinnedSessionCount: number;
+  dbBytes: number;
+  walBytes: number;
+  shmBytes: number;
+  totalBytes: number;
+  prunableEventCount: number;
+  prunableEventTypes: Record<string, number>;
+  messageFtsCount: number;
+  summaryFtsCount: number;
+  artifactFtsCount: number;
+};
+
+export type AutomaticRetrievalDebugScopeStat = {
+  scope: string;
+  budget: number;
+  rawResults: number;
+  selectedHits: number;
+};
+
+export type AutomaticRetrievalDebugHit = {
+  kind: 'message' | 'summary' | 'artifact';
+  id: string;
+  label: string;
+  sessionID?: string;
+  snippet: string;
+};
+
+export type AutomaticRetrievalDebugInfo = {
+  sessionID: string;
+  status:
+    | 'disabled'
+    | 'below-transform-threshold'
+    | 'no-window'
+    | 'no-summary-roots'
+    | 'no-query'
+    | 'no-hit-quota'
+    | 'no-hits'
+    | 'recalled';
+  anchorMessageID?: string;
+  anchorRole?: string;
+  archivedCount?: number;
+  recentCount?: number;
+  queryTokens: string[];
+  queries: string[];
+  searchedScopes: ScopeName[];
+  rawResultCount: number;
+  hitCount: number;
+  allowedHits: number;
+  targetHits: number;
+  stopReason: string;
+  scopeStats: AutomaticRetrievalDebugScopeStat[];
+  hits: AutomaticRetrievalDebugHit[];
 };
 
 export type ConversationMessage = {

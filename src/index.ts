@@ -25,18 +25,26 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           const lines = [
             `schema_version=${stats.schemaVersion}`,
             `total_events=${stats.totalEvents}`,
+            `prunable_events=${stats.prunableEventCount}`,
             `session_count=${stats.sessionCount}`,
             `root_sessions=${stats.rootSessionCount}`,
             `branched_sessions=${stats.branchedSessionCount}`,
             `pinned_sessions=${stats.pinnedSessionCount}`,
             `worktrees=${stats.worktreeCount}`,
             `latest_event_at=${stats.latestEventAt ?? 'n/a'}`,
+            `db_bytes=${stats.dbBytes}`,
+            `wal_bytes=${stats.walBytes}`,
+            `shm_bytes=${stats.shmBytes}`,
+            `total_bytes=${stats.totalBytes}`,
             `summary_nodes=${stats.summaryNodeCount}`,
             `summary_states=${stats.summaryStateCount}`,
             `artifacts=${stats.artifactCount}`,
             `artifact_blobs=${stats.artifactBlobCount}`,
             `shared_artifact_blobs=${stats.sharedArtifactBlobCount}`,
             `orphan_artifact_blobs=${stats.orphanArtifactBlobCount}`,
+            `message_fts=${stats.messageFtsCount}`,
+            `summary_fts=${stats.summaryFtsCount}`,
+            `artifact_fts=${stats.artifactFtsCount}`,
             `default_grep_scope=${options.scopeDefaults.grep}`,
             `default_describe_scope=${options.scopeDefaults.describe}`,
             `scope_profiles=${options.scopeProfiles.length}`,
@@ -61,12 +69,26 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `privacy_exclude_tool_prefixes=${options.privacy.excludeToolPrefixes.join(',')}`,
             `privacy_exclude_path_patterns=${options.privacy.excludePathPatterns.length}`,
             `privacy_redact_patterns=${options.privacy.redactPatterns.length}`,
+            ...Object.entries(stats.prunableEventTypes)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 10)
+              .map(([type, count]) => `prunable_${type}=${count}`),
             ...Object.entries(stats.eventTypes)
               .sort((a, b) => b[1] - a[1])
               .slice(0, 10)
               .map(([type, count]) => `${type}=${count}`),
           ];
           return lines.join('\n');
+        },
+      }),
+
+      lcm_retrieval_debug: tool({
+        description: 'Show latest automatic retrieval diagnostics',
+        args: {
+          sessionID: tool.schema.string().optional(),
+        },
+        async execute(args, context) {
+          return await store.automaticRetrievalDebug(args.sessionID ?? context.sessionID);
         },
       }),
 

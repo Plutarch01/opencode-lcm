@@ -65,6 +65,7 @@ import {
   type SummaryStateRow,
 } from './store-snapshot.js';
 import type {
+  AutomaticRetrievalDebugInfo,
   CapturedEvent,
   ConversationMessage,
   NormalizedSession,
@@ -881,6 +882,7 @@ export class SqliteLcmStore {
   private deferredInitRequested = false;
   private activeOperationCount = 0;
   private readonly pendingPartUpdates = new Map<string, Event>();
+  private readonly lastAutomaticRetrievalBySession = new Map<string, AutomaticRetrievalDebugInfo>();
   private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
   private pendingPartUpdateFlushPromise?: Promise<void>;
 
@@ -1348,6 +1350,7 @@ export class SqliteLcmStore {
   close(): void {
     this.clearDeferredPartUpdateTimer();
     this.pendingPartUpdates.clear();
+    this.lastAutomaticRetrievalBySession.clear();
     if (this.deferredInitTimer) {
       clearTimeout(this.deferredInitTimer);
       this.deferredInitTimer = undefined;
@@ -1432,6 +1435,8 @@ export class SqliteLcmStore {
     await this.prepareForRead();
     await this.ensureDeferredInitComplete();
     const db = this.getDb();
+    const fileSizes = await this.readStoreFileSizes();
+    const prunableEventTypes = this.readPrunableEventTypeCountsSync();
     const totalRow = validateRow<{ count: number; latest: number | null }>(
       db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
       { count: 'number', latest: 'nullable' },
@@ -1521,6 +1526,21 @@ export class SqliteLcmStore {
       { count: 'number' },
       'stats.worktreeCount',
     );
+    const messageFtsRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM message_fts').get(),
+      { count: 'number' },
+      'stats.messageFtsCount',
+    );
+    const summaryFtsRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get(),
+      { count: 'number' },
+      'stats.summaryFtsCount',
+    );
+    const artifactFtsRow = validateRow<{ count: number }>(
+      db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get(),
+      { count: 'number' },
+      'stats.artifactFtsCount',
+    );
 
     return {
       schemaVersion: readSchemaVersionSync(db),
@@ -1538,7 +1558,66 @@ export class SqliteLcmStore {
       orphanArtifactBlobCount: orphanBlobRow.count,
       worktreeCount: worktreeRow.count,
       pinnedSessionCount: pinnedRow.count,
+      dbBytes: fileSizes.dbBytes,
+      walBytes: fileSizes.walBytes,
+      shmBytes: fileSizes.shmBytes,
+      totalBytes: fileSizes.totalBytes,
+      prunableEventCount: prunableEventTypes.reduce((sum, row) => sum + row.count, 0),
+      prunableEventTypes: Object.fromEntries(
+        prunableEventTypes.map((row) => [row.eventType, row.count]),
+      ),
+      messageFtsCount: messageFtsRow.count,
+      summaryFtsCount: summaryFtsRow.count,
+      artifactFtsCount: artifactFtsRow.count,
     };
+  }
+
+  async automaticRetrievalDebug(sessionID?: string): Promise<string> {
+    await this.prepareForRead();
+    const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+    if (!resolvedSessionID) return 'No archived sessions yet.';
+
+    const debug = this.lastAutomaticRetrievalBySession.get(resolvedSessionID);
+    if (!debug) {
+      return [
+        `session_id=${resolvedSessionID}`,
+        'status=no-debug-data',
+        'Run another turn in this session so transformMessages can record recall telemetry.',
+      ].join('\n');
+    }
+
+    const lines = [
+      `session_id=${debug.sessionID}`,
+      `status=${debug.status}`,
+      `anchor_message_id=${debug.anchorMessageID ?? 'n/a'}`,
+      `anchor_role=${debug.anchorRole ?? 'n/a'}`,
+      `archived_messages=${debug.archivedCount ?? 0}`,
+      `recent_messages=${debug.recentCount ?? 0}`,
+      `allowed_hits=${debug.allowedHits}`,
+      `target_hits=${debug.targetHits}`,
+      `raw_results=${debug.rawResultCount}`,
+      `selected_hits=${debug.hitCount}`,
+      `stop_reason=${debug.stopReason}`,
+      `query_tokens=${debug.queryTokens.length > 0 ? debug.queryTokens.join(',') : 'none'}`,
+      `queries=${debug.queries.length > 0 ? debug.queries.join(' | ') : 'none'}`,
+      `searched_scopes=${debug.searchedScopes.length > 0 ? debug.searchedScopes.join(',') : 'none'}`,
+      'scope_stats:',
+      ...(debug.scopeStats.length > 0
+        ? debug.scopeStats.map(
+            (entry) =>
+              `- ${entry.scope} budget=${entry.budget} raw_results=${entry.rawResults} selected_hits=${entry.selectedHits}`,
+          )
+        : ['- none']),
+      'selected_hit_preview:',
+      ...(debug.hits.length > 0
+        ? debug.hits.map(
+            (hit) =>
+              `- ${hit.kind} session=${hit.sessionID ?? 'n/a'} id=${hit.id} label=${hit.label} snippet=${truncate(hit.snippet, 160)}`,
+          )
+        : ['- none']),
+    ];
+
+    return lines.join('\n');
   }
 
   async grep(input: {
@@ -3164,17 +3243,83 @@ export class SqliteLcmStore {
       if (validMessages.length !== messages.length) {
         messages.splice(0, messages.length, ...validMessages);
       }
-      if (messages.length < this.options.minMessagesForTransform) return false;
+      if (messages.length < this.options.minMessagesForTransform) {
+        const anchor = this.findAutomaticRetrievalAnchor(messages);
+        if (anchor) {
+          this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
+            sessionID: anchor.info.sessionID,
+            status: 'below-transform-threshold',
+            anchorMessageID: anchor.info.id,
+            anchorRole: anchor.info.role,
+            archivedCount: 0,
+            recentCount: messages.length,
+            queryTokens: [],
+            queries: [],
+            searchedScopes: [],
+            rawResultCount: 0,
+            hitCount: 0,
+            allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+            targetHits: 0,
+            stopReason: 'below-transform-threshold',
+            scopeStats: [],
+            hits: [],
+          });
+        }
+        return false;
+      }
 
       const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
-      if (!window) return false;
+      if (!window) {
+        const anchor = this.findAutomaticRetrievalAnchor(messages);
+        if (anchor) {
+          this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
+            sessionID: anchor.info.sessionID,
+            status: 'no-window',
+            anchorMessageID: anchor.info.id,
+            anchorRole: anchor.info.role,
+            archivedCount: 0,
+            recentCount: messages.length,
+            queryTokens: [],
+            queries: [],
+            searchedScopes: [],
+            rawResultCount: 0,
+            hitCount: 0,
+            allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+            targetHits: 0,
+            stopReason: 'no-window',
+            scopeStats: [],
+            hits: [],
+          });
+        }
+        return false;
+      }
 
       await this.prepareForRead();
 
       const { anchor, archived, recent } = window;
 
       const roots = this.ensureSummaryGraphSync(anchor.info.sessionID, archived);
-      if (roots.length === 0) return false;
+      if (roots.length === 0) {
+        this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
+          sessionID: anchor.info.sessionID,
+          status: 'no-summary-roots',
+          anchorMessageID: anchor.info.id,
+          anchorRole: anchor.info.role,
+          archivedCount: archived.length,
+          recentCount: recent.length,
+          queryTokens: [],
+          queries: [],
+          searchedScopes: [],
+          rawResultCount: 0,
+          hitCount: 0,
+          allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+          targetHits: 0,
+          stopReason: 'no-summary-roots',
+          scopeStats: [],
+          hits: [],
+        });
+        return false;
+      }
 
       const summary = buildActiveSummaryText(
         roots,
@@ -3273,16 +3418,76 @@ export class SqliteLcmStore {
     recent: ConversationMessage[],
     anchor: ConversationMessage,
   ): Promise<string | undefined> {
-    if (!this.options.automaticRetrieval.enabled) return undefined;
+    if (!this.options.automaticRetrieval.enabled) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'disabled',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: 0,
+        recentCount: recent.length,
+        queryTokens: [],
+        queries: [],
+        searchedScopes: [],
+        rawResultCount: 0,
+        hitCount: 0,
+        allowedHits: 0,
+        targetHits: 0,
+        stopReason: 'disabled',
+        scopeStats: [],
+        hits: [],
+      });
+      return undefined;
+    }
 
     const query = this.buildAutomaticRetrievalQuery(anchor, recent);
-    if (!query) return undefined;
+    if (!query) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'no-query',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: 0,
+        recentCount: recent.length,
+        queryTokens: [],
+        queries: [],
+        searchedScopes: [],
+        rawResultCount: 0,
+        hitCount: 0,
+        allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+        targetHits: 0,
+        stopReason: 'no-query',
+        scopeStats: [],
+        hits: [],
+      });
+      return undefined;
+    }
 
     const allowedHits =
       clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4) +
       clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3) +
       clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3);
-    if (allowedHits <= 0) return undefined;
+    if (allowedHits <= 0) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'no-hit-quota',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: 0,
+        recentCount: recent.length,
+        queryTokens: query.tokens,
+        queries: query.queries,
+        searchedScopes: [],
+        rawResultCount: 0,
+        hitCount: 0,
+        allowedHits,
+        targetHits: 0,
+        stopReason: 'no-hit-quota',
+        scopeStats: [],
+        hits: [],
+      });
+      return undefined;
+    }
 
     const targetHits = this.resolveAutomaticRetrievalTargetHits(allowedHits);
     const results: SearchResult[] = [];
@@ -3358,6 +3563,24 @@ export class SqliteLcmStore {
       }
 
       if (stopReason !== 'scope-order-exhausted') {
+        this.recordAutomaticRetrievalDebug(sessionID, {
+          sessionID,
+          status: 'recalled',
+          anchorMessageID: anchor.info.id,
+          anchorRole: anchor.info.role,
+          archivedCount: Math.max(0, this.readMessageCountSync(sessionID) - recent.length),
+          recentCount: recent.length,
+          queryTokens: query.tokens,
+          queries: query.queries,
+          searchedScopes,
+          rawResultCount: results.length,
+          hitCount: hits.length,
+          allowedHits,
+          targetHits,
+          stopReason,
+          scopeStats,
+          hits,
+        });
         return renderAutomaticRetrievalContext(
           searchedScopes,
           hits,
@@ -3372,7 +3595,46 @@ export class SqliteLcmStore {
       }
     }
 
-    if (hits.length === 0) return undefined;
+    if (hits.length === 0) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'no-hits',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: Math.max(0, this.readMessageCountSync(sessionID) - recent.length),
+        recentCount: recent.length,
+        queryTokens: query.tokens,
+        queries: query.queries,
+        searchedScopes,
+        rawResultCount: results.length,
+        hitCount: 0,
+        allowedHits,
+        targetHits,
+        stopReason,
+        scopeStats,
+        hits: [],
+      });
+      return undefined;
+    }
+
+    this.recordAutomaticRetrievalDebug(sessionID, {
+      sessionID,
+      status: 'recalled',
+      anchorMessageID: anchor.info.id,
+      anchorRole: anchor.info.role,
+      archivedCount: Math.max(0, this.readMessageCountSync(sessionID) - recent.length),
+      recentCount: recent.length,
+      queryTokens: query.tokens,
+      queries: query.queries,
+      searchedScopes,
+      rawResultCount: results.length,
+      hitCount: hits.length,
+      allowedHits,
+      targetHits,
+      stopReason,
+      scopeStats,
+      hits,
+    });
 
     return renderAutomaticRetrievalContext(
       searchedScopes,
@@ -3385,6 +3647,30 @@ export class SqliteLcmStore {
         scopeStats,
       },
     );
+  }
+
+  private resolveAutomaticRetrievalAllowedHits(): number {
+    return (
+      clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4) +
+      clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3) +
+      clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3)
+    );
+  }
+
+  private findAutomaticRetrievalAnchor(
+    messages: ConversationMessage[],
+  ): ConversationMessage | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.info.role === 'user') return messages[index];
+    }
+    return undefined;
+  }
+
+  private recordAutomaticRetrievalDebug(
+    sessionID: string,
+    debug: AutomaticRetrievalDebugInfo,
+  ): void {
+    this.lastAutomaticRetrievalBySession.set(sessionID, debug);
   }
 
   private buildAutomaticRetrievalQuery(

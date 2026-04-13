@@ -1180,6 +1180,138 @@ test('automatic retrieval can stop after the first scope with hits', async () =>
   }
 });
 
+test('automaticRetrievalDebug reports the latest successful recall decision', async () => {
+  const workspace = makeWorkspace('lcm-auto-retrieval-debug-hit');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
+    );
+    await store.init();
+
+    await createSession(store, workspace, 's1', 1);
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm1',
+      created: 2,
+      parts: [textPart('s1', 'm1', 'm1-p', 'tenant mapping sqlite lives in the billing cache')],
+    });
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm2',
+      created: 3,
+      role: 'assistant',
+      parts: [textPart('s1', 'm2', 'm2-p', 'confirmed the tenant mapping sqlite flow')],
+    });
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm3',
+      created: 4,
+      parts: [textPart('s1', 'm3', 'm3-p', 'other archived context')],
+    });
+
+    const messages = [
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm1',
+        created: 2,
+        parts: [textPart('s1', 'm1', 'm1-p', 'tenant mapping sqlite lives in the billing cache')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm2',
+        created: 3,
+        role: 'assistant',
+        parts: [textPart('s1', 'm2', 'm2-p', 'confirmed the tenant mapping sqlite flow')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm3',
+        created: 4,
+        parts: [textPart('s1', 'm3', 'm3-p', 'other archived context')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm4',
+        created: 5,
+        parts: [textPart('s1', 'm4', 'm4-p', 'tenant mapping sqlite')],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+    const debug = await store.automaticRetrievalDebug('s1');
+
+    assert.match(debug, /status=recalled/);
+    assert.match(debug, /anchor_message_id=m4/);
+    assert.match(debug, /query_tokens=tenant,mapping,sqlite/);
+    assert.match(debug, /searched_scopes=session/);
+    assert.match(debug, /selected_hits=\d+/);
+    assert.match(debug, /selected_hit_preview:/);
+    assert.match(debug, /session=s1 id=m1/);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('automaticRetrievalDebug records suppressed low-signal turns as no-query', async () => {
+  const workspace = makeWorkspace('lcm-auto-retrieval-debug-no-query');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ freshTailMessages: 1, minMessagesForTransform: 4 }),
+    );
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+
+    const messages = [
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm1',
+        created: 1,
+        parts: [textPart('s1', 'm1', 'm1-p', 'older archived message')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm2',
+        created: 2,
+        role: 'assistant',
+        parts: [textPart('s1', 'm2', 'm2-p', 'older assistant note')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm3',
+        created: 3,
+        parts: [textPart('s1', 'm3', 'm3-p', 'ok')],
+      }),
+      conversationMessage({
+        sessionID: 's1',
+        messageID: 'm4',
+        created: 4,
+        role: 'assistant',
+        parts: [textPart('s1', 'm4', 'm4-p', 'acknowledged')],
+      }),
+    ];
+
+    await store.transformMessages(messages);
+    const debug = await store.automaticRetrievalDebug('s1');
+
+    assert.match(debug, /status=no-query/);
+    assert.match(debug, /anchor_message_id=m3/);
+    assert.match(debug, /query_tokens=none/);
+    assert.match(debug, /queries=none/);
+    assert.match(debug, /selected_hits=0/);
+    assert.match(debug, /stop_reason=no-query/);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('transformMessages can disable automatic archived retrieval', async () => {
   const workspace = makeWorkspace('lcm-auto-retrieval-off');
   let store;
