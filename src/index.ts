@@ -1,12 +1,21 @@
 import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
 
+import type { LcmStore } from './lcm-store.js';
+import { NodeSidecarLcmStore } from './node-sidecar-store.js';
 import { resolveOptions } from './options.js';
 import { SqliteLcmStore } from './store.js';
 import type { OpencodeLcmOptions } from './types.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
+type RuntimeBackend = 'in_process' | 'node_sidecar' | 'disabled';
 
 const ALLOW_UNSAFE_BUN_WINDOWS_ENV = 'OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS';
+
+type BunWindowsSafetyDecision = {
+  allowed: boolean;
+  configRequested: boolean;
+  envRequested: boolean;
+};
 
 function isTruthyEnvFlag(value: string | undefined): boolean {
   if (!value) return false;
@@ -22,28 +31,35 @@ function isUnsafeBunWindowsRuntime(): boolean {
   return isBunRuntime() && process.platform === 'win32';
 }
 
-function resolveAllowUnsafeBunWindows(options: OpencodeLcmOptions): boolean {
-  return (
-    options.runtimeSafety.allowUnsafeBunWindows ||
-    isTruthyEnvFlag(process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV])
-  );
+function resolveBunWindowsSafety(options: OpencodeLcmOptions): BunWindowsSafetyDecision {
+  const configRequested = options.runtimeSafety.allowUnsafeBunWindows;
+  const envRequested = isTruthyEnvFlag(process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV]);
+
+  return {
+    allowed: envRequested,
+    configRequested,
+    envRequested,
+  };
 }
 
-function buildSafeModeStatus(allowUnsafeBunWindows: boolean): string {
+function buildSafeModeStatus(decision: BunWindowsSafetyDecision): string {
   return [
     'status=disabled',
     'reason=bun_windows_runtime_guard',
     'available_tools=lcm_status',
     `platform=${process.platform}`,
     `bun_runtime=${isBunRuntime()}`,
-    `runtime_safety_allow_unsafe_bun_windows=${allowUnsafeBunWindows}`,
-    'override_config=runtimeSafety.allowUnsafeBunWindows=true',
+    `runtime_safety_allow_unsafe_bun_windows=${decision.allowed}`,
+    `runtime_safety_config_allow_unsafe_bun_windows=${decision.configRequested}`,
+    `runtime_safety_env_allow_unsafe_bun_windows=${decision.envRequested}`,
+    'runtime_safety_backend=disabled',
+    'override_config=ignored_on_bun_windows',
     `override_env=${ALLOW_UNSAFE_BUN_WINDOWS_ENV}=1`,
-    'message=opencode-lcm disabled itself before opening SQLite because Bun on Windows has reported native crashes in this path',
+    'message=opencode-lcm could not start its Node sidecar, so it disabled itself before opening SQLite in Bun on Windows; set OPENCODE_LCM_NODE_PATH to a working Node executable or use the env override only for deliberate debugging',
   ].join('\n');
 }
 
-function createSafeModeHooks(allowUnsafeBunWindows: boolean): Hooks {
+function createSafeModeHooks(decision: BunWindowsSafetyDecision): Hooks {
   return {
     event: async () => {},
 
@@ -52,7 +68,7 @@ function createSafeModeHooks(allowUnsafeBunWindows: boolean): Hooks {
         description: 'Show archived LCM capture stats',
         args: {},
         async execute() {
-          return buildSafeModeStatus(allowUnsafeBunWindows);
+          return buildSafeModeStatus(decision);
         },
       }),
     },
@@ -63,17 +79,38 @@ function createSafeModeHooks(allowUnsafeBunWindows: boolean): Hooks {
   };
 }
 
+function resolveRuntimeBackend(decision: BunWindowsSafetyDecision): RuntimeBackend {
+  if (!isUnsafeBunWindowsRuntime()) return 'in_process';
+  return decision.allowed ? 'in_process' : 'node_sidecar';
+}
+
+function createStore(
+  directory: string,
+  options: OpencodeLcmOptions,
+  backend: RuntimeBackend,
+): LcmStore {
+  if (backend === 'node_sidecar') return new NodeSidecarLcmStore(directory, options);
+  return new SqliteLcmStore(directory, options);
+}
+
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   const options = resolveOptions(rawOptions);
-  const allowUnsafeBunWindows = resolveAllowUnsafeBunWindows(options);
+  const bunWindowsSafety = resolveBunWindowsSafety(options);
+  const runtimeBackend = resolveRuntimeBackend(bunWindowsSafety);
 
-  if (isUnsafeBunWindowsRuntime() && !allowUnsafeBunWindows) {
-    return createSafeModeHooks(allowUnsafeBunWindows);
+  if (runtimeBackend === 'disabled') {
+    return createSafeModeHooks(bunWindowsSafety);
   }
 
-  const store = new SqliteLcmStore(ctx.directory, options);
+  const store = createStore(ctx.directory, options, runtimeBackend);
 
-  await store.init();
+  try {
+    await store.init();
+  } catch (_error) {
+    store.close();
+    if (runtimeBackend === 'node_sidecar') return createSafeModeHooks(bunWindowsSafety);
+    throw _error;
+  }
 
   return {
     event: async ({ event }) => {
@@ -128,7 +165,10 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `fresh_tail_messages=${options.freshTailMessages}`,
             `min_messages_for_transform=${options.minMessagesForTransform}`,
             `large_content_threshold=${options.largeContentThreshold}`,
-            `runtime_safety_allow_unsafe_bun_windows=${allowUnsafeBunWindows}`,
+            `runtime_safety_allow_unsafe_bun_windows=${bunWindowsSafety.allowed}`,
+            `runtime_safety_config_allow_unsafe_bun_windows=${bunWindowsSafety.configRequested}`,
+            `runtime_safety_env_allow_unsafe_bun_windows=${bunWindowsSafety.envRequested}`,
+            `runtime_safety_backend=${runtimeBackend}`,
             `binary_preview_providers=${options.binaryPreviewProviders.join(',')}`,
             `preview_byte_peek=${options.previewBytePeek}`,
             `privacy_exclude_tool_prefixes=${options.privacy.excludeToolPrefixes.join(',')}`,

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-04-18
+
+### Fixed
+- Bun on Windows now keeps core archive/retrieval functionality by routing SQLite-backed work through a Node sidecar instead of loading SQLite in the Bun host process
+- Config-only unsafe overrides no longer bypass the Bun/Windows sidecar; `OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1` is reserved for deliberate in-process debugging
+
 ## [0.14.0] - 2026-04-13
 
 ### Added

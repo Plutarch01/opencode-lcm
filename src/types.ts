@@ -63,6 +63,7 @@ export type SummaryV2Options = {
 };
 
 export type RuntimeSafetyOptions = {
+  /** Deprecated on Bun+Windows: config is reported for diagnostics but cannot bypass the sidecar. */
   allowUnsafeBunWindows: boolean;
 };
 

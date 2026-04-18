@@ -106,7 +106,7 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
 > All defaults are applied automatically. Expand below only if you need to override settings.
 
 > [!IMPORTANT]
-> On Bun for Windows, `opencode-lcm` now starts in a pre-SQLite safe mode and only exposes `lcm_status` by default. This avoids a Bun/Windows native-crash path seen in the field. To force-enable the full plugin anyway, set `"runtimeSafety": { "allowUnsafeBunWindows": true }` in the plugin config or export `OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1` before starting OpenCode.
+> On Bun for Windows, `opencode-lcm` keeps full archive and retrieval behavior by running SQLite work in a Node sidecar process. This avoids loading SQLite in the Bun host process, where native crashes have been seen. If `node` is not on `PATH`, set `OPENCODE_LCM_NODE_PATH` to a Node executable. `OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1` bypasses the sidecar only for deliberate debugging.
 
 <details>
 <summary><strong>Full Configuration</strong> (click to expand)</summary>

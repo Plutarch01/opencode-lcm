@@ -145,15 +145,17 @@ test('resolveOptions normalizes malformed plugin config', () => {
   });
 });
 
-test('plugin defaults to Bun on Windows safe mode before opening SQLite', async () => {
-  const workspace = makeWorkspace('lcm-plugin-bun-win-safe-mode');
+test('plugin uses Node sidecar on Bun Windows without unsafe env override', async () => {
+  const workspace = makeWorkspace('lcm-plugin-bun-win-sidecar');
 
   try {
     await withSimulatedBunWindows(async () => {
-      const hooks = await OpencodeLcmPlugin(makePluginContext(workspace), makeOptions());
+      const hooks = await OpencodeLcmPlugin(
+        makePluginContext(workspace),
+        makeOptions({ freshTailMessages: 1 }),
+      );
 
-      assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), ['lcm_status']);
-      assert.equal(hooks.tool.lcm_describe, undefined);
+      assert.ok(hooks.tool.lcm_describe);
 
       await hooks.event({
         event: {
@@ -161,13 +163,23 @@ test('plugin defaults to Bun on Windows safe mode before opening SQLite', async 
           properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
         },
       });
+      await captureMessage(
+        { capture: (event) => hooks.event({ event }) },
+        {
+          sessionID: 's1',
+          messageID: 'm1',
+          created: 2,
+          parts: [textPart('s1', 'm1', 'm1-p', 'sidecar preserved core functionality')],
+        },
+      );
 
       const systemOutput = { system: [] };
       await hooks['experimental.chat.system.transform'](
         { sessionID: 's1', model: {} },
         systemOutput,
       );
-      assert.deepEqual(systemOutput.system, []);
+      assert.equal(systemOutput.system.length, 1);
+      assert.match(systemOutput.system[0], /Archived session state/);
 
       const messagesOutput = {
         messages: [
@@ -184,29 +196,79 @@ test('plugin defaults to Bun on Windows safe mode before opening SQLite', async 
 
       const compactionOutput = { context: [], prompt: 'keep-default' };
       await hooks['experimental.session.compacting']({ sessionID: 's1' }, compactionOutput);
-      assert.deepEqual(compactionOutput, { context: [], prompt: 'keep-default' });
+      assert.equal(compactionOutput.context.length, 1);
 
-      const status = await hooks.tool.lcm_status.execute({}, makeToolContext(workspace, 's1'));
-      assert.match(status, /status=disabled/);
-      assert.match(status, /reason=bun_windows_runtime_guard/);
-      assert.match(status, /available_tools=lcm_status/);
+      const toolContext = makeToolContext(workspace, 's1');
+      const status = await hooks.tool.lcm_status.execute({}, toolContext);
+      const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
+
+      assert.match(status, /schema_version=2/);
       assert.match(status, /runtime_safety_allow_unsafe_bun_windows=false/);
-      assert.match(status, /override_config=runtimeSafety\.allowUnsafeBunWindows=true/);
-      assert.match(status, /override_env=OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1/);
+      assert.match(status, /runtime_safety_config_allow_unsafe_bun_windows=false/);
+      assert.match(status, /runtime_safety_env_allow_unsafe_bun_windows=false/);
+      assert.match(status, /runtime_safety_backend=node_sidecar/);
+      assert.match(describe, /sidecar preserved core functionality/);
     });
   } finally {
-    // Safe mode does not open a store handle.
+    // Plugin hooks keep their sidecar store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
   }
 });
 
-test('plugin allows explicit Bun on Windows override', async () => {
-  const workspace = makeWorkspace('lcm-plugin-bun-win-override');
+test('plugin routes Bun on Windows config override through the Node sidecar', async () => {
+  const workspace = makeWorkspace('lcm-plugin-bun-win-config-sidecar');
 
   try {
     await withSimulatedBunWindows(async () => {
       const hooks = await OpencodeLcmPlugin(
         makePluginContext(workspace),
         makeOptions({ runtimeSafety: { allowUnsafeBunWindows: true }, freshTailMessages: 1 }),
+      );
+
+      assert.ok(hooks.tool.lcm_describe);
+      await hooks.event({
+        event: {
+          type: 'session.created',
+          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+        },
+      });
+      await captureMessage(
+        { capture: (event) => hooks.event({ event }) },
+        {
+          sessionID: 's1',
+          messageID: 'm1',
+          created: 2,
+          parts: [textPart('s1', 'm1', 'm1-p', 'config-sidecar body')],
+        },
+      );
+
+      const toolContext = makeToolContext(workspace, 's1');
+      const status = await hooks.tool.lcm_status.execute({}, toolContext);
+      const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
+
+      assert.match(status, /schema_version=2/);
+      assert.match(status, /runtime_safety_allow_unsafe_bun_windows=false/);
+      assert.match(status, /runtime_safety_config_allow_unsafe_bun_windows=true/);
+      assert.match(status, /runtime_safety_env_allow_unsafe_bun_windows=false/);
+      assert.match(status, /runtime_safety_backend=node_sidecar/);
+      assert.match(describe, /config-sidecar body/);
+    });
+  } finally {
+    // Plugin hooks keep their sidecar store open for the life of the plugin instance.
+    // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+
+test('plugin allows explicit Bun on Windows env override', async () => {
+  const workspace = makeWorkspace('lcm-plugin-bun-win-override');
+
+  try {
+    await withSimulatedBunWindows(async () => {
+      process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV] = '1';
+
+      const hooks = await OpencodeLcmPlugin(
+        makePluginContext(workspace),
+        makeOptions({ freshTailMessages: 1 }),
       );
 
       assert.ok(hooks.tool.lcm_describe);
@@ -233,6 +295,9 @@ test('plugin allows explicit Bun on Windows override', async () => {
 
       assert.match(status, /schema_version=2/);
       assert.match(status, /runtime_safety_allow_unsafe_bun_windows=true/);
+      assert.match(status, /runtime_safety_config_allow_unsafe_bun_windows=false/);
+      assert.match(status, /runtime_safety_env_allow_unsafe_bun_windows=true/);
+      assert.match(status, /runtime_safety_backend=in_process/);
       assert.match(describe, /override-enabled body/);
     });
   } finally {
