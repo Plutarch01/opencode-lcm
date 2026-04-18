@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-04-18
+
+### Fixed
+- Biome lint: sorted imports and used optional chaining in `node-sidecar-store.ts`
+- Biome format: wrapped long `rejectAll` call for line-length compliance
+
 ## [0.14.1] - 2026-04-18
 
 ### Fixed

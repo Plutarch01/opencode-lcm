@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
@@ -204,7 +204,9 @@ export class NodeSidecarLcmStore implements LcmStore {
     child.once('exit', (code, signal) => {
       if (this.closed) return;
       const suffix = this.stderrBuffer ? `\nSidecar stderr:\n${this.stderrBuffer}` : '';
-      this.rejectAll(new Error(`opencode-lcm Node sidecar exited code=${code} signal=${signal}${suffix}`));
+      this.rejectAll(
+        new Error(`opencode-lcm Node sidecar exited code=${code} signal=${signal}${suffix}`),
+      );
     });
     this.updateRefs();
   }
@@ -212,7 +214,7 @@ export class NodeSidecarLcmStore implements LcmStore {
   private request(method: string, params: unknown): Promise<unknown> {
     this.ensureStarted();
     const child = this.child;
-    if (!child || !child.stdin.writable) {
+    if (!child?.stdin.writable) {
       return Promise.reject(new Error('opencode-lcm Node sidecar is not writable'));
     }
 
