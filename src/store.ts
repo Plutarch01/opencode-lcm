@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 
 import type { Event, Message, Part } from '@opencode-ai/sdk';
@@ -769,6 +770,17 @@ function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
 }
 
+function isFilesystemWriteError(error: unknown): boolean {
+  return (
+    hasErrorCode(error, 'EACCES') || hasErrorCode(error, 'EPERM') || hasErrorCode(error, 'EROFS')
+  );
+}
+
+function isReadonlySqliteError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return message.includes('readonly database');
+}
+
 async function openBunSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
   const { Database } = await import('bun:sqlite');
   const db = new (
@@ -870,8 +882,8 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
 
 export class SqliteLcmStore {
   private static readonly deferredPartUpdateDelayMs = 250;
-  private readonly baseDir: string;
-  private readonly dbPath: string;
+  private baseDir: string;
+  private dbPath: string;
   private readonly privacy: CompiledPrivacyOptions;
   private readonly workspaceDirectory: string;
   private db?: SqlDatabaseLike;
@@ -884,6 +896,7 @@ export class SqliteLcmStore {
   private readonly lastAutomaticRetrievalBySession = new Map<string, AutomaticRetrievalDebugInfo>();
   private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
   private pendingPartUpdateFlushPromise?: Promise<void>;
+  private usingFallbackBaseDir = false;
 
   constructor(
     projectDir: string,
@@ -896,7 +909,70 @@ export class SqliteLcmStore {
   }
 
   async init(): Promise<void> {
-    await mkdir(this.baseDir, { recursive: true });
+    await this.ensureStoreDirReady();
+  }
+
+  private usesDefaultStoreDir(): boolean {
+    return this.options.storeDir === undefined || this.options.storeDir === '.lcm';
+  }
+
+  private resolveFallbackBaseDir(): string {
+    const worktreeKey = normalizeWorktreeKey(this.workspaceDirectory) ?? this.workspaceDirectory;
+    const suffix = createHash('sha256').update(worktreeKey).digest('hex').slice(0, 16);
+    return path.join(homedir(), '.opencode-lcm', 'stores', suffix);
+  }
+
+  private async probeStoreDirWrite(): Promise<void> {
+    const probePath = path.join(this.baseDir, `.write-probe-${process.pid}-${randomUUID()}`);
+    try {
+      await writeFile(probePath, '', { flag: 'wx' });
+    } finally {
+      try {
+        await unlink(probePath);
+      } catch (error) {
+        if (!hasErrorCode(error, 'ENOENT')) throw error;
+      }
+    }
+  }
+
+  private async ensureStoreDirReady(): Promise<void> {
+    try {
+      await mkdir(this.baseDir, { recursive: true });
+      if (!this.usesDefaultStoreDir()) return;
+      await this.probeStoreDirWrite();
+    } catch (error) {
+      if (!(await this.trySwitchToFallbackBaseDir(error, 'init'))) throw error;
+      await mkdir(this.baseDir, { recursive: true });
+      await this.probeStoreDirWrite();
+    }
+  }
+
+  private async trySwitchToFallbackBaseDir(error: unknown, reason: string): Promise<boolean> {
+    if (this.usingFallbackBaseDir || !this.usesDefaultStoreDir()) return false;
+    if (!isFilesystemWriteError(error) && !isReadonlySqliteError(error)) return false;
+
+    const previousBaseDir = this.baseDir;
+    this.close();
+    this.baseDir = this.resolveFallbackBaseDir();
+    this.dbPath = path.join(this.baseDir, 'lcm.db');
+    this.usingFallbackBaseDir = true;
+    logStartupPhase('store-dir:fallback', {
+      reason,
+      from: previousBaseDir,
+      to: this.baseDir,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return true;
+  }
+
+  private async withReadonlyStoreFallback<T>(reason: string, operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(await this.trySwitchToFallbackBaseDir(error, reason))) throw error;
+      await this.ensureStoreDirReady();
+      return await operation();
+    }
   }
 
   // Keep deferred SQLite maintenance off the active connection while a store operation is running.
@@ -1032,16 +1108,18 @@ export class SqliteLcmStore {
   }
 
   private async ensureDbReady(): Promise<void> {
-    if (!this.dbReadyPromise) {
-      if (this.db) {
-        this.scheduleDeferredInit();
-        return;
+    await this.withReadonlyStoreFallback('open-db', async () => {
+      if (!this.dbReadyPromise) {
+        if (this.db) {
+          this.scheduleDeferredInit();
+          return;
+        }
+        this.dbReadyPromise = this.openAndInitializeDb();
       }
-      this.dbReadyPromise = this.openAndInitializeDb();
-    }
 
-    await this.dbReadyPromise;
-    this.scheduleDeferredInit();
+      await this.dbReadyPromise;
+      this.scheduleDeferredInit();
+    });
   }
 
   private async openAndInitializeDb(): Promise<void> {
@@ -1365,71 +1443,73 @@ export class SqliteLcmStore {
 
   async capture(event: Event): Promise<void> {
     return this.withStoreActivity(async () => {
-      const normalized = normalizeEvent(event);
-      if (!normalized) return;
+      await this.withReadonlyStoreFallback('capture', async () => {
+        const normalized = normalizeEvent(event);
+        if (!normalized) return;
 
-      if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
+        if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
 
-      const shouldRecord = this.shouldRecordEvent(normalized.type);
-      const shouldPersistSession =
-        Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
-      if (!shouldRecord && !shouldPersistSession) return;
+        const shouldRecord = this.shouldRecordEvent(normalized.type);
+        const shouldPersistSession =
+          Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
+        if (!shouldRecord && !shouldPersistSession) return;
 
-      await this.ensureDeferredInitComplete();
+        await this.ensureDeferredInitComplete();
 
-      if (shouldRecord) {
-        this.writeEvent(normalized);
-      }
-
-      if (!normalized.sessionID || !shouldPersistSession) return;
-
-      const session = shouldUseLightweightPartCapture(normalized)
-        ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
-        : resolveCaptureHydrationMode() === 'targeted'
-          ? this.readSessionForCaptureSync(normalized)
-          : this.readSessionSync(normalized.sessionID);
-      const previousParentSessionID = session.parentSessionID;
-      const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
-        session,
-        normalized,
-      );
-      let next = this.applyEvent(session, normalized);
-      next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
-      next.eventCount += 1;
-      next = this.prepareSessionForPersistence(next);
-
-      await this.persistCapturedSession(next, normalized);
-
-      if (this.shouldRefreshLineageForEvent(normalized.type)) {
-        this.refreshAllLineageSync();
-        const refreshed = this.readSessionHeaderSync(normalized.sessionID);
-        if (refreshed) {
-          next = {
-            ...next,
-            parentSessionID: refreshed.parentSessionID,
-            rootSessionID: refreshed.rootSessionID,
-            lineageDepth: refreshed.lineageDepth,
-          };
+        if (shouldRecord) {
+          this.writeEvent(normalized);
         }
-      }
 
-      if (shouldSyncDerivedState) {
-        this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
-      }
+        if (!normalized.sessionID || !shouldPersistSession) return;
 
-      if (
-        this.shouldSyncDerivedLineageSubtree(
-          normalized.type,
-          previousParentSessionID,
-          next.parentSessionID,
-        )
-      ) {
-        this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
-      }
+        const session = shouldUseLightweightPartCapture(normalized)
+          ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
+          : resolveCaptureHydrationMode() === 'targeted'
+            ? this.readSessionForCaptureSync(normalized)
+            : this.readSessionSync(normalized.sessionID);
+        const previousParentSessionID = session.parentSessionID;
+        const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
+          session,
+          normalized,
+        );
+        let next = this.applyEvent(session, normalized);
+        next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
+        next.eventCount += 1;
+        next = this.prepareSessionForPersistence(next);
 
-      if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
-        this.deleteOrphanArtifactBlobsSync();
-      }
+        await this.persistCapturedSession(next, normalized);
+
+        if (this.shouldRefreshLineageForEvent(normalized.type)) {
+          this.refreshAllLineageSync();
+          const refreshed = this.readSessionHeaderSync(normalized.sessionID);
+          if (refreshed) {
+            next = {
+              ...next,
+              parentSessionID: refreshed.parentSessionID,
+              rootSessionID: refreshed.rootSessionID,
+              lineageDepth: refreshed.lineageDepth,
+            };
+          }
+        }
+
+        if (shouldSyncDerivedState) {
+          this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
+        }
+
+        if (
+          this.shouldSyncDerivedLineageSubtree(
+            normalized.type,
+            previousParentSessionID,
+            next.parentSessionID,
+          )
+        ) {
+          this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
+        }
+
+        if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
+          this.deleteOrphanArtifactBlobsSync();
+        }
+      });
     });
   }
 

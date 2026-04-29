@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -41,6 +42,12 @@ function makeOptions(overrides = {}) {
     previewBytePeek: 8,
     ...overrides,
   };
+}
+
+function fallbackStoreDir(workspace, homeDir) {
+  const worktreeKey = workspace.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const suffix = createHash('sha256').update(worktreeKey).digest('hex').slice(0, 16);
+  return path.join(homeDir, '.opencode-lcm', 'stores', suffix);
 }
 
 async function cleanupWorkspace(workspace) {
@@ -208,6 +215,88 @@ test('init reads an initialized store even when lcm.db is readonly', async () =>
     }
 
     await cleanupWorkspace(workspace);
+  }
+});
+
+test('capture falls back to a user-writable store when the default lcm.db is readonly', async () => {
+  const workspace = makeWorkspace('lcm-capture-readonly');
+  const homeDir = makeWorkspace('lcm-fallback-home');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+  const fallbackDbPath = path.join(fallbackStoreDir(workspace, homeDir), 'lcm.db');
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  let store;
+
+  try {
+    process.env.HOME = homeDir;
+    process.env.USERPROFILE = homeDir;
+
+    store = new SqliteLcmStore(workspace, makeOptions({ storeDir: undefined }));
+    await store.init();
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 'primary', info: sessionInfo(workspace, 'primary', 1) },
+    });
+
+    store.close();
+    store = undefined;
+
+    chmodSync(dbPath, 0o444);
+
+    store = new SqliteLcmStore(workspace, makeOptions({ storeDir: undefined }));
+    await store.init();
+    await store.capture({
+      type: 'session.created',
+      properties: { sessionID: 'fallback', info: sessionInfo(workspace, 'fallback', 2) },
+    });
+
+    assert.equal(existsSync(fallbackDbPath), true);
+
+    const primaryDb = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const primarySession = primaryDb
+      .prepare('SELECT session_id FROM sessions WHERE session_id = ?')
+      .get('primary');
+    const missingFallbackSession = primaryDb
+      .prepare('SELECT session_id FROM sessions WHERE session_id = ?')
+      .get('fallback');
+    primaryDb.close();
+
+    const fallbackDb = new DatabaseSync(fallbackDbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const fallbackSession = fallbackDb
+      .prepare('SELECT session_id FROM sessions WHERE session_id = ?')
+      .get('fallback');
+    fallbackDb.close();
+
+    assert.equal(primarySession.session_id, 'primary');
+    assert.equal(missingFallbackSession, undefined);
+    assert.equal(fallbackSession.session_id, 'fallback');
+  } finally {
+    store?.close();
+
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+
+    if (originalUserProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = originalUserProfile;
+    }
+
+    if (existsSync(dbPath)) {
+      chmodSync(dbPath, 0o666);
+    }
+
+    await cleanupWorkspace(workspace);
+    await cleanupWorkspace(homeDir);
   }
 });
 
