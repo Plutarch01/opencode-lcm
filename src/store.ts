@@ -777,7 +777,8 @@ function isFilesystemWriteError(error: unknown): boolean {
 }
 
 function isReadonlySqliteError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   return message.includes('readonly database');
 }
 
@@ -929,8 +930,8 @@ export class SqliteLcmStore {
     } finally {
       try {
         await unlink(probePath);
-      } catch (error) {
-        if (!hasErrorCode(error, 'ENOENT')) throw error;
+      } catch {
+        // Best-effort cleanup; a stale probe file is less harmful than masking the real failure.
       }
     }
   }
@@ -965,7 +966,10 @@ export class SqliteLcmStore {
     return true;
   }
 
-  private async withReadonlyStoreFallback<T>(reason: string, operation: () => Promise<T>): Promise<T> {
+  private async withReadonlyStoreFallback<T>(
+    reason: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
     try {
       return await operation();
     } catch (error) {
