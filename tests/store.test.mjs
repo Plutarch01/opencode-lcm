@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -176,6 +176,37 @@ test('init stamps the current schema version on disk', async () => {
     assert.equal(Object.values(versionRow)[0], 2);
   } finally {
     store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('init reads an initialized store even when lcm.db is readonly', async () => {
+  const workspace = makeWorkspace('lcm-schema-readonly');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    assert.equal((await store.stats()).schemaVersion, 2);
+
+    store.close();
+    store = undefined;
+
+    chmodSync(dbPath, 0o444);
+
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    const stats = await store.stats();
+    assert.equal(stats.schemaVersion, 2);
+  } finally {
+    store?.close();
+
+    if (existsSync(dbPath)) {
+      chmodSync(dbPath, 0o666);
+    }
+
     await cleanupWorkspace(workspace);
   }
 });

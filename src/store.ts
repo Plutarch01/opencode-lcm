@@ -1219,8 +1219,11 @@ export class SqliteLcmStore {
       );
       logStartupPhase('open-db:migrate-legacy-artifacts');
       await this.migrateLegacyArtifacts();
-      logStartupPhase('open-db:write-schema-version', { schemaVersion: STORE_SCHEMA_VERSION });
-      this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
+      const schemaVersion = this.readSchemaVersionSync();
+      if (schemaVersion !== STORE_SCHEMA_VERSION) {
+        logStartupPhase('open-db:write-schema-version', { schemaVersion: STORE_SCHEMA_VERSION });
+        this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
+      }
       logStartupPhase('open-db:ready');
     } catch (error) {
       logStartupPhase('open-db:error', {
