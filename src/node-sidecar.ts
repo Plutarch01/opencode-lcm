@@ -5,6 +5,7 @@ import type { Event } from '@opencode-ai/sdk';
 import type {
   ApplyLimitInput,
   ArtifactInput,
+  CompactInput,
   DescribeInput,
   DoctorInput,
   ExpandInput,
@@ -58,7 +59,7 @@ async function handleRequest(request: RequestMessage): Promise<unknown> {
       return true;
     }
     case 'close':
-      store?.close();
+      await store?.close();
       store = undefined;
       process.exitCode = 0;
       return true;
@@ -89,6 +90,8 @@ async function handleRequest(request: RequestMessage): Promise<unknown> {
       return await requireStore().blobStats(request.params as LimitInput);
     case 'gcBlobs':
       return await requireStore().gcBlobs(request.params as ApplyLimitInput);
+    case 'compact':
+      return await requireStore().compact(request.params as CompactInput | undefined);
     case 'doctor':
       return await requireStore().doctor(request.params as DoctorInput | undefined);
     case 'retentionReport':
@@ -129,5 +132,5 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => {
-  store?.close();
+  void store?.close();
 });

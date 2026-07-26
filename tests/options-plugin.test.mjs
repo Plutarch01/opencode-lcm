@@ -322,6 +322,7 @@ test('plugin exposes tools, records events, and appends compaction context once'
         'lcm_artifact',
         'lcm_blob_gc',
         'lcm_blob_stats',
+        'lcm_compact',
         'lcm_describe',
         'lcm_doctor',
         'lcm_expand',

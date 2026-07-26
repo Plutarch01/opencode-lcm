@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-07-26
+
+### Added
+- `lcm_compact` previews database page/WAL usage, removes obsolete internal events, checkpoints WAL, and conditionally runs `VACUUM`
+- `lcm_status` reports persisted corruption-recovery details and quarantined file locations
+- `lcm_doctor` now runs SQLite integrity and foreign-key checks and validates event payloads precisely
+
+### Fixed
+- Corrupt SQLite databases are quarantined as a complete DB/WAL/SHM/journal set before a clean store is created
+- Orphan blob retention now measures age from first observed orphaning instead of blob creation
+- Sidecar timeouts terminate stuck workers, reject queued requests, and permit clean restart
+- Store and sidecar shutdown flush deferred part updates and reject outstanding requests
+
 ## [0.14.2] - 2026-04-18
 
 ### Fixed

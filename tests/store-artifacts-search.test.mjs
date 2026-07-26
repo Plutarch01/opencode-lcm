@@ -15,7 +15,7 @@ import {
   writeFixtureFile,
 } from './helpers.mjs';
 
-test('large repeated content is externalized, deduplicated, and capture cleanup prevents new orphans', async () => {
+test('large repeated content is externalized, deduplicated, and new orphans receive a grace period', async () => {
   const workspace = makeWorkspace('lcm-artifact-dedup');
   let store;
 
@@ -79,7 +79,7 @@ test('large repeated content is externalized, deduplicated, and capture cleanup 
     assert.match(dryRun, /status=clean/);
     assert.match(applied, /orphan_blobs=0/);
     assert.match(applied, /status=clean/);
-    assert.equal(after.orphanArtifactBlobCount, 0);
+    assert.equal(after.orphanArtifactBlobCount, 1);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);

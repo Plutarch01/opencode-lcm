@@ -91,6 +91,7 @@ export type ArtifactBlobRow = {
   content_text: string;
   char_count: number;
   created_at: number;
+  orphaned_at: number | null;
 };
 
 export type SnapshotPayload = {
@@ -249,7 +250,7 @@ export async function importStoreSnapshot(
       `INSERT OR REPLACE INTO resumes (session_id, note, updated_at) VALUES (?, ?, ?)`,
     );
     const insertBlob = db.prepare(
-      `INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at) VALUES (?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at, orphaned_at) VALUES (?, ?, ?, ?, ?)`,
     );
     const insertArtifact = db.prepare(
       `INSERT OR REPLACE INTO artifacts (artifact_id, session_id, message_id, part_id, artifact_kind, field_name, preview_text, content_text, content_hash, metadata_json, char_count, created_at)
@@ -290,7 +291,13 @@ export async function importStoreSnapshot(
       insertPart.run(row.part_id, row.session_id, row.message_id, row.sort_key, row.part_json);
     for (const row of snapshot.resumes) insertResume.run(row.session_id, row.note, row.updated_at);
     for (const row of snapshot.artifact_blobs)
-      insertBlob.run(row.content_hash, row.content_text, row.char_count, row.created_at);
+      insertBlob.run(
+        row.content_hash,
+        row.content_text,
+        row.char_count,
+        row.created_at,
+        row.orphaned_at,
+      );
     for (const row of snapshot.artifacts) {
       insertArtifact.run(
         row.artifact_id,
@@ -453,6 +460,10 @@ function parseArtifactBlobRow(value: unknown): ArtifactBlobRow {
     content_text: expectString(row.content_text, 'artifact_blobs[].content_text'),
     char_count: expectNumber(row.char_count, 'artifact_blobs[].char_count'),
     created_at: expectNumber(row.created_at, 'artifact_blobs[].created_at'),
+    orphaned_at:
+      row.orphaned_at === undefined
+        ? null
+        : expectNullableNumber(row.orphaned_at, 'artifact_blobs[].orphaned_at'),
   };
 }
 

@@ -74,7 +74,7 @@ Appends a compact resume note during compaction so important context survives th
 - **Snapshot export/import** — portable snapshots with safe merge and worktree modes
 - **Privacy controls** — tool-output exclusion, path-based capture exclusion, regex redaction
 - **Configurable retrieval** — scope ordering, per-scope budgets, stop rules, recency-aware ranking
-- **16 tools** — `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, `lcm_import_snapshot`
+- **17 tools** — `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_compact`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, `lcm_import_snapshot`
 - **Legacy migration** — auto-migrates `.lcm/events.jsonl`, `.lcm/resume.json`, `.lcm/sessions/*.json`
 
 ## Configuration
@@ -106,7 +106,7 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
 > All defaults are applied automatically. Expand below only if you need to override settings.
 
 > [!IMPORTANT]
-> On Bun for Windows, `opencode-lcm` keeps full archive and retrieval behavior by running SQLite work in a Node sidecar process. This avoids loading SQLite in the Bun host process, where native crashes have been seen. If `node` is not on `PATH`, set `OPENCODE_LCM_NODE_PATH` to a Node executable. `OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1` bypasses the sidecar only for deliberate debugging.
+> On Bun for Windows, `opencode-lcm` keeps full archive and retrieval behavior by running SQLite work in a Node sidecar process. This avoids loading SQLite in the Bun host process, where native crashes have been seen. If `node` is not on `PATH`, set `OPENCODE_LCM_NODE_PATH` to a Node executable. Sidecar requests time out after five minutes by default; set `OPENCODE_LCM_SIDECAR_TIMEOUT_MS` to another duration or `0` to disable the timeout. `OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS=1` bypasses the sidecar only for deliberate debugging.
 
 <details>
 <summary><strong>Full Configuration</strong> (click to expand)</summary>

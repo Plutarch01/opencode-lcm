@@ -57,7 +57,7 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
     const preCorruptionStats = await store.stats();
 
     assert.match(healthyBeforeCorruption, /status=clean/);
-    assert.equal(preCorruptionStats.orphanArtifactBlobCount, 0);
+    assert.equal(preCorruptionStats.orphanArtifactBlobCount, 1);
 
     store.close();
 
@@ -72,7 +72,7 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
     driftDb.exec("DELETE FROM summary_nodes WHERE session_id = 's1'");
     driftDb.exec("DELETE FROM message_fts WHERE message_id = 'm1'");
     driftDb.exec(
-      "INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at) VALUES ('orphan-doctor-blob', 'orphaned artifact payload', 23, 7)",
+      "INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at, orphaned_at) VALUES ('orphan-doctor-blob', 'orphaned artifact payload', 23, 7, 7)",
     );
     driftDb.close();
 

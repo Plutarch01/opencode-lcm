@@ -18,6 +18,9 @@ export type DoctorReport = {
   summaryFts: DoctorCountCheck;
   artifactFts: DoctorCountCheck;
   orphanArtifactBlobs: number;
+  integrityCheck: { status: 'ok' | 'error'; message: string };
+  foreignKeyViolations: number;
+  malformedEventRows: number;
   status: 'clean' | 'issues-found' | 'repaired';
   appliedActions?: string[];
 };
@@ -38,7 +41,10 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
     Math.abs(report.messageFts.expected - report.messageFts.actual) +
     Math.abs(report.summaryFts.expected - report.summaryFts.actual) +
     Math.abs(report.artifactFts.expected - report.artifactFts.actual) +
-    report.orphanArtifactBlobs;
+    report.orphanArtifactBlobs +
+    (report.integrityCheck.status !== 'ok' ? 1 : 0) +
+    report.foreignKeyViolations +
+    report.malformedEventRows;
 
   const lines = [
     `checked_scope=${report.scope}`,
@@ -50,9 +56,22 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
     ...formatCountCheck('summary_fts', report.summaryFts),
     ...formatCountCheck('artifact_fts', report.artifactFts),
     `orphan_artifact_blobs=${report.orphanArtifactBlobs}`,
+    `integrity_check=${report.integrityCheck.status}`,
+    `foreign_key_violations=${report.foreignKeyViolations}`,
+    `malformed_event_rows=${report.malformedEventRows}`,
     `issues=${issueCount}`,
     `status=${report.status}`,
   ];
+
+  if (report.integrityCheck.status !== 'ok') {
+    lines.push(
+      'integrity_check_detail:',
+      ...report.integrityCheck.message
+        .split('; ')
+        .slice(0, 20)
+        .map((detail) => `- ${detail}`),
+    );
+  }
 
   if (report.summarySessionsNeedingRebuild.length > 0) {
     lines.push(

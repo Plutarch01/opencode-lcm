@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -893,11 +893,18 @@ export class SqliteLcmStore {
   private deferredInitPromise?: Promise<void>;
   private deferredInitRequested = false;
   private activeOperationCount = 0;
+  private operationDrainWaiters: Array<() => void> = [];
   private readonly pendingPartUpdates = new Map<string, Event>();
   private readonly lastAutomaticRetrievalBySession = new Map<string, AutomaticRetrievalDebugInfo>();
   private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
   private pendingPartUpdateFlushPromise?: Promise<void>;
   private usingFallbackBaseDir = false;
+  private storeRecovered = false;
+  private lastRecovery?: { reason: string; at: number; quarantinedFiles: string[] };
+  private mutationTail: Promise<void> = Promise.resolve();
+  private closing = false;
+  private closePromise?: Promise<void>;
+  private static readonly compactFreeRatioThreshold = 0.2;
 
   constructor(
     projectDir: string,
@@ -953,7 +960,7 @@ export class SqliteLcmStore {
     if (!isFilesystemWriteError(error) && !isReadonlySqliteError(error)) return false;
 
     const previousBaseDir = this.baseDir;
-    this.close();
+    this.closeDbConnection();
     this.baseDir = this.resolveFallbackBaseDir();
     this.dbPath = path.join(this.baseDir, 'lcm.db');
     this.usingFallbackBaseDir = true;
@@ -964,6 +971,16 @@ export class SqliteLcmStore {
       message: error instanceof Error ? error.message : String(error),
     });
     return true;
+  }
+
+  private closeDbConnection(): void {
+    if (this.deferredInitTimer) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = undefined;
+    }
+    if (this.db) this.db.close();
+    this.db = undefined;
+    this.dbReadyPromise = undefined;
   }
 
   private async withReadonlyStoreFallback<T>(
@@ -981,6 +998,7 @@ export class SqliteLcmStore {
 
   // Keep deferred SQLite maintenance off the active connection while a store operation is running.
   private async withStoreActivity<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closing) throw new Error('opencode-lcm store is closing');
     this.activeOperationCount += 1;
     try {
       return await operation();
@@ -989,6 +1007,30 @@ export class SqliteLcmStore {
       if (this.activeOperationCount === 0 && this.deferredInitRequested) {
         this.scheduleDeferredInit();
       }
+      if (this.activeOperationCount === 0) {
+        const waiters = this.operationDrainWaiters;
+        this.operationDrainWaiters = [];
+        for (const resolve of waiters) resolve();
+      }
+    }
+  }
+
+  private waitForActiveOperations(): Promise<void> {
+    if (this.activeOperationCount === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => this.operationDrainWaiters.push(resolve));
+  }
+
+  private async withMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 
@@ -1008,7 +1050,11 @@ export class SqliteLcmStore {
 
     this.pendingPartUpdateTimer = setTimeout(() => {
       this.pendingPartUpdateTimer = undefined;
-      void this.flushDeferredPartUpdates();
+      void this.flushDeferredPartUpdates().catch((error) => {
+        logStartupPhase('deferred-part-flush:error', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
     }, SqliteLcmStore.deferredPartUpdateDelayMs);
     unrefTimer(this.pendingPartUpdateTimer);
   }
@@ -1098,8 +1144,18 @@ export class SqliteLcmStore {
         while (this.pendingPartUpdates.size > 0) {
           const batch = [...this.pendingPartUpdates.values()];
           this.pendingPartUpdates.clear();
-          for (const event of batch) {
-            await this.capture(event);
+          for (const [index, event] of batch.entries()) {
+            try {
+              await this.capture(event);
+            } catch (error) {
+              for (const pendingEvent of batch.slice(index)) {
+                const key = getDeferredPartUpdateKey(pendingEvent);
+                if (key && !this.pendingPartUpdates.has(key)) {
+                  this.pendingPartUpdates.set(key, pendingEvent);
+                }
+              }
+              throw error;
+            }
           }
         }
       })().finally(() => {
@@ -1129,11 +1185,28 @@ export class SqliteLcmStore {
   private async openAndInitializeDb(): Promise<void> {
     logStartupPhase('open-db:start', { dbPath: this.dbPath });
     await mkdir(this.baseDir, { recursive: true });
+    await this.loadRecoveryRecord();
     logStartupPhase('open-db:connect', {
       runtime: typeof globalThis === 'object' && 'Bun' in globalThis ? 'bun' : 'node',
       sqliteRuntime: resolveSqliteRuntime(),
     });
-    const db = await openSqliteDatabase(this.dbPath);
+    await this.openAndInitializeConnection();
+  }
+
+  private async openAndInitializeConnection(): Promise<void> {
+    let db: SqlDatabaseLike;
+    try {
+      db = await openSqliteDatabase(this.dbPath);
+    } catch (error) {
+      if (this.isCorruptionError(error) && !this.storeRecovered) {
+        await this.quarantineCorruptedStore(error);
+        this.storeRecovered = true;
+        await this.openAndInitializeConnection();
+        return;
+      }
+      throw error;
+    }
+
     this.db = db;
 
     try {
@@ -1217,7 +1290,8 @@ export class SqliteLcmStore {
         content_hash TEXT PRIMARY KEY,
         content_text TEXT NOT NULL,
         char_count INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        orphaned_at INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS summary_nodes (
@@ -1311,11 +1385,116 @@ export class SqliteLcmStore {
       logStartupPhase('open-db:error', {
         message: error instanceof Error ? error.message : String(error),
       });
-      db.close();
+      try {
+        db.close();
+      } catch {
+        // Ignore close failures during error recovery.
+      }
       this.db = undefined;
       this.dbReadyPromise = undefined;
+      if (this.isCorruptionError(error) && !this.storeRecovered) {
+        await this.quarantineCorruptedStore(error);
+        this.storeRecovered = true;
+        await this.openAndInitializeConnection();
+        return;
+      }
       throw error;
     }
+  }
+
+  private isCorruptionError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    const code = (error as { code?: unknown } | null)?.code;
+    return (
+      /database disk image is malformed|file is not a database|not a database|SQLITE_CORRUPT|SQLITE_NOTADB|corrupt/i.test(
+        message,
+      ) ||
+      code === 'SQLITE_CORRUPT' ||
+      code === 'SQLITE_NOTADB'
+    );
+  }
+
+  private async quarantineCorruptedStore(error: unknown): Promise<void> {
+    const reason = error instanceof Error ? error.message : String(error ?? 'unknown corruption');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dbName = path.basename(this.dbPath);
+    const quarantineDir = path.join(this.baseDir, `${dbName}.corrupted-${stamp}`);
+    const suffixes = ['', '-wal', '-shm', '-journal'];
+    const sourceFiles: Array<{ source: string; destination: string }> = [];
+    const quarantinedFiles: string[] = [];
+
+    for (const suffix of suffixes) {
+      const source = `${this.dbPath}${suffix}`;
+      try {
+        const info = await stat(source);
+        if (!info.isFile()) continue;
+      } catch {
+        continue;
+      }
+      sourceFiles.push({ source, destination: path.join(quarantineDir, `${dbName}${suffix}`) });
+    }
+
+    if (sourceFiles.length === 0)
+      throw new Error(`Corrupt SQLite store was not found: ${this.dbPath}`);
+
+    await mkdir(quarantineDir, { recursive: false });
+    try {
+      for (const file of sourceFiles) {
+        await rename(file.source, file.destination);
+        quarantinedFiles.push(file.destination);
+      }
+    } catch (quarantineError) {
+      for (const file of [...sourceFiles].reverse()) {
+        if (!quarantinedFiles.includes(file.destination)) continue;
+        try {
+          await rename(file.destination, file.source);
+        } catch {
+          // Keep trying to restore the remaining files before surfacing the failure.
+        }
+      }
+      throw new Error(
+        `Unable to quarantine corrupt SQLite store: ${quarantineError instanceof Error ? quarantineError.message : String(quarantineError)}`,
+      );
+    }
+
+    this.lastRecovery = { reason, at: Date.now(), quarantinedFiles };
+    await this.persistRecoveryRecord();
+    logStartupPhase('open-db:quarantined-corrupt', {
+      reason,
+      files: quarantinedFiles,
+      baseDir: this.baseDir,
+    });
+  }
+
+  private async loadRecoveryRecord(): Promise<void> {
+    if (this.lastRecovery) return;
+    try {
+      const record = JSON.parse(
+        await readFile(path.join(this.baseDir, 'last-recovery.json'), 'utf8'),
+      ) as { reason?: unknown; at?: unknown; quarantinedFiles?: unknown };
+      if (
+        typeof record.reason === 'string' &&
+        typeof record.at === 'number' &&
+        Array.isArray(record.quarantinedFiles) &&
+        record.quarantinedFiles.every((entry) => typeof entry === 'string')
+      ) {
+        this.lastRecovery = {
+          reason: record.reason,
+          at: record.at,
+          quarantinedFiles: record.quarantinedFiles,
+        };
+      }
+    } catch {
+      // No prior recovery record, or the record is unreadable.
+    }
+  }
+
+  private async persistRecoveryRecord(): Promise<void> {
+    if (!this.lastRecovery) return;
+    const recordPath = path.join(this.baseDir, 'last-recovery.json');
+    const temporaryPath = `${recordPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify(this.lastRecovery, null, 2)}\n`, 'utf8');
+    await rename(temporaryPath, recordPath);
   }
 
   private deferredInitCompleted = false;
@@ -1396,7 +1575,7 @@ export class SqliteLcmStore {
       this.backfillArtifactBlobsSync();
     }
     logStartupPhase('deferred-init:orphan-blob-cleanup');
-    this.deleteOrphanArtifactBlobsSync();
+    this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
     if (
       this.options.retention.staleSessionDays !== undefined ||
       this.options.retention.deletedSessionDays !== undefined ||
@@ -1431,279 +1610,299 @@ export class SqliteLcmStore {
     return row.count > 0;
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeStore().catch((error) => {
+      this.closePromise = undefined;
+      this.closing = false;
+      throw error;
+    });
+    return this.closePromise;
+  }
+
+  private async closeStore(): Promise<void> {
     this.clearDeferredPartUpdateTimer();
-    this.pendingPartUpdates.clear();
-    this.lastAutomaticRetrievalBySession.clear();
+    if (this.pendingPartUpdateFlushPromise) await this.pendingPartUpdateFlushPromise;
+    if (this.pendingPartUpdates.size > 0) await this.flushDeferredPartUpdates();
+
+    this.closing = true;
     if (this.deferredInitTimer) {
       clearTimeout(this.deferredInitTimer);
       this.deferredInitTimer = undefined;
     }
-    if (!this.db) return;
-    this.db.close();
-    this.db = undefined;
-    this.dbReadyPromise = undefined;
+    await this.mutationTail;
+    await this.waitForActiveOperations();
+
+    this.pendingPartUpdates.clear();
+    this.lastAutomaticRetrievalBySession.clear();
+    this.closeDbConnection();
   }
 
   async capture(event: Event): Promise<void> {
-    return this.withStoreActivity(async () => {
-      await this.withReadonlyStoreFallback('capture', async () => {
-        const normalized = normalizeEvent(event);
-        if (!normalized) return;
+    return this.withStoreActivity(() =>
+      this.withMutation(async () => {
+        await this.withReadonlyStoreFallback('capture', async () => {
+          const normalized = normalizeEvent(event);
+          if (!normalized) return;
 
-        if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
+          if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
 
-        const shouldRecord = this.shouldRecordEvent(normalized.type);
-        const shouldPersistSession =
-          Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
-        if (!shouldRecord && !shouldPersistSession) return;
+          const shouldRecord = this.shouldRecordEvent(normalized.type);
+          const shouldPersistSession =
+            Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
+          if (!shouldRecord && !shouldPersistSession) return;
 
-        await this.ensureDeferredInitComplete();
+          await this.ensureDeferredInitComplete();
 
-        if (shouldRecord) {
-          this.writeEvent(normalized);
-        }
-
-        if (!normalized.sessionID || !shouldPersistSession) return;
-
-        const session = shouldUseLightweightPartCapture(normalized)
-          ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
-          : resolveCaptureHydrationMode() === 'targeted'
-            ? this.readSessionForCaptureSync(normalized)
-            : this.readSessionSync(normalized.sessionID);
-        const previousParentSessionID = session.parentSessionID;
-        const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
-          session,
-          normalized,
-        );
-        let next = this.applyEvent(session, normalized);
-        next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
-        next.eventCount += 1;
-        next = this.prepareSessionForPersistence(next);
-
-        await this.persistCapturedSession(next, normalized);
-
-        if (this.shouldRefreshLineageForEvent(normalized.type)) {
-          this.refreshAllLineageSync();
-          const refreshed = this.readSessionHeaderSync(normalized.sessionID);
-          if (refreshed) {
-            next = {
-              ...next,
-              parentSessionID: refreshed.parentSessionID,
-              rootSessionID: refreshed.rootSessionID,
-              lineageDepth: refreshed.lineageDepth,
-            };
+          if (!normalized.sessionID || !shouldPersistSession) {
+            if (shouldRecord) this.writeEvent(normalized);
+            return;
           }
-        }
 
-        if (shouldSyncDerivedState) {
-          this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
-        }
+          const session = shouldUseLightweightPartCapture(normalized)
+            ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
+            : resolveCaptureHydrationMode() === 'targeted'
+              ? this.readSessionForCaptureSync(normalized)
+              : this.readSessionSync(normalized.sessionID);
+          const previousParentSessionID = session.parentSessionID;
+          const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
+            session,
+            normalized,
+          );
+          let next = this.applyEvent(session, normalized);
+          next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
+          next.eventCount += 1;
+          next = this.prepareSessionForPersistence(next);
 
-        if (
-          this.shouldSyncDerivedLineageSubtree(
-            normalized.type,
-            previousParentSessionID,
-            next.parentSessionID,
-          )
-        ) {
-          this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
-        }
+          await this.persistCapturedSession(next, normalized, shouldRecord);
 
-        if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
-          this.deleteOrphanArtifactBlobsSync();
-        }
-      });
-    });
+          if (this.shouldRefreshLineageForEvent(normalized.type)) {
+            this.refreshAllLineageSync();
+            const refreshed = this.readSessionHeaderSync(normalized.sessionID);
+            if (refreshed) {
+              next = {
+                ...next,
+                parentSessionID: refreshed.parentSessionID,
+                rootSessionID: refreshed.rootSessionID,
+                lineageDepth: refreshed.lineageDepth,
+              };
+            }
+          }
+
+          if (shouldSyncDerivedState) {
+            this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
+          }
+
+          if (
+            this.shouldSyncDerivedLineageSubtree(
+              normalized.type,
+              previousParentSessionID,
+              next.parentSessionID,
+            )
+          ) {
+            this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
+          }
+
+          if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
+            this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
+          }
+        });
+      }),
+    );
   }
 
   async stats(): Promise<StoreStats> {
-    await this.prepareForRead();
-    await this.ensureDeferredInitComplete();
-    const db = this.getDb();
-    const fileSizes = await this.readStoreFileSizes();
-    const prunableEventTypes = this.readPrunableEventTypeCountsSync();
-    const totalRow = validateRow<{ count: number; latest: number | null }>(
-      db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
-      { count: 'number', latest: 'nullable' },
-      'stats.totalEvents',
-    );
-    const sessionRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM sessions').get(),
-      { count: 'number' },
-      'stats.sessionCount',
-    );
-    const typeRows = safeQuery<{ event_type: string; count: number }>(
-      db.prepare(
-        'SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type ORDER BY count DESC',
-      ),
-      [],
-      'stats.eventTypes',
-    );
-    const summaryNodeRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get(),
-      { count: 'number' },
-      'stats.summaryNodeCount',
-    );
-    const summaryStateRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM summary_state').get(),
-      { count: 'number' },
-      'stats.summaryStateCount',
-    );
-    const artifactRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM artifacts').get(),
-      { count: 'number' },
-      'stats.artifactCount',
-    );
-    const blobRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM artifact_blobs').get(),
-      { count: 'number' },
-      'stats.artifactBlobCount',
-    );
-    const sharedBlobRow = validateRow<{ count: number }>(
-      db
-        .prepare(
-          `SELECT COUNT(*) AS count FROM (
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      await this.ensureDeferredInitComplete();
+      const db = this.getDb();
+      const fileSizes = await this.readStoreFileSizes();
+      const prunableEventTypes = this.readPrunableEventTypeCountsSync();
+      const totalRow = validateRow<{ count: number; latest: number | null }>(
+        db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
+        { count: 'number', latest: 'nullable' },
+        'stats.totalEvents',
+      );
+      const sessionRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM sessions').get(),
+        { count: 'number' },
+        'stats.sessionCount',
+      );
+      const typeRows = safeQuery<{ event_type: string; count: number }>(
+        db.prepare(
+          'SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type ORDER BY count DESC',
+        ),
+        [],
+        'stats.eventTypes',
+      );
+      const summaryNodeRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get(),
+        { count: 'number' },
+        'stats.summaryNodeCount',
+      );
+      const summaryStateRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM summary_state').get(),
+        { count: 'number' },
+        'stats.summaryStateCount',
+      );
+      const artifactRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM artifacts').get(),
+        { count: 'number' },
+        'stats.artifactCount',
+      );
+      const blobRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM artifact_blobs').get(),
+        { count: 'number' },
+        'stats.artifactBlobCount',
+      );
+      const sharedBlobRow = validateRow<{ count: number }>(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM (
            SELECT content_hash FROM artifacts
            WHERE content_hash IS NOT NULL
            GROUP BY content_hash
            HAVING COUNT(*) > 1
          )`,
-        )
-        .get(),
-      { count: 'number' },
-      'stats.sharedArtifactBlobCount',
-    );
-    const orphanBlobRow = validateRow<{ count: number }>(
-      db
-        .prepare(
-          `SELECT COUNT(*) AS count FROM artifact_blobs b
+          )
+          .get(),
+        { count: 'number' },
+        'stats.sharedArtifactBlobCount',
+      );
+      const orphanBlobRow = validateRow<{ count: number }>(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM artifact_blobs b
          WHERE NOT EXISTS (
            SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
          )`,
-        )
-        .get(),
-      { count: 'number' },
-      'stats.orphanArtifactBlobCount',
-    );
-    const rootRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NULL').get(),
-      { count: 'number' },
-      'stats.rootSessionCount',
-    );
-    const branchedRow = validateRow<{ count: number }>(
-      db
-        .prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NOT NULL')
-        .get(),
-      { count: 'number' },
-      'stats.branchedSessionCount',
-    );
-    const pinnedRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE pinned = 1').get(),
-      { count: 'number' },
-      'stats.pinnedSessionCount',
-    );
-    const worktreeRow = validateRow<{ count: number }>(
-      db
-        .prepare(
-          'SELECT COUNT(DISTINCT worktree_key) AS count FROM sessions WHERE worktree_key IS NOT NULL',
-        )
-        .get(),
-      { count: 'number' },
-      'stats.worktreeCount',
-    );
-    const messageFtsRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM message_fts').get(),
-      { count: 'number' },
-      'stats.messageFtsCount',
-    );
-    const summaryFtsRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get(),
-      { count: 'number' },
-      'stats.summaryFtsCount',
-    );
-    const artifactFtsRow = validateRow<{ count: number }>(
-      db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get(),
-      { count: 'number' },
-      'stats.artifactFtsCount',
-    );
+          )
+          .get(),
+        { count: 'number' },
+        'stats.orphanArtifactBlobCount',
+      );
+      const rootRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NULL').get(),
+        { count: 'number' },
+        'stats.rootSessionCount',
+      );
+      const branchedRow = validateRow<{ count: number }>(
+        db
+          .prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NOT NULL')
+          .get(),
+        { count: 'number' },
+        'stats.branchedSessionCount',
+      );
+      const pinnedRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE pinned = 1').get(),
+        { count: 'number' },
+        'stats.pinnedSessionCount',
+      );
+      const worktreeRow = validateRow<{ count: number }>(
+        db
+          .prepare(
+            'SELECT COUNT(DISTINCT worktree_key) AS count FROM sessions WHERE worktree_key IS NOT NULL',
+          )
+          .get(),
+        { count: 'number' },
+        'stats.worktreeCount',
+      );
+      const messageFtsRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM message_fts').get(),
+        { count: 'number' },
+        'stats.messageFtsCount',
+      );
+      const summaryFtsRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get(),
+        { count: 'number' },
+        'stats.summaryFtsCount',
+      );
+      const artifactFtsRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get(),
+        { count: 'number' },
+        'stats.artifactFtsCount',
+      );
 
-    return {
-      schemaVersion: readSchemaVersionSync(db),
-      totalEvents: totalRow.count,
-      sessionCount: sessionRow.count,
-      latestEventAt: totalRow.latest ?? undefined,
-      eventTypes: Object.fromEntries(typeRows.map((row) => [row.event_type, row.count])),
-      summaryNodeCount: summaryNodeRow.count,
-      summaryStateCount: summaryStateRow.count,
-      rootSessionCount: rootRow.count,
-      branchedSessionCount: branchedRow.count,
-      artifactCount: artifactRow.count,
-      artifactBlobCount: blobRow.count,
-      sharedArtifactBlobCount: sharedBlobRow.count,
-      orphanArtifactBlobCount: orphanBlobRow.count,
-      worktreeCount: worktreeRow.count,
-      pinnedSessionCount: pinnedRow.count,
-      dbBytes: fileSizes.dbBytes,
-      walBytes: fileSizes.walBytes,
-      shmBytes: fileSizes.shmBytes,
-      totalBytes: fileSizes.totalBytes,
-      prunableEventCount: prunableEventTypes.reduce((sum, row) => sum + row.count, 0),
-      prunableEventTypes: Object.fromEntries(
-        prunableEventTypes.map((row) => [row.eventType, row.count]),
-      ),
-      messageFtsCount: messageFtsRow.count,
-      summaryFtsCount: summaryFtsRow.count,
-      artifactFtsCount: artifactFtsRow.count,
-    };
+      return {
+        schemaVersion: readSchemaVersionSync(db),
+        totalEvents: totalRow.count,
+        sessionCount: sessionRow.count,
+        latestEventAt: totalRow.latest ?? undefined,
+        eventTypes: Object.fromEntries(typeRows.map((row) => [row.event_type, row.count])),
+        summaryNodeCount: summaryNodeRow.count,
+        summaryStateCount: summaryStateRow.count,
+        rootSessionCount: rootRow.count,
+        branchedSessionCount: branchedRow.count,
+        artifactCount: artifactRow.count,
+        artifactBlobCount: blobRow.count,
+        sharedArtifactBlobCount: sharedBlobRow.count,
+        orphanArtifactBlobCount: orphanBlobRow.count,
+        worktreeCount: worktreeRow.count,
+        pinnedSessionCount: pinnedRow.count,
+        dbBytes: fileSizes.dbBytes,
+        walBytes: fileSizes.walBytes,
+        shmBytes: fileSizes.shmBytes,
+        totalBytes: fileSizes.totalBytes,
+        prunableEventCount: prunableEventTypes.reduce((sum, row) => sum + row.count, 0),
+        prunableEventTypes: Object.fromEntries(
+          prunableEventTypes.map((row) => [row.eventType, row.count]),
+        ),
+        messageFtsCount: messageFtsRow.count,
+        summaryFtsCount: summaryFtsRow.count,
+        artifactFtsCount: artifactFtsRow.count,
+        recovery: this.lastRecovery,
+      };
+    });
   }
 
   async automaticRetrievalDebug(sessionID?: string): Promise<string> {
-    await this.prepareForRead();
-    const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
-    if (!resolvedSessionID) return 'No archived sessions yet.';
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+      if (!resolvedSessionID) return 'No archived sessions yet.';
 
-    const debug = this.lastAutomaticRetrievalBySession.get(resolvedSessionID);
-    if (!debug) {
-      return [
-        `session_id=${resolvedSessionID}`,
-        'status=no-debug-data',
-        'Run another turn in this session so transformMessages can record recall telemetry.',
-      ].join('\n');
-    }
+      const debug = this.lastAutomaticRetrievalBySession.get(resolvedSessionID);
+      if (!debug) {
+        return [
+          `session_id=${resolvedSessionID}`,
+          'status=no-debug-data',
+          'Run another turn in this session so transformMessages can record recall telemetry.',
+        ].join('\n');
+      }
 
-    const lines = [
-      `session_id=${debug.sessionID}`,
-      `status=${debug.status}`,
-      `anchor_message_id=${debug.anchorMessageID ?? 'n/a'}`,
-      `anchor_role=${debug.anchorRole ?? 'n/a'}`,
-      `archived_messages=${debug.archivedCount ?? 0}`,
-      `recent_messages=${debug.recentCount ?? 0}`,
-      `allowed_hits=${debug.allowedHits}`,
-      `target_hits=${debug.targetHits}`,
-      `raw_results=${debug.rawResultCount}`,
-      `selected_hits=${debug.hitCount}`,
-      `stop_reason=${debug.stopReason}`,
-      `query_tokens=${debug.queryTokens.length > 0 ? debug.queryTokens.join(',') : 'none'}`,
-      `queries=${debug.queries.length > 0 ? debug.queries.join(' | ') : 'none'}`,
-      `searched_scopes=${debug.searchedScopes.length > 0 ? debug.searchedScopes.join(',') : 'none'}`,
-      'scope_stats:',
-      ...(debug.scopeStats.length > 0
-        ? debug.scopeStats.map(
-            (entry) =>
-              `- ${entry.scope} budget=${entry.budget} raw_results=${entry.rawResults} selected_hits=${entry.selectedHits}`,
-          )
-        : ['- none']),
-      'selected_hit_preview:',
-      ...(debug.hits.length > 0
-        ? debug.hits.map(
-            (hit) =>
-              `- ${hit.kind} session=${hit.sessionID ?? 'n/a'} id=${hit.id} label=${hit.label} snippet=${truncate(hit.snippet, 160)}`,
-          )
-        : ['- none']),
-    ];
+      const lines = [
+        `session_id=${debug.sessionID}`,
+        `status=${debug.status}`,
+        `anchor_message_id=${debug.anchorMessageID ?? 'n/a'}`,
+        `anchor_role=${debug.anchorRole ?? 'n/a'}`,
+        `archived_messages=${debug.archivedCount ?? 0}`,
+        `recent_messages=${debug.recentCount ?? 0}`,
+        `allowed_hits=${debug.allowedHits}`,
+        `target_hits=${debug.targetHits}`,
+        `raw_results=${debug.rawResultCount}`,
+        `selected_hits=${debug.hitCount}`,
+        `stop_reason=${debug.stopReason}`,
+        `query_tokens=${debug.queryTokens.length > 0 ? debug.queryTokens.join(',') : 'none'}`,
+        `queries=${debug.queries.length > 0 ? debug.queries.join(' | ') : 'none'}`,
+        `searched_scopes=${debug.searchedScopes.length > 0 ? debug.searchedScopes.join(',') : 'none'}`,
+        'scope_stats:',
+        ...(debug.scopeStats.length > 0
+          ? debug.scopeStats.map(
+              (entry) =>
+                `- ${entry.scope} budget=${entry.budget} raw_results=${entry.rawResults} selected_hits=${entry.selectedHits}`,
+            )
+          : ['- none']),
+        'selected_hit_preview:',
+        ...(debug.hits.length > 0
+          ? debug.hits.map(
+              (hit) =>
+                `- ${hit.kind} session=${hit.sessionID ?? 'n/a'} id=${hit.id} label=${hit.label} snippet=${truncate(hit.snippet, 160)}`,
+            )
+          : ['- none']),
+      ];
 
-    return lines.join('\n');
+      return lines.join('\n');
+    });
   }
 
   async grep(input: {
@@ -1712,166 +1911,179 @@ export class SqliteLcmStore {
     scope?: string;
     limit?: number;
   }): Promise<SearchResult[]> {
-    const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
-    const limit = input.limit ?? 5;
-    const needle = input.query.trim();
-    if (!needle) return [];
+    return this.withStoreActivity(async () => {
+      const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
+      const limit = input.limit ?? 5;
+      const needle = input.query.trim();
+      if (!needle) return [];
 
-    await this.prepareForRead();
-    const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
+      await this.prepareForRead();
+      const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
 
-    const ftsResults = this.searchWithFts(needle, sessionIDs, limit);
-    if (ftsResults.length > 0) return ftsResults;
-    return this.searchByScan(needle.toLowerCase(), sessionIDs, limit);
+      const ftsResults = this.searchWithFts(needle, sessionIDs, limit);
+      if (ftsResults.length > 0) return ftsResults;
+      return this.searchByScan(needle.toLowerCase(), sessionIDs, limit);
+    });
   }
 
   async describe(input?: { sessionID?: string; scope?: string }): Promise<string> {
-    await this.prepareForRead();
-    const scope = this.resolveConfiguredScope('describe', input?.scope, input?.sessionID);
-    const sessionID = input?.sessionID;
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const scope = this.resolveConfiguredScope('describe', input?.scope, input?.sessionID);
+        const sessionID = input?.sessionID;
 
-    if (scope !== 'session') {
-      const scopedSessions = this.readScopedSessionsSync(
-        this.resolveScopeSessionIDs(scope, sessionID),
-      );
-      if (scopedSessions.length === 0) return 'No archived sessions yet.';
+        if (scope !== 'session') {
+          const scopedSessions = this.readScopedSessionsSync(
+            this.resolveScopeSessionIDs(scope, sessionID),
+          );
+          if (scopedSessions.length === 0) return 'No archived sessions yet.';
 
-      return [
-        `Scope: ${scope}`,
-        `Sessions: ${scopedSessions.length}`,
-        `Latest update: ${Math.max(...scopedSessions.map((session) => session.updatedAt))}`,
-        `Root sessions: ${new Set(scopedSessions.map((session) => session.rootSessionID ?? session.sessionID)).size}`,
-        `Worktrees: ${new Set(scopedSessions.map((session) => normalizeWorktreeKey(session.directory)).filter(Boolean)).size}`,
-        'Matching sessions:',
-        ...scopedSessions
-          .sort((a, b) => b.updatedAt - a.updatedAt)
-          .slice(0, 8)
-          .map((session) => {
-            const root = session.rootSessionID ?? session.sessionID;
-            const worktree = normalizeWorktreeKey(session.directory) ?? 'unknown';
-            return `- ${session.sessionID}: ${makeSessionTitle(session) ?? 'Untitled session'} (root=${root}, worktree=${worktree})`;
-          }),
-      ].join('\n');
-    }
+          return [
+            `Scope: ${scope}`,
+            `Sessions: ${scopedSessions.length}`,
+            `Latest update: ${Math.max(...scopedSessions.map((session) => session.updatedAt))}`,
+            `Root sessions: ${new Set(scopedSessions.map((session) => session.rootSessionID ?? session.sessionID)).size}`,
+            `Worktrees: ${new Set(scopedSessions.map((session) => normalizeWorktreeKey(session.directory)).filter(Boolean)).size}`,
+            'Matching sessions:',
+            ...scopedSessions
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .slice(0, 8)
+              .map((session) => {
+                const root = session.rootSessionID ?? session.sessionID;
+                const worktree = normalizeWorktreeKey(session.directory) ?? 'unknown';
+                return `- ${session.sessionID}: ${makeSessionTitle(session) ?? 'Untitled session'} (root=${root}, worktree=${worktree})`;
+              }),
+          ].join('\n');
+        }
 
-    if (!sessionID) {
-      const sessions = this.readAllSessionsSync();
-      if (sessions.length === 0) return 'No archived sessions yet.';
+        if (!sessionID) {
+          const sessions = this.readAllSessionsSync();
+          if (sessions.length === 0) return 'No archived sessions yet.';
 
-      return [
-        `Archived sessions: ${sessions.length}`,
-        `Latest update: ${Math.max(...sessions.map((session) => session.updatedAt))}`,
-        `Root sessions: ${sessions.filter((session) => !session.parentSessionID).length}`,
-        `Branched sessions: ${sessions.filter((session) => Boolean(session.parentSessionID)).length}`,
-        'Recent sessions:',
-        ...sessions
-          .sort((a, b) => b.updatedAt - a.updatedAt)
-          .slice(0, 5)
-          .map(
-            (session) =>
-              `- ${session.sessionID}: ${makeSessionTitle(session) ?? 'Untitled session'}`,
-          ),
-      ].join('\n');
-    }
+          return [
+            `Archived sessions: ${sessions.length}`,
+            `Latest update: ${Math.max(...sessions.map((session) => session.updatedAt))}`,
+            `Root sessions: ${sessions.filter((session) => !session.parentSessionID).length}`,
+            `Branched sessions: ${sessions.filter((session) => Boolean(session.parentSessionID)).length}`,
+            'Recent sessions:',
+            ...sessions
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .slice(0, 5)
+              .map(
+                (session) =>
+                  `- ${session.sessionID}: ${makeSessionTitle(session) ?? 'Untitled session'}`,
+              ),
+          ].join('\n');
+        }
 
-    const session = this.readSessionSync(sessionID);
-    if (session.messages.length === 0) return 'No archived events yet.';
+        const session = this.readSessionSync(sessionID);
+        if (session.messages.length === 0) return 'No archived events yet.';
 
-    const roots = this.getSummaryRootsForSession(session);
-    const userMessages = session.messages.filter((message) => message.info.role === 'user');
-    const assistantMessages = session.messages.filter(
-      (message) => message.info.role === 'assistant',
-    );
-    const files = new Set(session.messages.flatMap(listFiles));
-    const recent = session.messages.slice(-5).map((message) => {
-      const snippet =
-        guessMessageText(message, this.options.interop.ignoreToolPrefixes) || '(no text content)';
-      return `- ${message.info.role} ${message.info.id}: ${snippet}`;
+        const roots = this.getSummaryRootsForSession(session);
+        const userMessages = session.messages.filter((message) => message.info.role === 'user');
+        const assistantMessages = session.messages.filter(
+          (message) => message.info.role === 'assistant',
+        );
+        const files = new Set(session.messages.flatMap(listFiles));
+        const recent = session.messages.slice(-5).map((message) => {
+          const snippet =
+            guessMessageText(message, this.options.interop.ignoreToolPrefixes) ||
+            '(no text content)';
+          return `- ${message.info.role} ${message.info.id}: ${snippet}`;
+        });
+
+        return [
+          `Session: ${session.sessionID}`,
+          `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
+          `Directory: ${session.directory ?? 'unknown'}`,
+          `Parent session: ${session.parentSessionID ?? 'none'}`,
+          `Root session: ${session.rootSessionID ?? session.sessionID}`,
+          `Lineage depth: ${session.lineageDepth ?? 0}`,
+          `Pinned: ${session.pinned ? `yes${session.pinReason ? ` (${session.pinReason})` : ''}` : 'no'}`,
+          `Messages: ${session.messages.length}`,
+          `User messages: ${userMessages.length}`,
+          `Assistant messages: ${assistantMessages.length}`,
+          `Tracked files: ${files.size}`,
+          `Summary roots: ${roots.length}`,
+          `Child branches: ${this.readChildSessionsSync(session.sessionID).length}`,
+          `Last updated: ${session.updatedAt}`,
+          ...(roots.length > 0
+            ? [
+                'Summary root previews:',
+                ...roots
+                  .slice(0, 4)
+                  .map((node) => `- ${shortNodeID(node.nodeID)}: ${node.summaryText}`),
+              ]
+            : []),
+          'Recent entries:',
+          ...recent,
+        ].join('\n');
+      });
     });
-
-    return [
-      `Session: ${session.sessionID}`,
-      `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
-      `Directory: ${session.directory ?? 'unknown'}`,
-      `Parent session: ${session.parentSessionID ?? 'none'}`,
-      `Root session: ${session.rootSessionID ?? session.sessionID}`,
-      `Lineage depth: ${session.lineageDepth ?? 0}`,
-      `Pinned: ${session.pinned ? `yes${session.pinReason ? ` (${session.pinReason})` : ''}` : 'no'}`,
-      `Messages: ${session.messages.length}`,
-      `User messages: ${userMessages.length}`,
-      `Assistant messages: ${assistantMessages.length}`,
-      `Tracked files: ${files.size}`,
-      `Summary roots: ${roots.length}`,
-      `Child branches: ${this.readChildSessionsSync(session.sessionID).length}`,
-      `Last updated: ${session.updatedAt}`,
-      ...(roots.length > 0
-        ? [
-            'Summary root previews:',
-            ...roots
-              .slice(0, 4)
-              .map((node) => `- ${shortNodeID(node.nodeID)}: ${node.summaryText}`),
-          ]
-        : []),
-      'Recent entries:',
-      ...recent,
-    ].join('\n');
   }
 
   async doctor(input?: { sessionID?: string; apply?: boolean; limit?: number }): Promise<string> {
-    await this.prepareForRead();
-    const limit = clamp(input?.limit ?? 10, 1, 50);
-    const sessionID = input?.sessionID;
-    const apply = input?.apply ?? false;
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const sessionID = input?.sessionID;
+        const apply = input?.apply ?? false;
 
-    const before = this.collectDoctorReport(sessionID);
-    if (!apply || !this.hasDoctorIssues(before)) {
-      return formatDoctorReport(before, limit);
-    }
+        const before = this.collectDoctorReport(sessionID);
+        if (!apply || !this.hasDoctorIssues(before)) {
+          return formatDoctorReport(before, limit);
+        }
 
-    const checkedSessions = sessionID
-      ? [sessionID]
-      : this.readAllSessionsSync().map((session) => session.sessionID);
-    const appliedActions: string[] = [];
+        const checkedSessions = sessionID
+          ? [sessionID]
+          : this.readAllSessionsSync().map((session) => session.sessionID);
+        const appliedActions: string[] = [];
 
-    this.ensureSessionColumnsSync();
-    this.ensureSummaryStateColumnsSync();
-    this.ensureArtifactColumnsSync();
-    appliedActions.push('ensured schema columns');
+        this.ensureSessionColumnsSync();
+        this.ensureSummaryStateColumnsSync();
+        this.ensureArtifactColumnsSync();
+        appliedActions.push('ensured schema columns');
 
-    if (before.summarySessionsNeedingRebuild.length > 0 || before.orphanSummaryEdges > 0) {
-      this.rebuildSummarySessionsSync(checkedSessions);
-      appliedActions.push(`rebuilt summary DAGs for ${checkedSessions.length} checked session(s)`);
-    }
+        if (before.summarySessionsNeedingRebuild.length > 0 || before.orphanSummaryEdges > 0) {
+          this.rebuildSummarySessionsSync(checkedSessions);
+          appliedActions.push(
+            `rebuilt summary DAGs for ${checkedSessions.length} checked session(s)`,
+          );
+        }
 
-    if (before.lineageSessionsNeedingRefresh.length > 0) {
-      this.refreshAllLineageSync();
-      this.syncAllDerivedSessionStateSync(true);
-      appliedActions.push('refreshed lineage metadata');
-    }
+        if (before.lineageSessionsNeedingRefresh.length > 0) {
+          this.refreshAllLineageSync();
+          this.syncAllDerivedSessionStateSync(true);
+          appliedActions.push('refreshed lineage metadata');
+        }
 
-    if (before.orphanArtifactBlobs > 0) {
-      this.backfillArtifactBlobsSync();
-      const deleted = this.deleteOrphanArtifactBlobsSync();
-      if (deleted.length > 0) {
-        appliedActions.push(`deleted ${deleted.length} orphan artifact blob(s)`);
-      }
-    }
+        if (before.orphanArtifactBlobs > 0) {
+          this.backfillArtifactBlobsSync();
+          const deleted = this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
+          if (deleted.length > 0) {
+            appliedActions.push(`deleted ${deleted.length} orphan artifact blob(s)`);
+          }
+        }
 
-    if (
-      before.messageFts.expected !== before.messageFts.actual ||
-      before.summaryFts.expected !== before.summaryFts.actual ||
-      before.artifactFts.expected !== before.artifactFts.actual ||
-      before.summarySessionsNeedingRebuild.length > 0 ||
-      before.orphanSummaryEdges > 0
-    ) {
-      this.refreshSearchIndexesSync(checkedSessions);
-      appliedActions.push('rebuilt FTS indexes');
-    }
+        if (
+          before.messageFts.expected !== before.messageFts.actual ||
+          before.summaryFts.expected !== before.summaryFts.actual ||
+          before.artifactFts.expected !== before.artifactFts.actual ||
+          before.summarySessionsNeedingRebuild.length > 0 ||
+          before.orphanSummaryEdges > 0
+        ) {
+          this.refreshSearchIndexesSync(checkedSessions);
+          appliedActions.push('rebuilt FTS indexes');
+        }
 
-    const after = this.collectDoctorReport(sessionID);
-    after.status = this.hasDoctorIssues(after) ? 'issues-found' : 'repaired';
-    after.appliedActions = appliedActions;
-    return formatDoctorReport(after, limit);
+        const after = this.collectDoctorReport(sessionID);
+        after.status = this.hasDoctorIssues(after) ? 'issues-found' : 'repaired';
+        after.appliedActions = appliedActions;
+        return formatDoctorReport(after, limit);
+      });
+    });
   }
 
   private collectDoctorReport(sessionID?: string): DoctorReport {
@@ -1912,7 +2124,11 @@ export class SqliteLcmStore {
         expected: this.readScopedArtifactRowsSync(sessionIDs).length,
         actual: this.countScopedFtsRows('artifact_fts', sessionIDs),
       },
-      orphanArtifactBlobs: this.readOrphanArtifactBlobRowsSync().length,
+      orphanArtifactBlobs: this.selectOrphanBlobsForDeletionSync(this.orphanBlobGracePeriodMs())
+        .length,
+      integrityCheck: this.runIntegrityCheckSync(),
+      foreignKeyViolations: this.countForeignKeyViolationsSync(),
+      malformedEventRows: this.countMalformedEventRowsSync(),
       status: 'clean',
     };
 
@@ -1928,8 +2144,60 @@ export class SqliteLcmStore {
       report.messageFts.expected !== report.messageFts.actual ||
       report.summaryFts.expected !== report.summaryFts.actual ||
       report.artifactFts.expected !== report.artifactFts.actual ||
-      report.orphanArtifactBlobs > 0
+      report.orphanArtifactBlobs > 0 ||
+      report.integrityCheck.status !== 'ok' ||
+      report.foreignKeyViolations > 0 ||
+      report.malformedEventRows > 0
     );
+  }
+
+  private runIntegrityCheckSync(): { status: 'ok' | 'error'; message: string } {
+    try {
+      const rows = this.getDb().prepare('PRAGMA integrity_check').all() as Array<{
+        integrity_check?: string;
+      }>;
+      const texts = rows.map((row) => row.integrity_check ?? '');
+      if (texts.length === 1 && texts[0] === 'ok') {
+        return { status: 'ok', message: 'ok' };
+      }
+      return {
+        status: 'error',
+        message: texts.slice(0, 20).join('; ') || 'integrity_check reported problems',
+      };
+    } catch (error) {
+      return {
+        status: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private countForeignKeyViolationsSync(): number {
+    const rows = this.getDb().prepare('PRAGMA foreign_key_check').all() as unknown[];
+    return rows.length;
+  }
+
+  private countMalformedEventRowsSync(): number {
+    const rows = this.getDb()
+      .prepare('SELECT event_type, payload_json FROM events')
+      .all() as Array<{
+      event_type: string;
+      payload_json: string;
+    }>;
+    let malformed = 0;
+    for (const row of rows) {
+      const expectedStub =
+        row.event_type.startsWith('message.') || row.event_type.startsWith('session.')
+          ? `[${row.event_type}]`
+          : '';
+      if (row.payload_json === expectedStub && this.shouldRecordEvent(row.event_type)) continue;
+      try {
+        JSON.parse(row.payload_json);
+      } catch {
+        malformed += 1;
+      }
+    }
+    return malformed;
   }
 
   private diagnoseSummarySession(session: NormalizedSession): DoctorSessionIssue | undefined {
@@ -2363,11 +2631,12 @@ export class SqliteLcmStore {
     days: number,
     limit?: number,
   ): RetentionBlobCandidate[] {
+    this.refreshOrphanedArtifactBlobsSync();
     const params: Array<number> = [this.retentionCutoff(days)];
     const sql = `
       SELECT content_hash, char_count, created_at
       FROM artifact_blobs b
-      WHERE b.created_at <= ?
+      WHERE b.orphaned_at <= ?
         AND NOT EXISTS (
           SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
         )
@@ -2380,11 +2649,12 @@ export class SqliteLcmStore {
   }
 
   private countOrphanBlobRetentionCandidates(days: number): number {
+    this.refreshOrphanedArtifactBlobsSync();
     const row = this.getDb()
       .prepare(
         `SELECT COUNT(*) AS count
          FROM artifact_blobs b
-         WHERE b.created_at <= ?
+         WHERE b.orphaned_at <= ?
            AND NOT EXISTS (
              SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
            )`,
@@ -2394,11 +2664,12 @@ export class SqliteLcmStore {
   }
 
   private sumOrphanBlobRetentionChars(days: number): number {
+    this.refreshOrphanedArtifactBlobsSync();
     const row = this.getDb()
       .prepare(
         `SELECT COALESCE(SUM(char_count), 0) AS chars
          FROM artifact_blobs b
-         WHERE b.created_at <= ?
+         WHERE b.orphaned_at <= ?
            AND NOT EXISTS (
              SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
            )`,
@@ -2627,143 +2898,156 @@ export class SqliteLcmStore {
   }
 
   async lineage(sessionID?: string): Promise<string> {
-    await this.prepareForRead();
-    const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
-    if (!resolvedSessionID) return 'No archived sessions yet.';
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+      if (!resolvedSessionID) return 'No archived sessions yet.';
 
-    const session = this.readSessionSync(resolvedSessionID);
-    const chain = this.readLineageChainSync(resolvedSessionID);
-    const children = this.readChildSessionsSync(resolvedSessionID);
-    const siblings = session.parentSessionID
-      ? this.readChildSessionsSync(session.parentSessionID).filter(
-          (child) => child.sessionID !== resolvedSessionID,
-        )
-      : [];
+      const session = this.readSessionSync(resolvedSessionID);
+      const chain = this.readLineageChainSync(resolvedSessionID);
+      const children = this.readChildSessionsSync(resolvedSessionID);
+      const siblings = session.parentSessionID
+        ? this.readChildSessionsSync(session.parentSessionID).filter(
+            (child) => child.sessionID !== resolvedSessionID,
+          )
+        : [];
 
-    return [
-      `Session: ${session.sessionID}`,
-      `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
-      `Worktree: ${normalizeWorktreeKey(session.directory) ?? 'unknown'}`,
-      `Root session: ${session.rootSessionID ?? session.sessionID}`,
-      `Parent session: ${session.parentSessionID ?? 'none'}`,
-      `Lineage depth: ${session.lineageDepth ?? 0}`,
-      'Lineage chain:',
-      ...chain.map(
-        (entry, index) =>
-          `${entry.sessionID === resolvedSessionID ? '*' : '-'} depth=${index} ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
-      ),
-      ...(siblings.length > 0
-        ? [
-            'Sibling branches:',
-            ...siblings.map(
-              (entry) => `- ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
-            ),
-          ]
-        : []),
-      ...(children.length > 0
-        ? [
-            'Child branches:',
-            ...children.map(
-              (entry) => `- ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
-            ),
-          ]
-        : []),
-    ].join('\n');
+      return [
+        `Session: ${session.sessionID}`,
+        `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
+        `Worktree: ${normalizeWorktreeKey(session.directory) ?? 'unknown'}`,
+        `Root session: ${session.rootSessionID ?? session.sessionID}`,
+        `Parent session: ${session.parentSessionID ?? 'none'}`,
+        `Lineage depth: ${session.lineageDepth ?? 0}`,
+        'Lineage chain:',
+        ...chain.map(
+          (entry, index) =>
+            `${entry.sessionID === resolvedSessionID ? '*' : '-'} depth=${index} ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
+        ),
+        ...(siblings.length > 0
+          ? [
+              'Sibling branches:',
+              ...siblings.map(
+                (entry) => `- ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
+              ),
+            ]
+          : []),
+        ...(children.length > 0
+          ? [
+              'Child branches:',
+              ...children.map(
+                (entry) => `- ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
+              ),
+            ]
+          : []),
+      ].join('\n');
+    });
   }
 
   async pinSession(input: { sessionID?: string; reason?: string }): Promise<string> {
-    await this.prepareForRead();
-    const sessionID = input.sessionID ?? this.latestSessionIDSync();
-    if (!sessionID) return 'No archived sessions yet.';
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const sessionID = input.sessionID ?? this.latestSessionIDSync();
+        if (!sessionID) return 'No archived sessions yet.';
 
-    const session = this.readSessionHeaderSync(sessionID);
-    if (!session) return 'Unknown session.';
-    const reason = input.reason?.trim() || 'Pinned by user';
+        const session = this.readSessionHeaderSync(sessionID);
+        if (!session) return 'Unknown session.';
+        const reason = input.reason?.trim() || 'Pinned by user';
 
-    this.getDb()
-      .prepare('UPDATE sessions SET pinned = 1, pin_reason = ? WHERE session_id = ?')
-      .run(reason, sessionID);
-    return [`session=${sessionID}`, 'pinned=true', `reason=${reason}`].join('\n');
+        this.getDb()
+          .prepare('UPDATE sessions SET pinned = 1, pin_reason = ? WHERE session_id = ?')
+          .run(reason, sessionID);
+        return [`session=${sessionID}`, 'pinned=true', `reason=${reason}`].join('\n');
+      });
+    });
   }
 
   async unpinSession(input: { sessionID?: string }): Promise<string> {
-    await this.prepareForRead();
-    const sessionID = input.sessionID ?? this.latestSessionIDSync();
-    if (!sessionID) return 'No archived sessions yet.';
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const sessionID = input.sessionID ?? this.latestSessionIDSync();
+        if (!sessionID) return 'No archived sessions yet.';
 
-    const session = this.readSessionHeaderSync(sessionID);
-    if (!session) return 'Unknown session.';
-    this.getDb()
-      .prepare('UPDATE sessions SET pinned = 0, pin_reason = NULL WHERE session_id = ?')
-      .run(sessionID);
-    return [`session=${sessionID}`, 'pinned=false'].join('\n');
+        const session = this.readSessionHeaderSync(sessionID);
+        if (!session) return 'Unknown session.';
+        this.getDb()
+          .prepare('UPDATE sessions SET pinned = 0, pin_reason = NULL WHERE session_id = ?')
+          .run(sessionID);
+        return [`session=${sessionID}`, 'pinned=false'].join('\n');
+      });
+    });
   }
 
   async artifact(input: { artifactID: string; chars?: number }): Promise<string> {
-    await this.prepareForRead();
-    const artifact = this.readArtifactSync(input.artifactID);
-    if (!artifact) return 'Unknown artifact.';
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const artifact = this.readArtifactSync(input.artifactID);
+      if (!artifact) return 'Unknown artifact.';
 
-    const maxChars = Math.max(
-      200,
-      Math.min(this.options.artifactViewChars, input.chars ?? this.options.artifactViewChars),
-    );
-    return [
-      `Artifact: ${artifact.artifactID}`,
-      `Session: ${artifact.sessionID}`,
-      `Message: ${artifact.messageID}`,
-      `Part: ${artifact.partID}`,
-      `Kind: ${artifact.artifactKind}`,
-      `Field: ${artifact.fieldName}`,
-      `Content hash: ${artifact.contentHash}`,
-      `Characters: ${artifact.charCount}`,
-      ...this.formatArtifactMetadataLines(artifact.metadata),
-      'Preview:',
-      truncate(artifact.previewText, this.options.artifactPreviewChars),
-      'Content:',
-      truncate(artifact.contentText, maxChars),
-    ].join('\n');
+      const maxChars = Math.max(
+        200,
+        Math.min(this.options.artifactViewChars, input.chars ?? this.options.artifactViewChars),
+      );
+      return [
+        `Artifact: ${artifact.artifactID}`,
+        `Session: ${artifact.sessionID}`,
+        `Message: ${artifact.messageID}`,
+        `Part: ${artifact.partID}`,
+        `Kind: ${artifact.artifactKind}`,
+        `Field: ${artifact.fieldName}`,
+        `Content hash: ${artifact.contentHash}`,
+        `Characters: ${artifact.charCount}`,
+        ...this.formatArtifactMetadataLines(artifact.metadata),
+        'Preview:',
+        truncate(artifact.previewText, this.options.artifactPreviewChars),
+        'Content:',
+        truncate(artifact.contentText, maxChars),
+      ].join('\n');
+    });
   }
 
   async blobStats(input?: { limit?: number }): Promise<string> {
-    await this.prepareForRead();
-    const limit = clamp(input?.limit ?? 5, 1, 20);
-    const db = this.getDb();
-    const totals = db
-      .prepare(
-        `SELECT
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const limit = clamp(input?.limit ?? 5, 1, 20);
+      const db = this.getDb();
+      const totals = db
+        .prepare(
+          `SELECT
            COUNT(*) AS blob_count,
            COALESCE(SUM(char_count), 0) AS blob_chars,
            COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash) THEN 0 ELSE char_count END), 0) AS orphan_chars
          FROM artifact_blobs b`,
-      )
-      .get() as { blob_count: number; blob_chars: number; orphan_chars: number };
-    const referenced = db
-      .prepare(
-        'SELECT COUNT(DISTINCT content_hash) AS count FROM artifacts WHERE content_hash IS NOT NULL',
-      )
-      .get() as { count: number };
-    const sharedCount = db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM (
+        )
+        .get() as { blob_count: number; blob_chars: number; orphan_chars: number };
+      const referenced = db
+        .prepare(
+          'SELECT COUNT(DISTINCT content_hash) AS count FROM artifacts WHERE content_hash IS NOT NULL',
+        )
+        .get() as { count: number };
+      const sharedCount = db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM (
            SELECT content_hash FROM artifacts
            WHERE content_hash IS NOT NULL
            GROUP BY content_hash
            HAVING COUNT(*) > 1
          )`,
-      )
-      .get() as { count: number };
-    const orphanCount = db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM artifact_blobs b
+        )
+        .get() as { count: number };
+      const orphanCount = db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM artifact_blobs b
          WHERE NOT EXISTS (
            SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
          )`,
-      )
-      .get() as { count: number };
-    const shared = db
-      .prepare(
-        `SELECT a.content_hash AS content_hash, COUNT(*) AS ref_count, MAX(b.char_count) AS char_count
+        )
+        .get() as { count: number };
+      const shared = db
+        .prepare(
+          `SELECT a.content_hash AS content_hash, COUNT(*) AS ref_count, MAX(b.char_count) AS char_count
          FROM artifacts a
          JOIN artifact_blobs b ON b.content_hash = a.content_hash
          WHERE a.content_hash IS NOT NULL
@@ -2771,22 +3055,22 @@ export class SqliteLcmStore {
          HAVING COUNT(*) > 1
          ORDER BY ref_count DESC, char_count DESC
          LIMIT ?`,
-      )
-      .all(limit) as Array<{ content_hash: string; ref_count: number; char_count: number }>;
-    const orphan = db
-      .prepare(
-        `SELECT content_hash, char_count, created_at
+        )
+        .all(limit) as Array<{ content_hash: string; ref_count: number; char_count: number }>;
+      const orphan = db
+        .prepare(
+          `SELECT content_hash, char_count, created_at
          FROM artifact_blobs b
          WHERE NOT EXISTS (
            SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
          )
          ORDER BY char_count DESC, created_at ASC
          LIMIT ?`,
-      )
-      .all(limit) as Array<{ content_hash: string; char_count: number; created_at: number }>;
-    const saved = db
-      .prepare(
-        `SELECT COALESCE(SUM((ref_count - 1) * char_count), 0) AS chars_saved FROM (
+        )
+        .all(limit) as Array<{ content_hash: string; char_count: number; created_at: number }>;
+      const saved = db
+        .prepare(
+          `SELECT COALESCE(SUM((ref_count - 1) * char_count), 0) AS chars_saved FROM (
            SELECT a.content_hash AS content_hash, COUNT(*) AS ref_count, MAX(b.char_count) AS char_count
            FROM artifacts a
            JOIN artifact_blobs b ON b.content_hash = a.content_hash
@@ -2794,111 +3078,156 @@ export class SqliteLcmStore {
            GROUP BY a.content_hash
            HAVING COUNT(*) > 1
          )`,
-      )
-      .get() as { chars_saved: number };
+        )
+        .get() as { chars_saved: number };
 
-    return [
-      `artifact_blobs=${totals.blob_count}`,
-      `referenced_blobs=${referenced.count}`,
-      `shared_blobs=${sharedCount.count}`,
-      `orphan_blobs=${orphanCount.count}`,
-      `blob_chars=${totals.blob_chars}`,
-      `orphan_blob_chars=${totals.orphan_chars}`,
-      `saved_chars_from_dedup=${saved.chars_saved}`,
-      ...(shared.length > 0
-        ? [
-            'top_shared_blobs:',
-            ...shared.map(
-              (row) =>
-                `- ${row.content_hash.slice(0, 16)} refs=${row.ref_count} chars=${row.char_count}`,
-            ),
-          ]
-        : ['top_shared_blobs:', '- none']),
-      ...(orphan.length > 0
-        ? [
-            'orphan_blobs_preview:',
-            ...orphan.map(
-              (row) =>
-                `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-            ),
-          ]
-        : ['orphan_blobs_preview:', '- none']),
-    ].join('\n');
+      return [
+        `artifact_blobs=${totals.blob_count}`,
+        `referenced_blobs=${referenced.count}`,
+        `shared_blobs=${sharedCount.count}`,
+        `orphan_blobs=${orphanCount.count}`,
+        `blob_chars=${totals.blob_chars}`,
+        `orphan_blob_chars=${totals.orphan_chars}`,
+        `saved_chars_from_dedup=${saved.chars_saved}`,
+        ...(shared.length > 0
+          ? [
+              'top_shared_blobs:',
+              ...shared.map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} refs=${row.ref_count} chars=${row.char_count}`,
+              ),
+            ]
+          : ['top_shared_blobs:', '- none']),
+        ...(orphan.length > 0
+          ? [
+              'orphan_blobs_preview:',
+              ...orphan.map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+              ),
+            ]
+          : ['orphan_blobs_preview:', '- none']),
+      ].join('\n');
+    });
   }
 
-  private readOrphanArtifactBlobRowsSync(): RetentionBlobCandidate[] {
+  private deleteOrphanArtifactBlobsSync(gracePeriodMs?: number): RetentionBlobCandidate[] {
+    const db = this.getDb();
+    let orphanRows: RetentionBlobCandidate[] = [];
+    withTransaction(db, 'deleteOrphanBlobs', () => {
+      this.refreshOrphanedArtifactBlobsSync();
+      orphanRows = this.selectOrphanBlobsForDeletionSync(gracePeriodMs, false);
+      if (orphanRows.length === 0) return;
+
+      const cutoff = gracePeriodMs === undefined ? undefined : Date.now() - gracePeriodMs;
+      const cutoffClause = cutoff === undefined ? '' : ' AND orphaned_at <= ?';
+      const params = cutoff === undefined ? [] : [cutoff];
+      db.prepare(
+        `DELETE FROM artifact_blobs
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
+         )${cutoffClause}`,
+      ).run(...params);
+    });
+
+    return orphanRows;
+  }
+
+  private selectOrphanBlobsForDeletionSync(
+    gracePeriodMs?: number,
+    refresh = true,
+  ): RetentionBlobCandidate[] {
+    if (refresh) this.refreshOrphanedArtifactBlobsSync();
+    const cutoff = gracePeriodMs === undefined ? undefined : Date.now() - gracePeriodMs;
+    const cutoffClause = cutoff === undefined ? '' : ' AND b.orphaned_at <= ?';
+    const params = cutoff === undefined ? [] : [cutoff];
     return this.getDb()
       .prepare(
         `SELECT content_hash, char_count, created_at
          FROM artifact_blobs b
          WHERE NOT EXISTS (
            SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
-         )
+         )${cutoffClause}
          ORDER BY char_count DESC, created_at ASC`,
       )
-      .all() as RetentionBlobCandidate[];
+      .all(...params) as RetentionBlobCandidate[];
   }
 
-  private deleteOrphanArtifactBlobsSync(): RetentionBlobCandidate[] {
-    const orphanRows = this.readOrphanArtifactBlobRowsSync();
-    if (orphanRows.length === 0) return [];
-
-    this.getDb()
-      .prepare(
-        `DELETE FROM artifact_blobs
-         WHERE NOT EXISTS (
+  private refreshOrphanedArtifactBlobsSync(): void {
+    const db = this.getDb();
+    const now = Date.now();
+    db.prepare(
+      `UPDATE artifact_blobs
+       SET orphaned_at = COALESCE(orphaned_at, ?)
+       WHERE orphaned_at IS NULL
+         AND NOT EXISTS (
+         SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
+       )`,
+    ).run(now);
+    db.prepare(
+      `UPDATE artifact_blobs
+       SET orphaned_at = NULL
+       WHERE orphaned_at IS NOT NULL
+         AND EXISTS (
            SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
          )`,
-      )
-      .run();
+    ).run();
+  }
 
-    return orphanRows;
+  private orphanBlobGracePeriodMs(): number | undefined {
+    const days = this.options.retention.orphanBlobDays;
+    return days === undefined ? undefined : days * 24 * 60 * 60 * 1000;
   }
 
   async gcBlobs(input?: { apply?: boolean; limit?: number }): Promise<string> {
-    await this.prepareForRead();
-    const apply = input?.apply ?? false;
-    const limit = clamp(input?.limit ?? 10, 1, 50);
-    const orphanRows = this.readOrphanArtifactBlobRowsSync();
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const apply = input?.apply ?? false;
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const gracePeriodMs = this.orphanBlobGracePeriodMs();
+        const orphanRows = this.selectOrphanBlobsForDeletionSync(gracePeriodMs);
 
-    const totalChars = orphanRows.reduce((sum, row) => sum + row.char_count, 0);
-    if (orphanRows.length === 0) {
-      return ['orphan_blobs=0', 'deleted_blobs=0', 'deleted_blob_chars=0', 'status=clean'].join(
-        '\n',
-      );
-    }
+        const totalChars = orphanRows.reduce((sum, row) => sum + row.char_count, 0);
+        if (orphanRows.length === 0) {
+          return ['orphan_blobs=0', 'deleted_blobs=0', 'deleted_blob_chars=0', 'status=clean'].join(
+            '\n',
+          );
+        }
 
-    if (!apply) {
-      return [
-        `orphan_blobs=${orphanRows.length}`,
-        `orphan_blob_chars=${totalChars}`,
-        'status=dry-run',
-        'preview:',
-        ...orphanRows
-          .slice(0, limit)
-          .map(
-            (row) =>
-              `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-          ),
-        'Re-run with apply=true to delete orphan blobs.',
-      ].join('\n');
-    }
+        if (!apply) {
+          return [
+            `orphan_blobs=${orphanRows.length}`,
+            `orphan_blob_chars=${totalChars}`,
+            'status=dry-run',
+            'preview:',
+            ...orphanRows
+              .slice(0, limit)
+              .map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+              ),
+            'Re-run with apply=true to delete orphan blobs.',
+          ].join('\n');
+        }
 
-    this.deleteOrphanArtifactBlobsSync();
+        this.deleteOrphanArtifactBlobsSync(gracePeriodMs);
 
-    return [
-      `orphan_blobs=${orphanRows.length}`,
-      `deleted_blobs=${orphanRows.length}`,
-      `deleted_blob_chars=${totalChars}`,
-      'status=applied',
-      'deleted_preview:',
-      ...orphanRows
-        .slice(0, limit)
-        .map(
-          (row) =>
-            `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-        ),
-    ].join('\n');
+        return [
+          `orphan_blobs=${orphanRows.length}`,
+          `deleted_blobs=${orphanRows.length}`,
+          `deleted_blob_chars=${totalChars}`,
+          'status=applied',
+          'deleted_preview:',
+          ...orphanRows
+            .slice(0, limit)
+            .map(
+              (row) =>
+                `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+            ),
+        ].join('\n');
+      });
+    });
   }
 
   private readPrunableEventTypeCountsSync(): Array<{ eventType: string; count: number }> {
@@ -2942,77 +3271,134 @@ export class SqliteLcmStore {
     };
   }
 
+  private readStorageMetricsSync(): {
+    pageSize: number;
+    pageCount: number;
+    freelistCount: number;
+    freeBytes: number;
+    freeRatio: number;
+  } {
+    const db = this.getDb();
+    const pageSize = firstFiniteNumber(db.prepare('PRAGMA page_size').get()) ?? 4096;
+    const pageCount = firstFiniteNumber(db.prepare('PRAGMA page_count').get()) ?? 0;
+    const freelistCount = firstFiniteNumber(db.prepare('PRAGMA freelist_count').get()) ?? 0;
+    const freeBytes = freelistCount * pageSize;
+    const freeRatio = pageCount > 0 ? freelistCount / pageCount : 0;
+    return { pageSize, pageCount, freelistCount, freeBytes, freeRatio };
+  }
+
   async compactEventLog(input?: {
     apply?: boolean;
     vacuum?: boolean;
     limit?: number;
   }): Promise<string> {
+    return this.compact(input);
+  }
+
+  async compact(input?: { apply?: boolean; vacuum?: boolean; limit?: number }): Promise<string> {
     return this.withStoreActivity(async () => {
       await this.prepareForRead();
-      const apply = input?.apply ?? false;
-      const vacuum = input?.vacuum ?? true;
-      const limit = clamp(input?.limit ?? 10, 1, 50);
-      const candidates = this.readPrunableEventTypeCountsSync();
-      const candidateEvents = candidates.reduce((sum, row) => sum + row.count, 0);
-      const beforeSizes = await this.readStoreFileSizes();
+      return this.withMutation(async () => {
+        const apply = input?.apply ?? false;
+        const vacuumMode =
+          input?.vacuum === true ? 'force' : input?.vacuum === false ? 'off' : 'auto';
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const beforeSizes = await this.readStoreFileSizes();
+        const candidates = this.readPrunableEventTypeCountsSync();
+        const candidateEvents = candidates.reduce((sum, row) => sum + row.count, 0);
+        const metrics = this.readStorageMetricsSync();
 
-      if (!apply || candidateEvents === 0) {
+        if (!apply) {
+          return [
+            `candidate_events=${candidateEvents}`,
+            `apply=false`,
+            `vacuum_mode=${vacuumMode}`,
+            `vacuum_threshold=${SqliteLcmStore.compactFreeRatioThreshold.toFixed(2)}`,
+            `page_size=${metrics.pageSize}`,
+            `page_count=${metrics.pageCount}`,
+            `freelist_count=${metrics.freelistCount}`,
+            `free_bytes=${metrics.freeBytes}`,
+            `free_ratio=${metrics.freeRatio.toFixed(4)}`,
+            `db_bytes=${beforeSizes.dbBytes}`,
+            `wal_bytes=${beforeSizes.walBytes}`,
+            `shm_bytes=${beforeSizes.shmBytes}`,
+            `total_bytes=${beforeSizes.totalBytes}`,
+            ...(candidates.length > 0
+              ? [
+                  'candidate_event_types:',
+                  ...candidates
+                    .slice(0, limit)
+                    .map((row) => `- ${row.eventType} count=${row.count}`),
+                ]
+              : ['candidate_event_types:', '- none']),
+          ].join('\n');
+        }
+
+        if (candidateEvents > 0) {
+          const eventTypes = candidates.map((row) => row.eventType);
+          const placeholders = eventTypes.map(() => '?').join(', ');
+          this.getDb()
+            .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
+            .run(...eventTypes);
+        }
+
+        const decisionMetrics = this.readStorageMetricsSync();
+        const shouldVacuum =
+          vacuumMode === 'force' ||
+          (vacuumMode === 'auto' &&
+            decisionMetrics.freeRatio >= SqliteLcmStore.compactFreeRatioThreshold);
+        const vacuumReason =
+          vacuumMode === 'force'
+            ? 'requested'
+            : shouldVacuum
+              ? 'free-ratio'
+              : vacuumMode === 'off'
+                ? 'disabled'
+                : 'below-threshold';
+
+        this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        let vacuumApplied = false;
+        if (shouldVacuum) {
+          this.getDb().exec('VACUUM');
+          this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+          vacuumApplied = true;
+        }
+
+        const afterMetrics = this.readStorageMetricsSync();
+        const afterSizes = await this.readStoreFileSizes();
+
         return [
           `candidate_events=${candidateEvents}`,
-          `apply=false`,
-          `vacuum_requested=${vacuum}`,
-          `db_bytes=${beforeSizes.dbBytes}`,
-          `wal_bytes=${beforeSizes.walBytes}`,
-          `shm_bytes=${beforeSizes.shmBytes}`,
-          `total_bytes=${beforeSizes.totalBytes}`,
+          `deleted_events=${candidateEvents}`,
+          `apply=true`,
+          `vacuum_mode=${vacuumMode}`,
+          `vacuum_applied=${vacuumApplied}`,
+          `vacuum_reason=${vacuumReason}`,
+          `page_size=${metrics.pageSize}`,
+          `page_count_before=${metrics.pageCount}`,
+          `freelist_count_before=${metrics.freelistCount}`,
+          `free_bytes_before=${metrics.freeBytes}`,
+          `free_ratio_before=${metrics.freeRatio.toFixed(4)}`,
+          `page_count_after=${afterMetrics.pageCount}`,
+          `freelist_count_after=${afterMetrics.freelistCount}`,
+          `free_bytes_after=${afterMetrics.freeBytes}`,
+          `free_ratio_after=${afterMetrics.freeRatio.toFixed(4)}`,
+          `db_bytes_before=${beforeSizes.dbBytes}`,
+          `wal_bytes_before=${beforeSizes.walBytes}`,
+          `shm_bytes_before=${beforeSizes.shmBytes}`,
+          `total_bytes_before=${beforeSizes.totalBytes}`,
+          `db_bytes_after=${afterSizes.dbBytes}`,
+          `wal_bytes_after=${afterSizes.walBytes}`,
+          `shm_bytes_after=${afterSizes.shmBytes}`,
+          `total_bytes_after=${afterSizes.totalBytes}`,
           ...(candidates.length > 0
             ? [
-                'candidate_event_types:',
+                'deleted_event_types:',
                 ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
               ]
-            : ['candidate_event_types:', '- none']),
+            : ['deleted_event_types:', '- none']),
         ].join('\n');
-      }
-
-      const eventTypes = candidates.map((row) => row.eventType);
-      if (eventTypes.length > 0) {
-        const placeholders = eventTypes.map(() => '?').join(', ');
-        this.getDb()
-          .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
-          .run(...eventTypes);
-      }
-
-      let vacuumApplied = false;
-      this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
-      if (vacuum) {
-        this.getDb().exec('VACUUM');
-        this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
-        vacuumApplied = true;
-      }
-
-      const afterSizes = await this.readStoreFileSizes();
-
-      return [
-        `candidate_events=${candidateEvents}`,
-        `deleted_events=${candidateEvents}`,
-        `apply=true`,
-        `vacuum_requested=${vacuum}`,
-        `vacuum_applied=${vacuumApplied}`,
-        `db_bytes_before=${beforeSizes.dbBytes}`,
-        `wal_bytes_before=${beforeSizes.walBytes}`,
-        `shm_bytes_before=${beforeSizes.shmBytes}`,
-        `total_bytes_before=${beforeSizes.totalBytes}`,
-        `db_bytes_after=${afterSizes.dbBytes}`,
-        `wal_bytes_after=${afterSizes.walBytes}`,
-        `shm_bytes_after=${afterSizes.shmBytes}`,
-        `total_bytes_after=${afterSizes.totalBytes}`,
-        ...(candidates.length > 0
-          ? [
-              'deleted_event_types:',
-              ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
-            ]
-          : ['deleted_event_types:', '- none']),
-      ].join('\n');
+      });
     });
   }
 
@@ -3022,69 +3408,73 @@ export class SqliteLcmStore {
     orphanBlobDays?: number;
     limit?: number;
   }): Promise<string> {
-    await this.prepareForRead();
-    const limit = clamp(input?.limit ?? 10, 1, 50);
-    const policy = this.resolveRetentionPolicy(input);
-    const staleSessions =
-      policy.staleSessionDays === undefined
-        ? []
-        : this.readSessionRetentionCandidates(false, policy.staleSessionDays, limit);
-    const deletedSessions =
-      policy.deletedSessionDays === undefined
-        ? []
-        : this.readSessionRetentionCandidates(true, policy.deletedSessionDays, limit);
-    const orphanBlobs =
-      policy.orphanBlobDays === undefined
-        ? []
-        : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays, limit);
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const policy = this.resolveRetentionPolicy(input);
+        const staleSessions =
+          policy.staleSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(false, policy.staleSessionDays, limit);
+        const deletedSessions =
+          policy.deletedSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(true, policy.deletedSessionDays, limit);
+        const orphanBlobs =
+          policy.orphanBlobDays === undefined
+            ? []
+            : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays, limit);
 
-    const totalStaleSessions =
-      policy.staleSessionDays === undefined
-        ? 0
-        : this.countSessionRetentionCandidates(false, policy.staleSessionDays);
-    const totalDeletedSessions =
-      policy.deletedSessionDays === undefined
-        ? 0
-        : this.countSessionRetentionCandidates(true, policy.deletedSessionDays);
-    const totalOrphanBlobs =
-      policy.orphanBlobDays === undefined
-        ? 0
-        : this.countOrphanBlobRetentionCandidates(policy.orphanBlobDays);
-    const orphanBlobChars =
-      policy.orphanBlobDays === undefined
-        ? 0
-        : this.sumOrphanBlobRetentionChars(policy.orphanBlobDays);
+        const totalStaleSessions =
+          policy.staleSessionDays === undefined
+            ? 0
+            : this.countSessionRetentionCandidates(false, policy.staleSessionDays);
+        const totalDeletedSessions =
+          policy.deletedSessionDays === undefined
+            ? 0
+            : this.countSessionRetentionCandidates(true, policy.deletedSessionDays);
+        const totalOrphanBlobs =
+          policy.orphanBlobDays === undefined
+            ? 0
+            : this.countOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+        const orphanBlobChars =
+          policy.orphanBlobDays === undefined
+            ? 0
+            : this.sumOrphanBlobRetentionChars(policy.orphanBlobDays);
 
-    return [
-      `stale_session_days=${formatRetentionDays(policy.staleSessionDays)}`,
-      `deleted_session_days=${formatRetentionDays(policy.deletedSessionDays)}`,
-      `orphan_blob_days=${formatRetentionDays(policy.orphanBlobDays)}`,
-      `stale_session_candidates=${totalStaleSessions}`,
-      `deleted_session_candidates=${totalDeletedSessions}`,
-      `orphan_blob_candidates=${totalOrphanBlobs}`,
-      `orphan_blob_candidate_chars=${orphanBlobChars}`,
-      ...(staleSessions.length > 0
-        ? [
-            'stale_sessions_preview:',
-            ...staleSessions.map((row) => this.formatRetentionSessionCandidate(row)),
-          ]
-        : ['stale_sessions_preview:', '- none']),
-      ...(deletedSessions.length > 0
-        ? [
-            'deleted_sessions_preview:',
-            ...deletedSessions.map((row) => this.formatRetentionSessionCandidate(row)),
-          ]
-        : ['deleted_sessions_preview:', '- none']),
-      ...(orphanBlobs.length > 0
-        ? [
-            'orphan_blobs_preview:',
-            ...orphanBlobs.map(
-              (row) =>
-                `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-            ),
-          ]
-        : ['orphan_blobs_preview:', '- none']),
-    ].join('\n');
+        return [
+          `stale_session_days=${formatRetentionDays(policy.staleSessionDays)}`,
+          `deleted_session_days=${formatRetentionDays(policy.deletedSessionDays)}`,
+          `orphan_blob_days=${formatRetentionDays(policy.orphanBlobDays)}`,
+          `stale_session_candidates=${totalStaleSessions}`,
+          `deleted_session_candidates=${totalDeletedSessions}`,
+          `orphan_blob_candidates=${totalOrphanBlobs}`,
+          `orphan_blob_candidate_chars=${orphanBlobChars}`,
+          ...(staleSessions.length > 0
+            ? [
+                'stale_sessions_preview:',
+                ...staleSessions.map((row) => this.formatRetentionSessionCandidate(row)),
+              ]
+            : ['stale_sessions_preview:', '- none']),
+          ...(deletedSessions.length > 0
+            ? [
+                'deleted_sessions_preview:',
+                ...deletedSessions.map((row) => this.formatRetentionSessionCandidate(row)),
+              ]
+            : ['deleted_sessions_preview:', '- none']),
+          ...(orphanBlobs.length > 0
+            ? [
+                'orphan_blobs_preview:',
+                ...orphanBlobs.map(
+                  (row) =>
+                    `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+                ),
+              ]
+            : ['orphan_blobs_preview:', '- none']),
+        ].join('\n');
+      });
+    });
   }
 
   async retentionPrune(input?: {
@@ -3094,88 +3484,94 @@ export class SqliteLcmStore {
     apply?: boolean;
     limit?: number;
   }): Promise<string> {
-    await this.prepareForRead();
-    const apply = input?.apply ?? false;
-    const limit = clamp(input?.limit ?? 10, 1, 50);
-    const policy = this.resolveRetentionPolicy(input);
-    const staleSessions =
-      policy.staleSessionDays === undefined
-        ? []
-        : this.readSessionRetentionCandidates(false, policy.staleSessionDays);
-    const deletedSessions =
-      policy.deletedSessionDays === undefined
-        ? []
-        : this.readSessionRetentionCandidates(true, policy.deletedSessionDays);
-    const combinedSessions = [...staleSessions, ...deletedSessions];
-    const initialOrphanBlobs =
-      policy.orphanBlobDays === undefined
-        ? []
-        : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const apply = input?.apply ?? false;
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const policy = this.resolveRetentionPolicy(input);
+        const staleSessions =
+          policy.staleSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(false, policy.staleSessionDays);
+        const deletedSessions =
+          policy.deletedSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(true, policy.deletedSessionDays);
+        const combinedSessions = [...staleSessions, ...deletedSessions];
+        const initialOrphanBlobs =
+          policy.orphanBlobDays === undefined
+            ? []
+            : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
 
-    if (!apply) {
-      return [
-        `stale_session_candidates=${staleSessions.length}`,
-        `deleted_session_candidates=${deletedSessions.length}`,
-        `orphan_blob_candidates=${initialOrphanBlobs.length}`,
-        'status=dry-run',
-        ...(combinedSessions.length > 0
-          ? [
-              'session_preview:',
-              ...combinedSessions
-                .slice(0, limit)
-                .map((row) => this.formatRetentionSessionCandidate(row)),
-            ]
-          : ['session_preview:', '- none']),
-        ...(initialOrphanBlobs.length > 0
-          ? [
-              'blob_preview:',
-              ...initialOrphanBlobs
-                .slice(0, limit)
-                .map(
-                  (row) =>
-                    `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-                ),
-            ]
-          : ['blob_preview:', '- none']),
-        'Re-run with apply=true to prune the candidates above.',
-      ].join('\n');
-    }
+        if (!apply) {
+          return [
+            `stale_session_candidates=${staleSessions.length}`,
+            `deleted_session_candidates=${deletedSessions.length}`,
+            `orphan_blob_candidates=${initialOrphanBlobs.length}`,
+            'status=dry-run',
+            ...(combinedSessions.length > 0
+              ? [
+                  'session_preview:',
+                  ...combinedSessions
+                    .slice(0, limit)
+                    .map((row) => this.formatRetentionSessionCandidate(row)),
+                ]
+              : ['session_preview:', '- none']),
+            ...(initialOrphanBlobs.length > 0
+              ? [
+                  'blob_preview:',
+                  ...initialOrphanBlobs
+                    .slice(0, limit)
+                    .map(
+                      (row) =>
+                        `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+                    ),
+                ]
+              : ['blob_preview:', '- none']),
+            'Re-run with apply=true to prune the candidates above.',
+          ].join('\n');
+        }
 
-    const result = this.applyRetentionPruneSync({ ...input, apply: true });
+        const result = this.applyRetentionPruneSync({ ...input, apply: true });
 
-    let combinedPreview: string[] = [];
-    if (combinedSessions.length > 0) {
-      combinedPreview = [
-        'deleted_sessions_preview:',
-        ...combinedSessions.slice(0, limit).map((row) => this.formatRetentionSessionCandidate(row)),
-      ];
-    } else {
-      combinedPreview = ['deleted_sessions_preview:', '- none'];
-    }
+        let combinedPreview: string[] = [];
+        if (combinedSessions.length > 0) {
+          combinedPreview = [
+            'deleted_sessions_preview:',
+            ...combinedSessions
+              .slice(0, limit)
+              .map((row) => this.formatRetentionSessionCandidate(row)),
+          ];
+        } else {
+          combinedPreview = ['deleted_sessions_preview:', '- none'];
+        }
 
-    let deletedBlobPreview: string[] = [];
-    if (initialOrphanBlobs.length > 0) {
-      deletedBlobPreview = [
-        'deleted_blobs_preview:',
-        ...initialOrphanBlobs
-          .slice(0, limit)
-          .map(
-            (row) =>
-              `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
-          ),
-      ];
-    } else {
-      deletedBlobPreview = ['deleted_blobs_preview:', '- none'];
-    }
+        let deletedBlobPreview: string[] = [];
+        if (initialOrphanBlobs.length > 0) {
+          deletedBlobPreview = [
+            'deleted_blobs_preview:',
+            ...initialOrphanBlobs
+              .slice(0, limit)
+              .map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+              ),
+          ];
+        } else {
+          deletedBlobPreview = ['deleted_blobs_preview:', '- none'];
+        }
 
-    return [
-      `deleted_sessions=${result.deletedSessions}`,
-      `deleted_blobs=${result.deletedBlobs}`,
-      `deleted_blob_chars=${result.deletedBlobChars}`,
-      'status=applied',
-      ...combinedPreview,
-      ...deletedBlobPreview,
-    ].join('\n');
+        return [
+          `deleted_sessions=${result.deletedSessions}`,
+          `deleted_blobs=${result.deletedBlobs}`,
+          `deleted_blob_chars=${result.deletedBlobChars}`,
+          'status=applied',
+          ...combinedPreview,
+          ...deletedBlobPreview,
+        ].join('\n');
+      });
+    });
   }
 
   async exportSnapshot(input: {
@@ -3212,17 +3608,19 @@ export class SqliteLcmStore {
   }): Promise<string> {
     return this.withStoreActivity(async () => {
       await this.prepareForRead();
-      return importStoreSnapshot(
-        {
-          workspaceDirectory: this.workspaceDirectory,
-          getDb: () => this.getDb(),
-          clearSessionDataSync: this.clearSessionDataSync.bind(this),
-          backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
-          refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
-          syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
-          refreshSearchIndexesSync: this.refreshSearchIndexesSync.bind(this),
-        },
-        input,
+      return this.withMutation(async () =>
+        importStoreSnapshot(
+          {
+            workspaceDirectory: this.workspaceDirectory,
+            getDb: () => this.getDb(),
+            clearSessionDataSync: this.clearSessionDataSync.bind(this),
+            backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
+            refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
+            syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
+            refreshSearchIndexesSync: this.refreshSearchIndexesSync.bind(this),
+          },
+          input,
+        ),
       );
     });
   }
@@ -3249,76 +3647,90 @@ export class SqliteLcmStore {
     messageLimit?: number;
     includeRaw?: boolean;
   }): Promise<string> {
-    await this.prepareForRead();
-    const depth = clamp(input.depth ?? 1, 1, 4);
-    const messageLimit = clamp(input.messageLimit ?? EXPAND_MESSAGE_LIMIT, 1, 20);
-    const query = input.query?.trim();
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const depth = clamp(input.depth ?? 1, 1, 4);
+        const messageLimit = clamp(input.messageLimit ?? EXPAND_MESSAGE_LIMIT, 1, 20);
+        const query = input.query?.trim();
 
-    if (!input.nodeID) {
-      const sessionID = input.sessionID ?? this.latestSessionIDSync();
-      if (!sessionID) return 'No archived summary nodes yet.';
+        if (!input.nodeID) {
+          const sessionID = input.sessionID ?? this.latestSessionIDSync();
+          if (!sessionID) return 'No archived summary nodes yet.';
 
-      const session = this.readSessionSync(sessionID);
-      let roots = this.getSummaryRootsForSession(session);
-      if (roots.length === 0) return 'No archived summary nodes yet.';
+          const session = this.readSessionSync(sessionID);
+          let roots = this.getSummaryRootsForSession(session);
+          if (roots.length === 0) return 'No archived summary nodes yet.';
 
-      if (query) {
-        const matches = this.findExpandMatches(sessionID, query);
-        roots = roots.filter((node) => this.nodeMatchesQuery(node, matches));
-        if (roots.length === 0) return `No archived summary nodes matched "${query}".`;
-      }
+          if (query) {
+            const matches = this.findExpandMatches(sessionID, query);
+            roots = roots.filter((node) => this.nodeMatchesQuery(node, matches));
+            if (roots.length === 0) return `No archived summary nodes matched "${query}".`;
+          }
 
-      return [
-        `Session: ${sessionID}`,
-        query
-          ? `Archived summary roots matching "${query}": ${roots.length}`
-          : `Archived summary roots: ${roots.length}`,
-        'Use lcm_expand with one of these node IDs for more detail:',
-        ...roots.map(
-          (node) =>
-            `- ${node.nodeID} (messages ${node.startIndex + 1}-${node.endIndex + 1}, level ${node.level}): ${node.summaryText}`,
-        ),
-      ].join('\n');
-    }
+          return [
+            `Session: ${sessionID}`,
+            query
+              ? `Archived summary roots matching "${query}": ${roots.length}`
+              : `Archived summary roots: ${roots.length}`,
+            'Use lcm_expand with one of these node IDs for more detail:',
+            ...roots.map(
+              (node) =>
+                `- ${node.nodeID} (messages ${node.startIndex + 1}-${node.endIndex + 1}, level ${node.level}): ${node.summaryText}`,
+            ),
+          ].join('\n');
+        }
 
-    const node = this.readSummaryNodeSync(input.nodeID);
-    if (!node) return 'Unknown summary node.';
+        const node = this.readSummaryNodeSync(input.nodeID);
+        if (!node) return 'Unknown summary node.';
 
-    const session = this.readSessionSync(node.sessionID);
-    if (!query)
-      return this.renderExpandedNode(session, node, depth, input.includeRaw ?? true, messageLimit);
+        const session = this.readSessionSync(node.sessionID);
+        if (!query)
+          return this.renderExpandedNode(
+            session,
+            node,
+            depth,
+            input.includeRaw ?? true,
+            messageLimit,
+          );
 
-    const matches = this.findExpandMatches(node.sessionID, query);
-    if (!this.nodeMatchesQuery(node, matches)) {
-      return `No descendants in ${node.nodeID} matched "${query}".`;
-    }
+        const matches = this.findExpandMatches(node.sessionID, query);
+        if (!this.nodeMatchesQuery(node, matches)) {
+          return `No descendants in ${node.nodeID} matched "${query}".`;
+        }
 
-    return this.renderTargetedExpansion(
-      session,
-      node,
-      depth,
-      input.includeRaw ?? true,
-      messageLimit,
-      query,
-      matches,
-    );
+        return this.renderTargetedExpansion(
+          session,
+          node,
+          depth,
+          input.includeRaw ?? true,
+          messageLimit,
+          query,
+          matches,
+        );
+      });
+    });
   }
 
   async buildCompactionContext(sessionID: string): Promise<string | undefined> {
-    await this.prepareForRead();
-    const session = this.readSessionSync(sessionID);
-    if (session.messages.length === 0) return undefined;
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const session = this.readSessionSync(sessionID);
+        if (session.messages.length === 0) return undefined;
 
-    const roots = this.getSummaryRootsForSession(session);
-    const note = this.buildResumeNote(session, roots);
-    this.getDb()
-      .prepare(
-        `INSERT INTO resumes (session_id, note, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
-      )
-      .run(sessionID, note, Date.now());
-    return note;
+        const roots = this.getSummaryRootsForSession(session);
+        const note = this.buildResumeNote(session, roots);
+        this.getDb()
+          .prepare(
+            `INSERT INTO resumes (session_id, note, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
+          )
+          .run(sessionID, note, Date.now());
+        return note;
+      });
+    });
   }
 
   async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
@@ -3384,7 +3796,9 @@ export class SqliteLcmStore {
 
       const { anchor, archived, recent } = window;
 
-      const roots = this.ensureSummaryGraphSync(anchor.info.sessionID, archived);
+      const roots = await this.withMutation(async () =>
+        this.ensureSummaryGraphSync(anchor.info.sessionID, archived),
+      );
       if (roots.length === 0) {
         this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
           sessionID: anchor.info.sessionID,
@@ -4929,6 +5343,13 @@ export class SqliteLcmStore {
     if (!names.has('content_hash')) {
       db.exec('ALTER TABLE artifacts ADD COLUMN content_hash TEXT');
     }
+
+    const blobColumns = db.prepare('PRAGMA table_info(artifact_blobs)').all() as Array<{
+      name: string;
+    }>;
+    if (!blobColumns.some((column) => column.name === 'orphaned_at')) {
+      db.exec('ALTER TABLE artifact_blobs ADD COLUMN orphaned_at INTEGER');
+    }
   }
 
   private backfillArtifactBlobsSync(): void {
@@ -5539,8 +5960,12 @@ export class SqliteLcmStore {
   private async persistCapturedSession(
     session: NormalizedSession,
     event: CapturedEvent,
+    recordEvent: boolean,
   ): Promise<void> {
     const payload = event.payload as Event;
+    const writeEvent = () => {
+      if (recordEvent) this.writeEvent(event);
+    };
 
     switch (payload.type) {
       case 'session.created':
@@ -5548,6 +5973,7 @@ export class SqliteLcmStore {
       case 'session.deleted':
       case 'session.compacted':
         withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
           this.upsertSessionRowSync(session);
         });
         return;
@@ -5556,6 +5982,7 @@ export class SqliteLcmStore {
           (entry) => entry.info.id === payload.properties.info.id,
         );
         withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
           this.upsertSessionRowSync(session);
           if (message) {
             this.upsertMessageInfoSync(session.sessionID, message);
@@ -5566,6 +5993,7 @@ export class SqliteLcmStore {
       }
       case 'message.removed':
         withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
           this.upsertSessionRowSync(session);
           this.deleteMessageSync(session.sessionID, payload.properties.messageID);
         });
@@ -5581,6 +6009,7 @@ export class SqliteLcmStore {
           : [];
         const externalized = message ? await this.externalizeMessage(message) : undefined;
         withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
           this.upsertSessionRowSync(session);
           if (externalized) {
             this.replaceStoredMessageSync(session.sessionID, externalized.storedMessage, [
@@ -5602,6 +6031,7 @@ export class SqliteLcmStore {
           : [];
         const externalized = message ? await this.externalizeMessage(message) : undefined;
         withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
           this.upsertSessionRowSync(session);
           if (externalized) {
             this.replaceStoredMessageSync(session.sessionID, externalized.storedMessage, [
@@ -5615,6 +6045,7 @@ export class SqliteLcmStore {
       default: {
         const externalized = await this.externalizeSession(session);
         withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
           this.persistStoredSessionSync(externalized.storedSession, externalized.artifacts);
         });
       }

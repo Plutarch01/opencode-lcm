@@ -107,7 +107,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   try {
     await store.init();
   } catch (_error) {
-    store.close();
+    await store.close();
     if (runtimeBackend === 'node_sidecar') return createSafeModeHooks(bunWindowsSafety);
     throw _error;
   }
@@ -152,6 +152,14 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `retention_stale_session_days=${options.retention.staleSessionDays ?? 'disabled'}`,
             `retention_deleted_session_days=${options.retention.deletedSessionDays ?? 'disabled'}`,
             `retention_orphan_blob_days=${options.retention.orphanBlobDays ?? 'disabled'}`,
+            ...(stats.recovery
+              ? [
+                  `recovery_at=${stats.recovery.at}`,
+                  `recovery_reason=${stats.recovery.reason.replace(/[\r\n]+/g, ' ')}`,
+                  `recovery_quarantined_files=${stats.recovery.quarantinedFiles.length}`,
+                  ...stats.recovery.quarantinedFiles.map((file) => `recovery_file=${file}`),
+                ]
+              : ['recovery=none']),
             `automatic_retrieval_enabled=${options.automaticRetrieval.enabled}`,
             `automatic_retrieval_max_chars=${options.automaticRetrieval.maxChars}`,
             `automatic_retrieval_min_tokens=${options.automaticRetrieval.minTokens}`,
@@ -340,6 +348,23 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         async execute(args) {
           return await store.gcBlobs({
             apply: args.apply,
+            limit: args.limit,
+          });
+        },
+      }),
+
+      lcm_compact: tool({
+        description:
+          'Measure and reclaim archive database space (prune internal events, checkpoint WAL, and VACUUM when worthwhile)',
+        args: {
+          apply: tool.schema.boolean().optional(),
+          vacuum: tool.schema.boolean().optional(),
+          limit: tool.schema.number().int().min(1).max(50).optional(),
+        },
+        async execute(args) {
+          return await store.compact({
+            apply: args.apply,
+            vacuum: args.vacuum,
             limit: args.limit,
           });
         },

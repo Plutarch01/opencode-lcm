@@ -37,6 +37,12 @@ export type ApplyLimitInput = {
   limit?: number;
 };
 
+export type CompactInput = {
+  apply?: boolean;
+  vacuum?: boolean;
+  limit?: number;
+};
+
 export type DoctorInput = {
   apply?: boolean;
   sessionID?: string;
@@ -74,7 +80,7 @@ export type SessionIDInput = {
 
 export type LcmStore = {
   init(): Promise<void>;
-  close(): void;
+  close(): void | Promise<void>;
   captureDeferred(event: Event): Promise<void>;
   stats(): Promise<StoreStats>;
   automaticRetrievalDebug(sessionID?: string): Promise<string>;
@@ -88,6 +94,7 @@ export type LcmStore = {
   artifact(input: ArtifactInput): Promise<string>;
   blobStats(input: LimitInput): Promise<string>;
   gcBlobs(input: ApplyLimitInput): Promise<string>;
+  compact(input: CompactInput): Promise<string>;
   doctor(input?: DoctorInput): Promise<string>;
   retentionReport(input?: RetentionInput): Promise<string>;
   retentionPrune(input: RetentionInput): Promise<string>;

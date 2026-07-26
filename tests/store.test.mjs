@@ -544,14 +544,14 @@ test('message.removed drops reverted content from session memory and search', as
     assert.equal(after.length, 0);
     assert.ok(!describe.includes('reverted memory body'));
     assert.equal(stats.artifactCount, 0);
-    assert.equal(stats.orphanArtifactBlobCount, 0);
+    assert.equal(stats.orphanArtifactBlobCount, 1);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
   }
 });
 
-test('message.part.updated replaces externalized content without leaving stale artifacts', async () => {
+test('message.part.updated replaces stale artifacts and retains the blob through its grace period', async () => {
   const workspace = makeWorkspace('lcm-message-part-replace');
   let store;
 
@@ -607,7 +607,7 @@ test('message.part.updated replaces externalized content without leaving stale a
     assert.equal(grep.length, 0);
     assert.match(describe, /short replacement/);
     assert.equal(after.artifactCount, 0);
-    assert.equal(after.orphanArtifactBlobCount, 0);
+    assert.equal(after.orphanArtifactBlobCount, 1);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
@@ -879,7 +879,7 @@ test('compactEventLog prunes transient event rows without touching archived stat
     });
 
     const before = await store.describe({ sessionID: 's1' });
-    store.close();
+    await store.close();
     store = undefined;
 
     const db = new DatabaseSync(path.join(workspace, '.lcm', 'lcm.db'), {
@@ -1439,8 +1439,8 @@ test('startup orphan blob cleanup does not trigger unrelated session rebuilds', 
       timeout: 5000,
     });
     db.prepare(
-      'INSERT INTO artifact_blobs (content_hash, content_text, char_count, created_at) VALUES (?, ?, ?, ?)',
-    ).run('orphan-test-hash', 'orphaned startup blob', 19, 1);
+      'INSERT INTO artifact_blobs (content_hash, content_text, char_count, created_at, orphaned_at) VALUES (?, ?, ?, ?, ?)',
+    ).run('orphan-test-hash', 'orphaned startup blob', 19, 1, 1);
     const before = {
       summaryNodes: db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get().count,
       summaryState: db.prepare('SELECT COUNT(*) AS count FROM summary_state').get().count,

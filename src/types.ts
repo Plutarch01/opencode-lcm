@@ -131,6 +131,7 @@ export type StoreStats = {
   messageFtsCount: number;
   summaryFtsCount: number;
   artifactFtsCount: number;
+  recovery?: { reason: string; at: number; quarantinedFiles: string[] };
 };
 
 export type AutomaticRetrievalDebugScopeStat = {

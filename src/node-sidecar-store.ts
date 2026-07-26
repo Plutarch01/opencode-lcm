@@ -7,6 +7,7 @@ import type { Event } from '@opencode-ai/sdk';
 import type {
   ApplyLimitInput,
   ArtifactInput,
+  CompactInput,
   DescribeInput,
   DoctorInput,
   ExpandInput,
@@ -28,7 +29,15 @@ type SidecarResponse =
 type PendingRequest = {
   resolve(value: unknown): void;
   reject(error: Error): void;
+  timer?: ReturnType<typeof setTimeout>;
 };
+
+const SIDECAR_REQUEST_TIMEOUT_MS = (() => {
+  const configured = process.env.OPENCODE_LCM_SIDECAR_TIMEOUT_MS;
+  if (configured === undefined) return 300_000;
+  const raw = Number(configured);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 300_000;
+})();
 
 type TransformResult = {
   changed: boolean;
@@ -69,6 +78,9 @@ export class NodeSidecarLcmStore implements LcmStore {
   private stdoutBuffer = '';
   private stderrBuffer = '';
   private closed = false;
+  private restartBarrier: Promise<void> = Promise.resolve();
+  private restartError?: Error;
+  private terminatingChild?: ChildProcessWithoutNullStreams;
 
   constructor(
     private readonly projectDir: string,
@@ -76,23 +88,40 @@ export class NodeSidecarLcmStore implements LcmStore {
   ) {}
 
   async init(): Promise<void> {
-    this.ensureStarted();
     await this.request('init', {
       projectDir: this.projectDir,
       options: this.options,
     });
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    if (this.closed) return;
     this.closed = true;
     const child = this.child;
+    this.rejectAll(new Error('opencode-lcm Node sidecar closed'));
     this.child = undefined;
-    if (!child) return;
+    if (!child) {
+      await this.restartBarrier;
+      if (this.terminatingChild) await this.forceTerminateAndWait(this.terminatingChild);
+      return;
+    }
 
     if (child.stdin.writable) {
-      child.stdin.write(`${JSON.stringify({ id: this.nextID++, method: 'close' })}\n`);
+      child.stdin.end(`${JSON.stringify({ id: this.nextID++, method: 'close' })}\n`);
+    } else {
+      await this.forceTerminateAndWait(child);
+      return;
     }
-    child.kill();
+
+    const exited = once(child, 'exit').then(
+      () => true,
+      () => true,
+    );
+    const graceful = await Promise.race([
+      exited,
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
+    ]);
+    if (!graceful) await this.forceTerminateAndWait(child);
   }
 
   async captureDeferred(event: Event): Promise<void> {
@@ -147,6 +176,10 @@ export class NodeSidecarLcmStore implements LcmStore {
     return (await this.request('gcBlobs', input)) as string;
   }
 
+  async compact(input: CompactInput): Promise<string> {
+    return (await this.request('compact', input)) as string;
+  }
+
   async doctor(input?: DoctorInput): Promise<string> {
     return (await this.request('doctor', input)) as string;
   }
@@ -182,6 +215,7 @@ export class NodeSidecarLcmStore implements LcmStore {
   }
 
   private ensureStarted(): void {
+    if (this.closed) throw new Error('opencode-lcm Node sidecar is closed');
     if (this.child) return;
     const scriptPath = fileURLToPath(new URL('./node-sidecar.js', import.meta.url));
     const child = spawn(nodeExecutable(), ['--no-warnings', scriptPath], {
@@ -195,23 +229,31 @@ export class NodeSidecarLcmStore implements LcmStore {
     this.child = child;
 
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => this.handleStdout(chunk));
+    child.stdout.on('data', (chunk) => this.handleStdout(child, chunk));
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       this.stderrBuffer = (this.stderrBuffer + chunk).slice(-4000);
     });
-    child.once('error', (error) => this.rejectAll(error));
+    child.once('error', (error) => this.failChild(child, error));
     child.once('exit', (code, signal) => {
-      if (this.closed) return;
+      if (this.closed || this.child !== child) return;
       const suffix = this.stderrBuffer ? `\nSidecar stderr:\n${this.stderrBuffer}` : '';
-      this.rejectAll(
+      this.failChild(
+        child,
         new Error(`opencode-lcm Node sidecar exited code=${code} signal=${signal}${suffix}`),
+        false,
       );
     });
     this.updateRefs();
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
+  private async request(
+    method: string,
+    params: unknown,
+    timeoutMs: number = SIDECAR_REQUEST_TIMEOUT_MS,
+  ): Promise<unknown> {
+    await this.restartBarrier;
+    if (this.restartError) throw this.restartError;
     this.ensureStarted();
     const child = this.child;
     if (!child?.stdin.writable) {
@@ -222,10 +264,23 @@ export class NodeSidecarLcmStore implements LcmStore {
     this.nextID += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const entry: PendingRequest = { resolve, reject };
+      this.pending.set(id, entry);
+      if (timeoutMs && timeoutMs > 0) {
+        entry.timer = setTimeout(() => {
+          if (this.pending.get(id) !== entry) return;
+          this.failChild(
+            child,
+            new Error(`opencode-lcm sidecar request '${method}' timed out after ${timeoutMs}ms`),
+          );
+        }, timeoutMs);
+        if (typeof entry.timer.unref === 'function') entry.timer.unref();
+      }
       this.updateRefs();
       child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, (error) => {
         if (!error) return;
+        if (this.pending.get(id) !== entry) return;
+        if (entry.timer) clearTimeout(entry.timer);
         this.pending.delete(id);
         this.updateRefs();
         reject(error);
@@ -233,7 +288,8 @@ export class NodeSidecarLcmStore implements LcmStore {
     });
   }
 
-  private handleStdout(chunk: string): void {
+  private handleStdout(child: ChildProcessWithoutNullStreams, chunk: string): void {
+    if (this.child !== child) return;
     this.stdoutBuffer += chunk;
     for (;;) {
       const newline = this.stdoutBuffer.indexOf('\n');
@@ -254,6 +310,7 @@ export class NodeSidecarLcmStore implements LcmStore {
       if (!pending) continue;
       this.pending.delete(response.id);
       this.updateRefs();
+      if (pending.timer) clearTimeout(pending.timer);
 
       if ('error' in response) pending.reject(formatSidecarError(response.error));
       else pending.resolve(response.result);
@@ -261,9 +318,60 @@ export class NodeSidecarLcmStore implements LcmStore {
   }
 
   private rejectAll(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
     this.updateRefs();
+  }
+
+  private failChild(child: ChildProcessWithoutNullStreams, error: Error, terminate = true): void {
+    if (this.child !== child) return;
+    this.child = undefined;
+    this.stdoutBuffer = '';
+    this.stderrBuffer = '';
+    this.rejectAll(error);
+    if (terminate && child.exitCode === null) {
+      this.terminatingChild = child;
+      const exited = once(child, 'exit').then(
+        () => true,
+        () => true,
+      );
+      this.restartBarrier = Promise.race([
+        exited,
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
+      ]).then((didExit) => {
+        if (didExit && this.terminatingChild === child) {
+          this.terminatingChild = undefined;
+        } else if (!didExit) {
+          this.restartError = new Error(
+            'opencode-lcm sidecar did not exit after termination; restart the plugin before retrying',
+          );
+        }
+      });
+      child.kill();
+    }
+  }
+
+  private async forceTerminateAndWait(child: ChildProcessWithoutNullStreams): Promise<void> {
+    if (child.exitCode !== null) {
+      if (this.terminatingChild === child) this.terminatingChild = undefined;
+      return;
+    }
+    const exited = once(child, 'exit').then(
+      () => true,
+      () => true,
+    );
+    child.kill('SIGKILL');
+    const didExit = await Promise.race([
+      exited,
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
+    ]);
+    if (!didExit && child.exitCode === null) {
+      throw new Error('opencode-lcm sidecar did not exit after forced termination');
+    }
+    if (this.terminatingChild === child) this.terminatingChild = undefined;
   }
 
   private updateRefs(): void {
