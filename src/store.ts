@@ -2067,14 +2067,28 @@ export class SqliteLcmStore {
           }
         }
 
+        let deletedOrphans = 0;
+        let deletedMalformedEvents = 0;
+        if (before.foreignKeyViolations > 0) {
+          deletedOrphans = this.deleteOrphanedChildRowsSync();
+          appliedActions.push(`deleted ${deletedOrphans} orphaned child row(s)`);
+        }
+
+        if (before.malformedEventRows > 0) {
+          deletedMalformedEvents = this.deleteMalformedEventRowsSync();
+          appliedActions.push(`deleted ${deletedMalformedEvents} malformed event row(s)`);
+        }
+
+        const shouldRefreshAllFts = deletedOrphans > 0 || deletedMalformedEvents > 0;
         if (
           before.messageFts.expected !== before.messageFts.actual ||
           before.summaryFts.expected !== before.summaryFts.actual ||
           before.artifactFts.expected !== before.artifactFts.actual ||
           before.summarySessionsNeedingRebuild.length > 0 ||
-          before.orphanSummaryEdges > 0
+          before.orphanSummaryEdges > 0 ||
+          shouldRefreshAllFts
         ) {
-          this.refreshSearchIndexesSync(checkedSessions);
+          this.refreshSearchIndexesSync(shouldRefreshAllFts ? undefined : checkedSessions);
           appliedActions.push('rebuilt FTS indexes');
         }
 
@@ -2172,19 +2186,31 @@ export class SqliteLcmStore {
     }
   }
 
+  private listForeignKeyViolationsSync(): Array<{ table: string; rowid: number | null }> {
+    return this.getDb().prepare('PRAGMA foreign_key_check').all() as Array<{
+      table: string;
+      rowid: number | null;
+    }>;
+  }
+
   private countForeignKeyViolationsSync(): number {
-    const rows = this.getDb().prepare('PRAGMA foreign_key_check').all() as unknown[];
-    return rows.length;
+    return this.listForeignKeyViolationsSync().length;
   }
 
   private countMalformedEventRowsSync(): number {
+    return this.findMalformedEventRowIDsSync().length;
+  }
+
+  private findMalformedEventRowIDsSync(): number[] {
     const rows = this.getDb()
-      .prepare('SELECT event_type, payload_json FROM events')
+      .prepare('SELECT rowid, id, event_type, payload_json FROM events')
       .all() as Array<{
+      rowid: number;
+      id: string | null;
       event_type: string;
       payload_json: string;
     }>;
-    let malformed = 0;
+    const malformed: number[] = [];
     for (const row of rows) {
       const expectedStub =
         row.event_type.startsWith('message.') || row.event_type.startsWith('session.')
@@ -2194,10 +2220,70 @@ export class SqliteLcmStore {
       try {
         JSON.parse(row.payload_json);
       } catch {
-        malformed += 1;
+        malformed.push(row.rowid);
       }
     }
     return malformed;
+  }
+
+  private deleteMalformedEventRowsSync(): number {
+    const malformed = this.findMalformedEventRowIDsSync();
+    if (malformed.length === 0) return 0;
+    // Delete by rowid: a corrupt page can yield a row whose PRIMARY KEY (id)
+    // is NULL, and `WHERE id = NULL` never matches.
+    const stmt = this.getDb().prepare('DELETE FROM events WHERE rowid = ?');
+    let deleted = 0;
+    for (const rowID of malformed) {
+      deleted += (stmt.run(rowID) as { changes: number }).changes;
+    }
+    return deleted;
+  }
+
+  private deleteForeignKeyViolationRowsSync(): number {
+    const db = this.getDb();
+    let deleted = 0;
+    // Iterate until the checker comes back clean so future schema additions with
+    // deeper dependency chains are still repaired without hard-coding table order.
+    for (let pass = 0; pass < 10; pass += 1) {
+      const violations = this.listForeignKeyViolationsSync();
+      if (violations.length === 0) break;
+      let round = 0;
+      const seen = new Set<string>();
+      for (const violation of violations) {
+        if (typeof violation.rowid !== 'number') continue;
+        const key = `${violation.table}:${violation.rowid}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const tableName = `"${violation.table.replaceAll('"', '""')}"`;
+        round += (
+          db.prepare(`DELETE FROM ${tableName} WHERE rowid = ?`).run(violation.rowid) as {
+            changes: number;
+          }
+        ).changes;
+      }
+      if (round === 0) break;
+      deleted += round;
+    }
+    return deleted;
+  }
+
+  private deleteSessionlessEventRowsSync(): number {
+    return (
+      this.getDb()
+        .prepare(
+          `DELETE FROM events
+         WHERE session_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM sessions WHERE sessions.session_id = events.session_id
+           )`,
+        )
+        .run() as { changes: number }
+    ).changes;
+  }
+
+  private deleteOrphanedChildRowsSync(): number {
+    return this.deleteForeignKeyViolationRowsSync() + this.deleteSessionlessEventRowsSync();
   }
 
   private diagnoseSummarySession(session: NormalizedSession): DoctorSessionIssue | undefined {
