@@ -65,6 +65,69 @@ async function cleanupWorkspace(workspace) {
   }
 }
 
+function seedLegacyDb(workspace, { userVersion, withStrategyColumn }) {
+  const dbDir = path.join(workspace, '.lcm');
+  mkdirSync(dbDir, { recursive: true });
+  const db = new DatabaseSync(path.join(dbDir, 'lcm.db'), {
+    enableForeignKeyConstraints: true,
+    timeout: 5000,
+  });
+  db.exec(`
+    CREATE TABLE sessions (
+      session_id TEXT PRIMARY KEY, title TEXT, session_directory TEXT, worktree_key TEXT,
+      parent_session_id TEXT, root_session_id TEXT, lineage_depth INTEGER,
+      pinned INTEGER NOT NULL DEFAULT 0, pin_reason TEXT,
+      updated_at INTEGER NOT NULL DEFAULT 0, compacted_at INTEGER,
+      deleted INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE messages (
+      message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+      info_json TEXT NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+    CREATE TABLE parts (
+      part_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, message_id TEXT NOT NULL,
+      sort_key INTEGER NOT NULL DEFAULT 0, part_json TEXT NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE
+    );
+    CREATE TABLE summary_nodes (
+      node_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, level INTEGER NOT NULL,
+      node_kind TEXT NOT NULL, start_index INTEGER NOT NULL, end_index INTEGER NOT NULL,
+      message_ids_json TEXT NOT NULL, summary_text TEXT NOT NULL, created_at INTEGER NOT NULL
+      ${withStrategyColumn ? ", strategy TEXT NOT NULL DEFAULT 'deterministic-v1'" : ''},
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+    CREATE TABLE summary_state (
+      session_id TEXT PRIMARY KEY, archived_count INTEGER NOT NULL,
+      latest_message_created INTEGER NOT NULL, archived_signature TEXT NOT NULL DEFAULT '',
+      root_node_ids_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+  `);
+  const now = Date.now();
+  db.prepare(
+    'INSERT INTO sessions (session_id, title, updated_at, event_count) VALUES (?, ?, ?, ?)',
+  ).run('s1', 'Legacy session', now, 2);
+  const info = (id, role) => JSON.stringify({ id, role, sessionID: 's1', time: { created: now } });
+  const partJson = (id, mid, text) =>
+    JSON.stringify({ id, type: 'text', text, messageID: mid, sessionID: 's1' });
+  db.prepare(
+    'INSERT INTO messages (message_id, session_id, created_at, info_json) VALUES (?, ?, ?, ?)',
+  ).run('m1', 's1', now, info('m1', 'user'));
+  db.prepare(
+    'INSERT INTO messages (message_id, session_id, created_at, info_json) VALUES (?, ?, ?, ?)',
+  ).run('m2', 's1', now + 1, info('m2', 'assistant'));
+  db.prepare(
+    'INSERT INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)',
+  ).run('p1', 's1', 'm1', 0, partJson('p1', 'm1', 'legacy user message alpha'));
+  db.prepare(
+    'INSERT INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)',
+  ).run('p2', 's1', 'm2', 0, partJson('p2', 'm2', 'legacy assistant reply beta'));
+  db.exec(`PRAGMA user_version = ${userVersion}`);
+  db.close();
+}
+
 function sessionInfo(directory, id, created, parentID) {
   return {
     id,
@@ -316,6 +379,95 @@ test('init rejects newer on-disk schema versions', async () => {
     store = new SqliteLcmStore(workspace, makeOptions());
     await store.init();
     await assert.rejects(store.stats(), /Unsupported store schema version: 99/);
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('opens and migrates a pre-0.15.0 (v2) store missing messages.deleted_at', async () => {
+  const workspace = makeWorkspace('lcm-legacy-v2');
+  let store;
+
+  try {
+    seedLegacyDb(workspace, { userVersion: 2, withStrategyColumn: true });
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    const stats = await store.stats();
+    assert.equal(stats.schemaVersion, 2);
+
+    const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+    const db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const columns = db
+      .prepare('PRAGMA table_info(messages)')
+      .all()
+      .map((column) => column.name);
+    const version = Object.values(db.prepare('PRAGMA user_version').get())[0];
+    const deleted = db
+      .prepare('SELECT COUNT(*) AS count FROM messages WHERE deleted_at IS NOT NULL')
+      .get();
+    const messages = db.prepare('SELECT COUNT(*) AS count FROM messages').get();
+    db.close();
+
+    assert.ok(columns.includes('deleted_at'));
+    assert.equal(version, 2);
+    assert.equal(deleted.count, 0);
+    assert.equal(messages.count, 2);
+
+    const description = await store.describe({ sessionID: 's1' });
+    assert.match(description, /legacy user message alpha/);
+    assert.ok(!description.includes('[removed]'));
+  } finally {
+    store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('opens and migrates a pre-0.15.0 (v1) store missing legacy columns', async () => {
+  const workspace = makeWorkspace('lcm-legacy-v1');
+  let store;
+
+  try {
+    seedLegacyDb(workspace, { userVersion: 1, withStrategyColumn: false });
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+
+    const stats = await store.stats();
+    assert.equal(stats.schemaVersion, 2);
+
+    const dbPath = path.join(workspace, '.lcm', 'lcm.db');
+    const db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const messageColumns = db
+      .prepare('PRAGMA table_info(messages)')
+      .all()
+      .map((column) => column.name);
+    const summaryNodeColumns = db
+      .prepare('PRAGMA table_info(summary_nodes)')
+      .all()
+      .map((column) => column.name);
+    const version = Object.values(db.prepare('PRAGMA user_version').get())[0];
+    const deleted = db
+      .prepare('SELECT COUNT(*) AS count FROM messages WHERE deleted_at IS NOT NULL')
+      .get();
+    const messages = db.prepare('SELECT COUNT(*) AS count FROM messages').get();
+    db.close();
+
+    assert.ok(messageColumns.includes('deleted_at'));
+    assert.ok(summaryNodeColumns.includes('strategy'));
+    assert.equal(version, 2);
+    assert.equal(deleted.count, 0);
+    assert.equal(messages.count, 2);
+
+    const description = await store.describe({ sessionID: 's1' });
+    assert.match(description, /legacy user message alpha/);
+    assert.ok(!description.includes('[removed]'));
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
