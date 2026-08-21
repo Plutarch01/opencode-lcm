@@ -1,18 +1,13 @@
-## [0.15.0] - 2026-08-21
+## [0.15.1] - 2026-08-21
 
-This release expands archive retrieval, deterministic artifact exploration, and storage lifecycle safety.
+This hotfix locks in backward compatibility for SQLite stores created before 0.15.0.
 
 ### Highlights
-- `lcm_grep` supports pagination, summary-node scoping, and covering leaf annotations.
-- Text artifacts expose deterministic JSON, CSV/TSV, SQL, and code exploration summaries.
-- `lcm_status` and `lcm_doctor` report hook failures and repair managed resume-note drift.
-- Removed messages are preserved as tombstones with explicit `[removed]` and `[pruned: <id>]` expansion markers.
-- Storage operations use immediate transactions and WAL checkpoints for safer concurrent maintenance.
-
-### Issue fixes
-- Issue [#9](https://github.com/Plutarch01/opencode-lcm/issues/9): live SQLite corruption is quarantined and the triggering operation retried once; optional plugin hooks fail open so a corrupted store no longer blocks prompt submission.
+- Added regression fixtures based on legacy schema-v1 and schema-v2 stores.
+- Verified that opening a legacy store adds `messages.deleted_at` without deleting or tombstoning existing messages.
+- Verified that schema-v1 stores also gain `summary_nodes.strategy` and advance to schema version 2 automatically.
+- Behavioral reads continue to expose legacy message content after migration.
 
 ### Migration notes
-- Snapshot imports now require an explicit `merge` or `replace` mode.
-- `lcm_expand` returns summaries by default; pass `includeRaw=true` for raw messages.
-- The removed `interop.contextMode` and `interop.neverOverrideCompactionPrompt` options must be deleted from configuration.
+- No manual migration is required.
+- Existing databases are upgraded additively on first open; legacy messages remain live.
