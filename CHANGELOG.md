@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deferred startup maintenance no longer blocks the first capture or prompt read
 - Bun-on-Windows sidecar capture coalesces streaming part updates before RPC
 - The headless OpenCode dogfood harness uses an async Windows launcher and a configurable five-minute timeout, avoiding `spawnSync` hangs during slow plugin startup
+- Live SQLite corruption is quarantined and the triggering operation retried once; optional plugin hooks fail open so a corrupted store no longer blocks prompt submission ([#9](https://github.com/Plutarch01/opencode-lcm/issues/9))
 
 ### Removed
 - Unused `interop.contextMode` and `interop.neverOverrideCompactionPrompt` options
