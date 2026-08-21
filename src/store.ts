@@ -978,9 +978,10 @@ export class SqliteLcmStore {
       clearTimeout(this.deferredInitTimer);
       this.deferredInitTimer = undefined;
     }
-    if (this.db) this.db.close();
+    const snapshot = this.db;
     this.db = undefined;
     this.dbReadyPromise = undefined;
+    snapshot?.close();
   }
 
   private async withReadonlyStoreFallback<T>(
@@ -992,6 +993,16 @@ export class SqliteLcmStore {
     } catch (error) {
       if (!(await this.trySwitchToFallbackBaseDir(error, reason))) throw error;
       await this.ensureStoreDirReady();
+      return await operation();
+    }
+  }
+
+  private async withCorruptionRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!this.isCorruptionError(error) || this.storeRecovered) throw error;
+      await this.recoverCorruptedStore(error);
       return await operation();
     }
   }
@@ -1199,9 +1210,7 @@ export class SqliteLcmStore {
       db = await openSqliteDatabase(this.dbPath);
     } catch (error) {
       if (this.isCorruptionError(error) && !this.storeRecovered) {
-        await this.quarantineCorruptedStore(error);
-        this.storeRecovered = true;
-        await this.openAndInitializeConnection();
+        await this.recoverCorruptedStore(error);
         return;
       }
       throw error;
@@ -1393,13 +1402,22 @@ export class SqliteLcmStore {
       this.db = undefined;
       this.dbReadyPromise = undefined;
       if (this.isCorruptionError(error) && !this.storeRecovered) {
-        await this.quarantineCorruptedStore(error);
-        this.storeRecovered = true;
-        await this.openAndInitializeConnection();
+        await this.recoverCorruptedStore(error);
         return;
       }
       throw error;
     }
+  }
+
+  private async recoverCorruptedStore(error: unknown): Promise<void> {
+    try {
+      this.closeDbConnection();
+    } catch {
+      // Best-effort close before quarantine.
+    }
+    await this.quarantineCorruptedStore(error);
+    this.storeRecovered = true;
+    await this.openAndInitializeConnection();
   }
 
   private isCorruptionError(error: unknown): boolean {
@@ -1640,74 +1658,76 @@ export class SqliteLcmStore {
 
   async capture(event: Event): Promise<void> {
     return this.withStoreActivity(() =>
-      this.withMutation(async () => {
-        await this.withReadonlyStoreFallback('capture', async () => {
-          const normalized = normalizeEvent(event);
-          if (!normalized) return;
+      this.withMutation(async () =>
+        this.withCorruptionRecovery(async () =>
+          this.withReadonlyStoreFallback('capture', async () => {
+            const normalized = normalizeEvent(event);
+            if (!normalized) return;
 
-          if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
+            if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
 
-          const shouldRecord = this.shouldRecordEvent(normalized.type);
-          const shouldPersistSession =
-            Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
-          if (!shouldRecord && !shouldPersistSession) return;
+            const shouldRecord = this.shouldRecordEvent(normalized.type);
+            const shouldPersistSession =
+              Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
+            if (!shouldRecord && !shouldPersistSession) return;
 
-          await this.ensureDeferredInitComplete();
+            await this.ensureDeferredInitComplete();
 
-          if (!normalized.sessionID || !shouldPersistSession) {
-            if (shouldRecord) this.writeEvent(normalized);
-            return;
-          }
-
-          const session = shouldUseLightweightPartCapture(normalized)
-            ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
-            : resolveCaptureHydrationMode() === 'targeted'
-              ? this.readSessionForCaptureSync(normalized)
-              : this.readSessionSync(normalized.sessionID);
-          const previousParentSessionID = session.parentSessionID;
-          const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
-            session,
-            normalized,
-          );
-          let next = this.applyEvent(session, normalized);
-          next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
-          next.eventCount += 1;
-          next = this.prepareSessionForPersistence(next);
-
-          await this.persistCapturedSession(next, normalized, shouldRecord);
-
-          if (this.shouldRefreshLineageForEvent(normalized.type)) {
-            this.refreshAllLineageSync();
-            const refreshed = this.readSessionHeaderSync(normalized.sessionID);
-            if (refreshed) {
-              next = {
-                ...next,
-                parentSessionID: refreshed.parentSessionID,
-                rootSessionID: refreshed.rootSessionID,
-                lineageDepth: refreshed.lineageDepth,
-              };
+            if (!normalized.sessionID || !shouldPersistSession) {
+              if (shouldRecord) this.writeEvent(normalized);
+              return;
             }
-          }
 
-          if (shouldSyncDerivedState) {
-            this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
-          }
+            const session = shouldUseLightweightPartCapture(normalized)
+              ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
+              : resolveCaptureHydrationMode() === 'targeted'
+                ? this.readSessionForCaptureSync(normalized)
+                : this.readSessionSync(normalized.sessionID);
+            const previousParentSessionID = session.parentSessionID;
+            const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
+              session,
+              normalized,
+            );
+            let next = this.applyEvent(session, normalized);
+            next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
+            next.eventCount += 1;
+            next = this.prepareSessionForPersistence(next);
 
-          if (
-            this.shouldSyncDerivedLineageSubtree(
-              normalized.type,
-              previousParentSessionID,
-              next.parentSessionID,
-            )
-          ) {
-            this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
-          }
+            await this.persistCapturedSession(next, normalized, shouldRecord);
 
-          if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
-            this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
-          }
-        });
-      }),
+            if (this.shouldRefreshLineageForEvent(normalized.type)) {
+              this.refreshAllLineageSync();
+              const refreshed = this.readSessionHeaderSync(normalized.sessionID);
+              if (refreshed) {
+                next = {
+                  ...next,
+                  parentSessionID: refreshed.parentSessionID,
+                  rootSessionID: refreshed.rootSessionID,
+                  lineageDepth: refreshed.lineageDepth,
+                };
+              }
+            }
+
+            if (shouldSyncDerivedState) {
+              this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
+            }
+
+            if (
+              this.shouldSyncDerivedLineageSubtree(
+                normalized.type,
+                previousParentSessionID,
+                next.parentSessionID,
+              )
+            ) {
+              this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
+            }
+
+            if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
+              this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
+            }
+          }),
+        ),
+      ),
     );
   }
 

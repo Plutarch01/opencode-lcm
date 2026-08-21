@@ -1,6 +1,6 @@
 import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
-
 import type { LcmStore } from './lcm-store.js';
+import { getLogger } from './logging.js';
 import { NodeSidecarLcmStore } from './node-sidecar-store.js';
 import { resolveOptions } from './options.js';
 import { SqliteLcmStore } from './store.js';
@@ -93,6 +93,21 @@ function createStore(
   return new SqliteLcmStore(directory, options);
 }
 
+async function runOptionalPluginWork<T>(
+  operation: string,
+  work: () => Promise<T>,
+): Promise<T | undefined> {
+  try {
+    return await work();
+  } catch (error) {
+    getLogger().warn('Optional LCM hook failed; continuing without archived context', {
+      operation,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
 export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   const options = resolveOptions(rawOptions);
   const bunWindowsSafety = resolveBunWindowsSafety(options);
@@ -114,7 +129,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
 
   return {
     event: async ({ event }) => {
-      await store.captureDeferred(event);
+      await runOptionalPluginWork('event.capture', () => store.captureDeferred(event));
     },
 
     tool: {
@@ -461,7 +476,9 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
     },
 
     'experimental.chat.messages.transform': async (_input, output) => {
-      await store.transformMessages(output.messages);
+      await runOptionalPluginWork('chat.messages.transform', () =>
+        store.transformMessages(output.messages),
+      );
     },
 
     'experimental.chat.system.transform': async (_input, output) => {
@@ -471,7 +488,9 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
     },
 
     'experimental.session.compacting': async (input, output) => {
-      const note = await store.buildCompactionContext(input.sessionID);
+      const note = await runOptionalPluginWork('session.compacting', () =>
+        store.buildCompactionContext(input.sessionID),
+      );
       if (!note) return;
       if (output.context.some((entry) => entry.includes('LCM prototype resume note'))) return;
       output.context.push(note);

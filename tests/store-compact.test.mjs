@@ -130,6 +130,92 @@ test('corrupted database is quarantined and a clean database is started', async 
     await cleanupWorkspace(workspace);
   }
 });
+test('live capture corruption is quarantined and retried once', async () => {
+  const workspace = makeWorkspace('lcm-live-corrupt-recover');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions());
+    await store.init();
+    await store.stats();
+
+    const original = store.upsertSessionRowSync.bind(store);
+    let injected = false;
+    store.upsertSessionRowSync = (...args) => {
+      if (!injected) {
+        injected = true;
+        throw Object.assign(new Error('database disk image is malformed'), {
+          code: 'SQLITE_CORRUPT',
+        });
+      }
+      return original(...args);
+    };
+
+    await store.captureDeferred({
+      type: 'session.created',
+      properties: { sessionID: 's-live-1', info: sessionInfo(workspace, 's-live-1', 1) },
+    });
+
+    const dbDir = path.join(workspace, '.lcm');
+    const quarantined = readdirSync(dbDir).filter((name) => name.startsWith('lcm.db.corrupted-'));
+    assert.equal(quarantined.length, 1, 'exactly one quarantine directory should exist');
+
+    const stats = await store.stats();
+    assert.ok(stats.recovery, 'stats should report a recovery after live corruption');
+    assert.ok(stats.recovery.quarantinedFiles.length > 0, 'recovery should name quarantined files');
+    assert.ok(
+      stats.recovery.quarantinedFiles.some((file) => file.includes('lcm.db.corrupted-')),
+      'quarantined files should include the corruption directory',
+    );
+
+    const db = openRawDb(workspace);
+    const sessionRow = db
+      .prepare('SELECT session_id FROM sessions WHERE session_id = ?')
+      .get('s-live-1');
+    const eventRow = db
+      .prepare("SELECT COUNT(*) AS count FROM events WHERE session_id = 's-live-1'")
+      .get();
+    db.close();
+    assert.ok(sessionRow, 'triggering session should be persisted on the replacement DB');
+    assert.equal(eventRow.count, 1, 'triggering event should be persisted on the replacement DB');
+
+    await store.captureDeferred({
+      type: 'session.created',
+      properties: { sessionID: 's-live-2', info: sessionInfo(workspace, 's-live-2', 2) },
+    });
+
+    const db2 = openRawDb(workspace);
+    const secondRow = db2
+      .prepare('SELECT session_id FROM sessions WHERE session_id = ?')
+      .get('s-live-2');
+    db2.close();
+    assert.ok(secondRow, 'second session should be persisted after recovery');
+
+    store.upsertSessionRowSync = () => {
+      throw Object.assign(new Error('database disk image is malformed again'), {
+        code: 'SQLITE_CORRUPT',
+      });
+    };
+    await assert.rejects(
+      store.capture({
+        type: 'session.created',
+        properties: { sessionID: 's-live-3', info: sessionInfo(workspace, 's-live-3', 3) },
+      }),
+      /database disk image is malformed again/,
+    );
+    const quarantinedAfterSecondFailure = readdirSync(dbDir).filter((name) =>
+      name.startsWith('lcm.db.corrupted-'),
+    );
+    assert.equal(
+      quarantinedAfterSecondFailure.length,
+      1,
+      'a store lifetime should quarantine at most once',
+    );
+  } finally {
+    await store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
 
 test('compact reports storage metrics and reclaims space on apply', async () => {
   const workspace = makeWorkspace('lcm-compact');

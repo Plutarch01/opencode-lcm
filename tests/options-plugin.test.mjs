@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import OpencodeLcmPlugin from '../dist/index.js';
+import { getLogger, setLogger } from '../dist/logging.js';
 import { DEFAULT_OPTIONS, resolveOptions } from '../dist/options.js';
 
 import {
@@ -455,5 +456,114 @@ test('plugin system and message transform hooks respect options', async () => {
   } finally {
     // Plugin hooks keep their SQLite store open for the life of the plugin instance.
     // Let the temp workspace be reclaimed by the OS after process exit.
+  }
+});
+test('prompt hooks fail open when the store cannot open', async () => {
+  const workspace = makeWorkspace('lcm-plugin-fail-open');
+  const previousRuntime = process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+  const previousLogger = getLogger();
+  const warnings = [];
+  const recordingLogger = {
+    debug() {},
+    info() {},
+    warn(message, context) {
+      warnings.push({ message, context });
+    },
+    error() {},
+  };
+
+  try {
+    process.env.OPENCODE_LCM_SQLITE_RUNTIME = 'bun';
+    setLogger(recordingLogger);
+
+    const hooks = await OpencodeLcmPlugin(makePluginContext(workspace), makeOptions());
+
+    await assert.doesNotReject(
+      hooks.event({
+        event: {
+          type: 'session.created',
+          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+        },
+      }),
+    );
+
+    const output = {
+      messages: [
+        conversationMessage({
+          sessionID: 's1',
+          messageID: 'm1',
+          created: 1,
+          parts: [textPart('s1', 'm1', 'm1-p1', 'alpha message one')],
+        }),
+        conversationMessage({
+          sessionID: 's1',
+          messageID: 'm2',
+          created: 2,
+          parts: [textPart('s1', 'm2', 'm2-p1', 'alpha message two')],
+        }),
+        conversationMessage({
+          sessionID: 's1',
+          messageID: 'm3',
+          created: 3,
+          parts: [textPart('s1', 'm3', 'm3-p1', 'alpha message three')],
+        }),
+        conversationMessage({
+          sessionID: 's1',
+          messageID: 'm4',
+          created: 4,
+          parts: [textPart('s1', 'm4', 'm4-p1', 'alpha message four')],
+        }),
+        conversationMessage({
+          sessionID: 's1',
+          messageID: 'm5',
+          created: 5,
+          parts: [textPart('s1', 'm5', 'm5-p1', 'alpha message five')],
+        }),
+      ],
+    };
+    const beforeMessages = structuredClone(output.messages);
+
+    await assert.doesNotReject(hooks['experimental.chat.messages.transform']({}, output));
+    assert.deepEqual(
+      output.messages,
+      beforeMessages,
+      'transform should leave messages unchanged on failure',
+    );
+
+    const compactOutput = { context: ['existing context'] };
+    const beforeContext = [...compactOutput.context];
+    await assert.doesNotReject(
+      hooks['experimental.session.compacting']({ sessionID: 's1' }, compactOutput),
+    );
+    assert.deepEqual(
+      compactOutput.context,
+      beforeContext,
+      'compacting context should remain unchanged on failure',
+    );
+
+    await assert.rejects(
+      hooks.tool.lcm_status.execute({}, makeToolContext(workspace, 's1')),
+      'user-invoked tools should continue to surface store failures',
+    );
+
+    assert.equal(warnings.length, 3, 'exactly three warnings should be recorded');
+    const operations = warnings.map((entry) => entry.context?.operation).sort();
+    assert.deepEqual(operations, [
+      'chat.messages.transform',
+      'event.capture',
+      'session.compacting',
+    ]);
+    for (const entry of warnings) {
+      assert.equal(entry.message, 'Optional LCM hook failed; continuing without archived context');
+      assert.ok(typeof entry.context?.operation === 'string');
+      assert.ok(typeof entry.context?.message === 'string');
+    }
+  } finally {
+    if (previousRuntime === undefined) {
+      delete process.env.OPENCODE_LCM_SQLITE_RUNTIME;
+    } else {
+      process.env.OPENCODE_LCM_SQLITE_RUNTIME = previousRuntime;
+    }
+    setLogger(previousLogger);
   }
 });
