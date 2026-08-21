@@ -97,10 +97,29 @@ test('filterTokensByTfidf drops corpus-common terms using actual document freque
   db.prepare(
     'INSERT INTO message_fts (session_id, message_id, role, created_at, content) VALUES (?, ?, ?, ?, ?)',
   ).run('s1', 'm3', 'user', '3', 'common context');
+  for (let index = 4; index <= 50; index += 1) {
+    db.prepare(
+      'INSERT INTO message_fts (session_id, message_id, role, created_at, content) VALUES (?, ?, ?, ?, ?)',
+    ).run('s1', `m${index}`, 'user', String(index), `common filler${index}`);
+  }
 
   const filtered = filterTokensByTfidf(db, ['common', 'unique'], { minTokens: 1 });
 
   assert.deepEqual(filtered, ['unique']);
+});
+
+test('filterTokensByTfidf preserves candidate order for small corpora', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(
+    `CREATE VIRTUAL TABLE message_fts USING fts5(session_id UNINDEXED, message_id UNINDEXED, role UNINDEXED, created_at UNINDEXED, content);
+     CREATE VIRTUAL TABLE summary_fts USING fts5(session_id UNINDEXED, node_id UNINDEXED, level UNINDEXED, created_at UNINDEXED, content);
+     CREATE VIRTUAL TABLE artifact_fts USING fts5(session_id UNINDEXED, artifact_id UNINDEXED, message_id UNINDEXED, part_id UNINDEXED, artifact_kind UNINDEXED, created_at UNINDEXED, content);`,
+  );
+  db.prepare(
+    'INSERT INTO message_fts (session_id, message_id, role, created_at, content) VALUES (?, ?, ?, ?, ?)',
+  ).run('s1', 'm1', 'user', '1', 'common unique');
+
+  assert.deepEqual(filterTokensByTfidf(db, ['common', 'unique']), ['common', 'unique']);
 });
 
 test('refreshSearchIndexesSync replaces only the requested session rows', () => {

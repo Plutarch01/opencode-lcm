@@ -13,6 +13,7 @@ export type DoctorReport = {
   checkedSessions: number;
   summarySessionsNeedingRebuild: DoctorSessionIssue[];
   lineageSessionsNeedingRefresh: string[];
+  resumeSessionsNeedingRefresh: string[];
   orphanSummaryEdges: number;
   messageFts: DoctorCountCheck;
   summaryFts: DoctorCountCheck;
@@ -37,6 +38,7 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
   const issueCount =
     report.summarySessionsNeedingRebuild.length +
     report.lineageSessionsNeedingRefresh.length +
+    report.resumeSessionsNeedingRefresh.length +
     report.orphanSummaryEdges +
     Math.abs(report.messageFts.expected - report.messageFts.actual) +
     Math.abs(report.summaryFts.expected - report.summaryFts.actual) +
@@ -51,6 +53,7 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
     `checked_sessions=${report.checkedSessions}`,
     `summary_sessions_needing_rebuild=${report.summarySessionsNeedingRebuild.length}`,
     `lineage_sessions_needing_refresh=${report.lineageSessionsNeedingRefresh.length}`,
+    `resume_sessions_needing_refresh=${report.resumeSessionsNeedingRefresh.length}`,
     `orphan_summary_edges=${report.orphanSummaryEdges}`,
     ...formatCountCheck('message_fts', report.messageFts),
     ...formatCountCheck('summary_fts', report.summaryFts),
@@ -86,6 +89,13 @@ export function formatDoctorReport(report: DoctorReport, limit: number): string 
     lines.push(
       'lineage_session_preview:',
       ...report.lineageSessionsNeedingRefresh.slice(0, limit).map((sessionID) => `- ${sessionID}`),
+    );
+  }
+
+  if (report.resumeSessionsNeedingRefresh.length > 0) {
+    lines.push(
+      'resume_session_preview:',
+      ...report.resumeSessionsNeedingRefresh.slice(0, limit).map((sessionID) => `- ${sessionID}`),
     );
   }
 

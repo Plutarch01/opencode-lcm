@@ -1,8 +1,6 @@
 import type { Message, Part } from '@opencode-ai/sdk';
 
 export type InteropOptions = {
-  contextMode: boolean;
-  neverOverrideCompactionPrompt: boolean;
   ignoreToolPrefixes: string[];
 };
 
@@ -55,7 +53,7 @@ export type AutomaticRetrievalOptions = {
   stop: AutomaticRetrievalStopOptions;
 };
 
-export type SummaryStrategyName = 'deterministic-v1' | 'deterministic-v2';
+export type SummaryStrategyName = 'deterministic-v1' | 'deterministic-v2' | 'deterministic-v3';
 
 export type SummaryV2Options = {
   strategy: SummaryStrategyName;
@@ -104,6 +102,7 @@ export type SearchResult = {
   sessionID?: string;
   timestamp: number;
   snippet: string;
+  nodeID?: string;
 };
 
 export type StoreStats = {

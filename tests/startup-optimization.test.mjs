@@ -75,7 +75,7 @@ test('capture skips ignored events without opening SQLite', async () => {
   }
 });
 
-test('capture completes pending maintenance before the first write', async () => {
+test('capture leaves pending maintenance off the first write path', async () => {
   const workspace = makeWorkspace('lcm-startup-deferred-init');
   let store;
 
@@ -92,10 +92,13 @@ test('capture completes pending maintenance before the first write', async () =>
 
     await createSession(store, workspace, 's1', 1);
 
+    assert.equal(deferredRuns, 0);
+    assert.equal(store.deferredInitCompleted, false);
+    await store.whenIdle();
     assert.equal(deferredRuns, 1);
     assert.equal(store.deferredInitCompleted, true);
   } finally {
-    store?.close();
+    await store?.close();
     await cleanupWorkspace(workspace);
   }
 });

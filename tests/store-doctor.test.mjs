@@ -74,6 +74,9 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
     driftDb.exec(
       "INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at, orphaned_at) VALUES ('orphan-doctor-blob', 'orphaned artifact payload', 23, 7, 7)",
     );
+    driftDb.exec(
+      "UPDATE resumes SET note = 'LCM prototype resume note\nSummary roots:\n- sum_deadbeefcafe_l9_p9: stale' WHERE session_id = 's1'",
+    );
     driftDb.close();
 
     const dryRun = await store.doctor({ sessionID: 's1' });
@@ -83,6 +86,7 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
     assert.match(dryRun, /message_fts_delta=1/);
     assert.match(dryRun, /summary_fts_delta=-1/);
     assert.match(dryRun, /orphan_artifact_blobs=1/);
+    assert.match(dryRun, /resume_sessions_needing_refresh=1/);
 
     const repaired = await store.doctor({ sessionID: 's1', apply: true });
     const clean = await store.doctor({ sessionID: 's1' });
@@ -90,6 +94,7 @@ test('doctor reports and repairs summary drift, FTS drift, and orphan blobs', as
 
     assert.match(repaired, /status=repaired/);
     assert.match(repaired, /applied_actions:/);
+    assert.match(repaired, /refreshed 1 managed resume note/);
     assert.match(clean, /status=clean/);
     assert.match(clean, /issues=0/);
     assert.equal(grep[0]?.id, 'm1');

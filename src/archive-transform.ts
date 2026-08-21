@@ -140,7 +140,7 @@ export function buildActiveSummaryText(
 ): string {
   const lines = [
     `[Archived by opencode-lcm: compacted ${archivedCount} older conversation ${pluralize(archivedCount, 'turn')} into ${roots.length} archived summary ${pluralize(roots.length, 'node')}.]`,
-    `Summary roots: ${roots.map((node) => `${node.nodeID}: ${truncate(node.summaryText, 140)}`).join(' | ')}`,
+    `Summary roots: ${roots.map((node) => `${node.nodeID}: ${truncate(node.summaryText, 200)}`).join(' | ')}`,
   ];
 
   return truncate(lines.join('\n'), maxChars);

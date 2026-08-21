@@ -158,6 +158,12 @@ test('search prefers direct message hits, indexes artifact metadata, and falls b
       result.type.startsWith('artifact:file'),
     );
     const fallback = await store.grep({ query: '=>', sessionID: 's1', limit: 3 });
+    const noScan = await store.grep({
+      query: '=>',
+      sessionID: 's1',
+      limit: 3,
+      allowScan: false,
+    });
 
     assert.equal(ranked[0].type, 'user');
     assert.ok(ranked.some((result) => result.type === 'summary'));
@@ -170,6 +176,7 @@ test('search prefers direct message hits, indexes artifact metadata, and falls b
     assert.match(attachmentArtifact, /Kind: file/);
     assert.match(attachmentArtifact, /evidence.bin/);
     assert.equal(fallback[0].id, 'm5');
+    assert.deepEqual(noScan, []);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
@@ -255,6 +262,102 @@ test('privacy controls redact archived text and exclude configured tool and path
     assert.equal(stats.artifactCount, 1);
   } finally {
     store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('text artifacts include deterministic JSON and CSV exploration summaries', async () => {
+  const workspace = makeWorkspace('lcm-artifact-exploration');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({ largeContentThreshold: 20, artifactViewChars: 800 }),
+    );
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+
+    const jsonText = JSON.stringify({ alpha: 1, beta: { x: 2 }, gamma: [1, 2, 3] });
+    const csvText = 'customer_id,invoice_total,status\n1,42,open\n2,18,paid\n';
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'json-message',
+      created: 2,
+      parts: [
+        filePart(
+          's1',
+          'json-message',
+          'json-file',
+          `${workspace}/records.json`,
+          jsonText,
+          'application/json',
+        ),
+      ],
+    });
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'csv-message',
+      created: 3,
+      parts: [
+        filePart('s1', 'csv-message', 'csv-file', `${workspace}/invoices.csv`, csvText, 'text/csv'),
+      ],
+    });
+
+    const jsonArtifact = store
+      .readArtifactsForMessageSync('json-message')
+      .find((artifact) => artifact.fieldName === 'source');
+    const csvArtifact = store
+      .readArtifactsForMessageSync('csv-message')
+      .find((artifact) => artifact.fieldName === 'source');
+
+    assert.match(jsonArtifact.metadata.exploration, /keys: alpha, beta, gamma/);
+    assert.match(csvArtifact.metadata.exploration, /customer_id, invoice_total, status/);
+    assert.match(jsonArtifact.previewText, /JSON object/);
+    assert.match(csvArtifact.previewText, /CSV rows=2/);
+  } finally {
+    await store?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('artifact FTS indexes only the bounded content prefix', async () => {
+  const workspace = makeWorkspace('lcm-artifact-fts-cap');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(workspace, makeOptions({ largeContentThreshold: 20 }));
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+    await captureMessage(store, {
+      sessionID: 's1',
+      messageID: 'm1',
+      created: 2,
+      parts: [
+        textPart(
+          's1',
+          'm1',
+          'm1-text',
+          `frontuniquetoken ${'padding '.repeat(2_500)} tailuniquetoken`,
+        ),
+      ],
+    });
+
+    const front = await store.grep({
+      query: 'frontuniquetoken',
+      sessionID: 's1',
+      allowScan: false,
+    });
+    const tail = await store.grep({
+      query: 'tailuniquetoken',
+      sessionID: 's1',
+      allowScan: false,
+    });
+
+    assert.ok(Array.isArray(front) && front.some((result) => result.type.startsWith('artifact:')));
+    assert.deepEqual(tail, []);
+  } finally {
+    await store?.close();
     await cleanupWorkspace(workspace);
   }
 });

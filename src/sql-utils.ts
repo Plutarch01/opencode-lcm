@@ -66,7 +66,7 @@ export function safeQueryOne<T extends Record<string, unknown>>(
  * Automatically rolls back on failure.
  */
 export function withTransaction(db: SqlDatabaseLike, operation: string, fn: () => void): void {
-  db.exec('BEGIN');
+  db.exec('BEGIN IMMEDIATE');
   try {
     fn();
     db.exec('COMMIT');

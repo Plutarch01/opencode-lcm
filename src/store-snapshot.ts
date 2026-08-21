@@ -4,6 +4,7 @@ import path from 'node:path';
 import { withTransaction } from './sql-utils.js';
 import type { SqlDatabaseLike } from './store-types.js';
 import type { SummaryStrategyName } from './types.js';
+import { parseJson } from './utils.js';
 import { resolveWorkspacePath } from './workspace-path.js';
 import { normalizeWorktreeKey } from './worktree-key.js';
 
@@ -32,6 +33,7 @@ export type MessageRow = {
   session_id: string;
   created_at: number;
   info_json: string;
+  deleted_at: number | null;
 };
 
 export type PartRow = {
@@ -194,8 +196,15 @@ export async function importStoreSnapshot(
   const sourcePath = path.isAbsolute(input.filePath)
     ? path.normalize(input.filePath)
     : resolveWorkspacePath(bindings.workspaceDirectory, input.filePath);
-  const snapshot = parseSnapshotPayload(await readFile(sourcePath, 'utf8'));
+  let snapshot: SnapshotPayload;
+  try {
+    snapshot = parseSnapshotPayload(await readFile(sourcePath, 'utf8'));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid snapshot "${sourcePath}": ${message}`);
+  }
   const db = bindings.getDb();
+  validateSnapshotReferentialClosure(snapshot, db);
   const sessionIDs = [...new Set(snapshot.sessions.map((row) => row.session_id))];
   const worktreeMode = resolveSnapshotWorktreeMode(input.worktreeMode);
   const collisionSessionIDs = input.mode === 'merge' ? readExistingSessionIDs(db, sessionIDs) : [];
@@ -241,7 +250,7 @@ export async function importStoreSnapshot(
          event_count = excluded.event_count`,
     );
     const insertMessage = db.prepare(
-      `INSERT OR REPLACE INTO messages (message_id, session_id, created_at, info_json) VALUES (?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO messages (message_id, session_id, created_at, info_json, deleted_at) VALUES (?, ?, ?, ?, ?)`,
     );
     const insertPart = db.prepare(
       `INSERT OR REPLACE INTO parts (part_id, session_id, message_id, sort_key, part_json) VALUES (?, ?, ?, ?, ?)`,
@@ -250,7 +259,7 @@ export async function importStoreSnapshot(
       `INSERT OR REPLACE INTO resumes (session_id, note, updated_at) VALUES (?, ?, ?)`,
     );
     const insertBlob = db.prepare(
-      `INSERT OR REPLACE INTO artifact_blobs (content_hash, content_text, char_count, created_at, orphaned_at) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO artifact_blobs (content_hash, content_text, char_count, created_at, orphaned_at) VALUES (?, ?, ?, ?, ?)`,
     );
     const insertArtifact = db.prepare(
       `INSERT OR REPLACE INTO artifacts (artifact_id, session_id, message_id, part_id, artifact_kind, field_name, preview_text, content_text, content_hash, metadata_json, char_count, created_at)
@@ -285,8 +294,15 @@ export async function importStoreSnapshot(
         row.event_count,
       );
     }
-    for (const row of snapshot.messages)
-      insertMessage.run(row.message_id, row.session_id, row.created_at, row.info_json);
+    for (const row of snapshot.messages) {
+      insertMessage.run(
+        row.message_id,
+        row.session_id,
+        row.created_at,
+        row.info_json,
+        row.deleted_at,
+      );
+    }
     for (const row of snapshot.parts)
       insertPart.run(row.part_id, row.session_id, row.message_id, row.sort_key, row.part_json);
     for (const row of snapshot.resumes) insertResume.run(row.session_id, row.note, row.updated_at);
@@ -362,8 +378,53 @@ export async function importStoreSnapshot(
   ].join('\n');
 }
 
+function validateSnapshotReferentialClosure(snapshot: SnapshotPayload, db: SqlDatabaseLike): void {
+  const sessionIDs = new Set(snapshot.sessions.map((row) => row.session_id));
+  for (const message of snapshot.messages) {
+    if (!sessionIDs.has(message.session_id)) {
+      throw new Error(
+        `Snapshot message "${message.message_id}" references unknown session "${message.session_id}".`,
+      );
+    }
+  }
+
+  const messageIDs = new Set(snapshot.messages.map((row) => row.message_id));
+  for (const part of snapshot.parts) {
+    if (!messageIDs.has(part.message_id)) {
+      throw new Error(
+        `Snapshot part "${part.part_id}" references unknown message "${part.message_id}".`,
+      );
+    }
+  }
+
+  const payloadBlobHashes = new Set(snapshot.artifact_blobs.map((row) => row.content_hash));
+  const existingBlob = db.prepare('SELECT 1 AS present FROM artifact_blobs WHERE content_hash = ?');
+  for (const artifact of snapshot.artifacts) {
+    const contentHash = artifact.content_hash;
+    if (!contentHash || payloadBlobHashes.has(contentHash)) continue;
+    if (existingBlob.get(contentHash)) continue;
+    throw new Error(
+      `Snapshot artifact "${artifact.artifact_id}" references unknown content hash "${contentHash}".`,
+    );
+  }
+
+  const nodeIDs = new Set(snapshot.summary_nodes.map((row) => row.node_id));
+  for (const edge of snapshot.summary_edges) {
+    if (!nodeIDs.has(edge.parent_id)) {
+      throw new Error(
+        `Snapshot summary edge "${edge.parent_id}->${edge.child_id}" references unknown node "${edge.parent_id}".`,
+      );
+    }
+    if (!nodeIDs.has(edge.child_id)) {
+      throw new Error(
+        `Snapshot summary edge "${edge.parent_id}->${edge.child_id}" references unknown node "${edge.child_id}".`,
+      );
+    }
+  }
+}
+
 function parseSnapshotPayload(content: string): SnapshotPayload {
-  const value = JSON.parse(content) as unknown;
+  const value = parseJson<unknown>(content);
   const record = expectRecord(value, 'Snapshot file');
   const version = record.version;
   if (version !== 1) {
@@ -412,6 +473,10 @@ function parseMessageRow(value: unknown): MessageRow {
     session_id: expectString(row.session_id, 'messages[].session_id'),
     created_at: expectNumber(row.created_at, 'messages[].created_at'),
     info_json: expectString(row.info_json, 'messages[].info_json'),
+    deleted_at:
+      row.deleted_at === undefined
+        ? null
+        : expectNullableNumber(row.deleted_at, 'messages[].deleted_at'),
   };
 }
 

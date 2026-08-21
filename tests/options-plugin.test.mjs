@@ -99,7 +99,7 @@ test('resolveOptions normalizes malformed plugin config', () => {
     },
   });
 
-  assert.equal(resolved.interop.contextMode, false);
+  assert.equal('contextMode' in resolved.interop, false);
   assert.deepEqual(resolved.interop.ignoreToolPrefixes, ['custom_']);
   assert.deepEqual(resolved.scopeDefaults, { grep: 'session', describe: 'all' });
   assert.deepEqual(resolved.scopeProfiles, [
@@ -360,8 +360,15 @@ test('plugin exposes tools, records events, and appends compaction context once'
     const toolContext = makeToolContext(workspace, 's1');
     const status = await hooks.tool.lcm_status.execute({}, toolContext);
     const retrieval = await hooks.tool.lcm_retrieval_debug.execute({}, toolContext);
-    const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
+    const describe = await hooks.tool.lcm_describe.execute({}, toolContext);
     const doctor = await hooks.tool.lcm_doctor.execute({ sessionID: 's1' }, toolContext);
+    const grep = await hooks.tool.lcm_grep.execute({ query: 'plugin hook body' }, toolContext);
+    const importWithoutMode = await hooks.tool.lcm_import_snapshot.execute(
+      { filePath: 'unused.json' },
+      toolContext,
+    );
+    await hooks['experimental.chat.messages.transform']({}, { messages: null });
+    const failureStatus = await hooks.tool.lcm_status.execute({}, toolContext);
 
     assert.match(status, /schema_version=2/);
     assert.match(status, /session_count=1/);
@@ -372,9 +379,13 @@ test('plugin exposes tools, records events, and appends compaction context once'
     assert.match(status, /automatic_retrieval_scope_budgets=session:16,root:12,worktree:8,all:6/);
     assert.match(status, /automatic_retrieval_stop_target_hits=3/);
     assert.match(status, /automatic_retrieval_stop_on_first_scope_with_hits=false/);
+    assert.match(status, /recent_hook_failures=\d+/);
     assert.match(retrieval, /status=no-debug-data/);
     assert.match(describe, /Session: s1/);
     assert.match(describe, /plugin hook body/);
+    assert.match(grep, /session=s1 node=/);
+    assert.match(importWithoutMode, /mode is required.*merge.*replace/);
+    assert.match(failureStatus, /op=chat\.messages\.transform/);
     assert.match(doctor, /checked_scope=session:s1/);
 
     const firstCompaction = { context: [], prompt: 'keep-default' };

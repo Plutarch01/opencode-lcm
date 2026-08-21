@@ -7,6 +7,9 @@ export type GrepInput = {
   sessionID?: string;
   scope?: string;
   limit?: number;
+  offset?: number;
+  summaryID?: string;
+  allowScan?: boolean;
 };
 
 export type DescribeInput = {
@@ -85,7 +88,7 @@ export type LcmStore = {
   stats(): Promise<StoreStats>;
   automaticRetrievalDebug(sessionID?: string): Promise<string>;
   resume(sessionID?: string): Promise<string>;
-  grep(input: GrepInput): Promise<SearchResult[]>;
+  grep(input: GrepInput): Promise<SearchResult[] | string>;
   describe(input?: DescribeInput): Promise<string>;
   lineage(sessionID?: string): Promise<string>;
   pinSession(input: PinSessionInput): Promise<string>;

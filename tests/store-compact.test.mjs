@@ -421,6 +421,55 @@ test('sidecar close rejects pending requests', async () => {
   }
 });
 
+test('sidecar coalesces part updates and drains the latest value on close', async () => {
+  const workspace = makeWorkspace('lcm-sidecar-part-coalesce');
+  const store = new NodeSidecarLcmStore(workspace, makeOptions());
+
+  try {
+    await store.init();
+    await store.captureDeferred({
+      type: 'session.created',
+      properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
+    });
+    await store.captureDeferred({
+      type: 'message.updated',
+      properties: { sessionID: 's1', info: userInfo('s1', 'm1', 2) },
+    });
+    for (const [time, text] of [
+      [3, 'first streamed value'],
+      [4, 'second streamed value'],
+      [5, 'latest streamed value'],
+    ]) {
+      await store.captureDeferred({
+        type: 'message.part.updated',
+        properties: {
+          sessionID: 's1',
+          time,
+          part: {
+            id: 'm1-p',
+            sessionID: 's1',
+            messageID: 'm1',
+            type: 'text',
+            text,
+          },
+        },
+      });
+    }
+
+    await store.close();
+    const db = openRawDb(workspace);
+    const part = db.prepare("SELECT part_json FROM parts WHERE part_id = 'm1-p'").get();
+    const session = db.prepare("SELECT event_count FROM sessions WHERE session_id = 's1'").get();
+    db.close();
+
+    assert.equal(JSON.parse(part.part_json).text, 'latest streamed value');
+    assert.equal(session.event_count, 3);
+  } finally {
+    await store.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
 test('capture commits its event and session state atomically', async () => {
   const workspace = makeWorkspace('lcm-capture-atomic');
   let store;

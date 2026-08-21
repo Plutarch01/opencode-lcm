@@ -37,6 +37,7 @@ function initSchema(db) {
       message_id TEXT NOT NULL,
       role TEXT NOT NULL,
       created_at REAL NOT NULL,
+      deleted_at REAL,
       PRIMARY KEY (session_id, message_id)
     );
     CREATE TABLE parts (
@@ -209,11 +210,15 @@ test('readMessagesForSession returns messages ordered by created_at', () => {
   db.prepare(
     'INSERT INTO messages (session_id, message_id, role, created_at) VALUES (?, ?, ?, ?)',
   ).run('s1', 'm1', 'user', now);
+  db.prepare(
+    'INSERT INTO messages (session_id, message_id, role, created_at, deleted_at) VALUES (?, ?, ?, ?, ?)',
+  ).run('s1', 'removed', 'user', now - 10, now);
 
   const messages = readMessagesForSession(db, 's1');
   assert.equal(messages.length, 2);
   assert.equal(messages[0].message_id, 'm1');
   assert.equal(messages[1].message_id, 'm2');
+  assert.ok(messages.every((message) => message.message_id !== 'removed'));
   db.close();
 });
 

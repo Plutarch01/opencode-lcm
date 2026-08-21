@@ -15,9 +15,12 @@ import {
   AUTOMATIC_RETRIEVAL_QUERY_TOKENS,
   AUTOMATIC_RETRIEVAL_QUERY_VARIANTS,
   AUTOMATIC_RETRIEVAL_RECENT_MESSAGES,
+  AUTOMATIC_RETRIEVAL_WEIGHTED_TOKENS,
+  DEFERRED_PART_UPDATE_DELAY_MS,
   EXPAND_MESSAGE_LIMIT,
   STORE_SCHEMA_VERSION,
   SUMMARY_BRANCH_FACTOR,
+  SUMMARY_INTERNAL_CHAR_LIMIT,
   SUMMARY_LEAF_MESSAGES,
   SUMMARY_NODE_CHAR_LIMIT,
 } from './constants.js';
@@ -109,6 +112,17 @@ type SummaryNodeData = {
   createdAt: number;
 };
 
+type SummaryDigest = {
+  goals: string[];
+  lastAssistant: string;
+  files: string[];
+  tools: string[];
+  messageCount: number;
+  userCount: number;
+  assistantCount: number;
+  errFlag: boolean;
+};
+
 export type SessionReadRow = {
   session_id: string;
   title: string | null;
@@ -129,6 +143,7 @@ export type MessageReadRow = {
   session_id: string;
   message_id: string;
   role: string;
+  deleted_at: number | null;
   created_at: number;
 };
 
@@ -221,7 +236,9 @@ function readLineageChain(db: SqlDatabaseLike, sessionID: string): SessionReadRo
 
 function readMessagesForSession(db: SqlDatabaseLike, sessionID: string): MessageReadRow[] {
   return db
-    .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC')
+    .prepare(
+      'SELECT * FROM messages WHERE session_id = ? AND deleted_at IS NULL ORDER BY created_at ASC',
+    )
     .all(sessionID) as MessageReadRow[];
 }
 
@@ -483,7 +500,7 @@ function normalizeEvent(event: unknown): CapturedEvent | null {
   };
 }
 
-function getDeferredPartUpdateKey(event: Event): string | undefined {
+export function getDeferredPartUpdateKey(event: Event): string | undefined {
   if (event.type !== 'message.part.updated') return undefined;
   return `${event.properties.part.sessionID}:${event.properties.part.messageID}:${event.properties.part.id}`;
 }
@@ -696,6 +713,7 @@ type CaptureHydrationOptions = {
   platform?: string | undefined;
 };
 type ReadMessageOptions = {
+  includeDeleted?: boolean;
   hydrateArtifacts?: boolean;
 };
 
@@ -882,7 +900,6 @@ async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
 }
 
 export class SqliteLcmStore {
-  private static readonly deferredPartUpdateDelayMs = 250;
   private baseDir: string;
   private dbPath: string;
   private readonly privacy: CompiledPrivacyOptions;
@@ -896,6 +913,7 @@ export class SqliteLcmStore {
   private operationDrainWaiters: Array<() => void> = [];
   private readonly pendingPartUpdates = new Map<string, Event>();
   private readonly lastAutomaticRetrievalBySession = new Map<string, AutomaticRetrievalDebugInfo>();
+  private readonly tfidfDocFreqCache = new Map<string, { docFreq: number; at: number }>();
   private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
   private pendingPartUpdateFlushPromise?: Promise<void>;
   private usingFallbackBaseDir = false;
@@ -1045,14 +1063,8 @@ export class SqliteLcmStore {
     }
   }
 
-  private async waitForDeferredInitIfRunning(): Promise<void> {
-    if (!this.deferredInitPromise) return;
-    await this.deferredInitPromise;
-  }
-
   private async prepareForRead(): Promise<void> {
     await this.ensureDbReady();
-    await this.waitForDeferredInitIfRunning();
     await this.flushDeferredPartUpdates();
   }
 
@@ -1066,7 +1078,7 @@ export class SqliteLcmStore {
           message: error instanceof Error ? error.message : String(error),
         });
       });
-    }, SqliteLcmStore.deferredPartUpdateDelayMs);
+    }, DEFERRED_PART_UPDATE_DELAY_MS);
     unrefTimer(this.pendingPartUpdateTimer);
   }
 
@@ -1223,6 +1235,13 @@ export class SqliteLcmStore {
       this.assertSupportedSchemaVersionSync();
       db.exec('PRAGMA journal_mode = WAL');
       db.exec('PRAGMA synchronous = NORMAL');
+      try {
+        db.exec('PRAGMA journal_size_limit = 67108864');
+      } catch (error) {
+        getLogger().debug('Unable to set SQLite journal size limit', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
       logStartupPhase('open-db:create-tables');
       db.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -1254,6 +1273,7 @@ export class SqliteLcmStore {
         message_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        deleted_at INTEGER,
         info_json TEXT NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
       );
@@ -1366,6 +1386,7 @@ export class SqliteLcmStore {
         content
       );
     `);
+      this.ensureMessageColumnsSync();
 
       this.ensureSessionColumnsSync();
       this.ensureSummaryStateColumnsSync();
@@ -1521,13 +1542,11 @@ export class SqliteLcmStore {
     if (this.deferredInitCompleted) return Promise.resolve();
     if (this.deferredInitPromise) return this.deferredInitPromise;
 
-    this.deferredInitPromise = this.withStoreActivity(async () => {
-      this.deferredInitRequested = false;
-      logStartupPhase('deferred-init:start');
-      this.completeDeferredInit();
-    })
+    this.deferredInitPromise = this.withStoreActivity(() =>
+      this.withMutation(async () => this.completeDeferredInit()),
+    )
       .catch((error) => {
-        getLogger().warn('Deferred LCM maintenance failed', {
+        getLogger().debug('Deferred LCM maintenance failed', {
           message: error instanceof Error ? error.message : String(error),
         });
       })
@@ -1610,6 +1629,12 @@ export class SqliteLcmStore {
     this.deferredInitCompleted = true;
   }
 
+  async whenIdle(): Promise<void> {
+    await this.ensureDeferredInitComplete();
+    await this.flushDeferredPartUpdates();
+    await this.mutationTail;
+  }
+
   private hasPendingArtifactBlobBackfillSync(): boolean {
     const row = this.getDb()
       .prepare(
@@ -1653,6 +1678,13 @@ export class SqliteLcmStore {
 
     this.pendingPartUpdates.clear();
     this.lastAutomaticRetrievalBySession.clear();
+    try {
+      this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch (error) {
+      getLogger().debug('Unable to checkpoint SQLite WAL during close', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     this.closeDbConnection();
   }
 
@@ -1671,7 +1703,7 @@ export class SqliteLcmStore {
               Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
             if (!shouldRecord && !shouldPersistSession) return;
 
-            await this.ensureDeferredInitComplete();
+            await this.ensureDbReady();
 
             if (!normalized.sessionID || !shouldPersistSession) {
               if (shouldRecord) this.writeEvent(normalized);
@@ -1930,20 +1962,95 @@ export class SqliteLcmStore {
     sessionID?: string;
     scope?: string;
     limit?: number;
-  }): Promise<SearchResult[]> {
+    offset?: number;
+    summaryID?: string;
+    allowScan?: boolean;
+  }): Promise<SearchResult[] | string> {
     return this.withStoreActivity(async () => {
-      const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
-      const limit = input.limit ?? 5;
+      const limit = clamp(input.limit ?? 5, 1, 20);
+      const offset = clamp(input.offset ?? 0, 0, 200);
       const needle = input.query.trim();
       if (!needle) return [];
 
       await this.prepareForRead();
-      const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
+      let sessionIDs: string[] | undefined;
+      let within:
+        | {
+            messageIDs: string[];
+            summaryNodeIDs: string[];
+          }
+        | undefined;
+      if (input.summaryID) {
+        const node = this.readSummaryNodeSync(input.summaryID);
+        if (!node) return 'Unknown summary node.';
+        sessionIDs = [node.sessionID];
+        within = this.collectGrepSummaryScopeSync(node);
+      } else {
+        const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
+        sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
+      }
 
-      const ftsResults = this.searchWithFts(needle, sessionIDs, limit);
-      if (ftsResults.length > 0) return ftsResults;
-      return this.searchByScan(needle.toLowerCase(), sessionIDs, limit);
+      const fetchCount = offset + limit;
+      let results = this.searchWithFts(needle, sessionIDs, fetchCount, within);
+      if (results.length === 0 && input.allowScan !== false) {
+        results = this.searchByScan(needle.toLowerCase(), sessionIDs, fetchCount, within);
+      }
+      return this.annotateCoveringSummaryNodes(results).slice(offset, offset + limit);
     });
+  }
+
+  private collectGrepSummaryScopeSync(node: SummaryNodeData): {
+    messageIDs: string[];
+    summaryNodeIDs: string[];
+  } {
+    const messageIDs = new Set<string>();
+    const summaryNodeIDs = new Set<string>();
+    const pending = [node];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (!current || summaryNodeIDs.has(current.nodeID)) continue;
+      summaryNodeIDs.add(current.nodeID);
+      const children = this.readSummaryChildrenSync(current.nodeID);
+      if (children.length === 0) {
+        for (const messageID of current.messageIDs) messageIDs.add(messageID);
+      } else {
+        pending.push(...children);
+      }
+    }
+    return { messageIDs: [...messageIDs], summaryNodeIDs: [...summaryNodeIDs] };
+  }
+
+  private annotateCoveringSummaryNodes(results: SearchResult[]): SearchResult[] {
+    const messageResults = results.filter(
+      (result) => result.type !== 'summary' && !result.type.startsWith('artifact:'),
+    );
+    const sessions = [...new Set(messageResults.flatMap((result) => result.sessionID ?? []))];
+    const coveringByMessage = new Map<string, string>();
+    for (const sessionID of sessions) {
+      const rows = this.getDb()
+        .prepare(
+          `SELECT node_id, message_ids_json
+           FROM summary_nodes
+           WHERE session_id = ? AND level = 0
+           ORDER BY start_index ASC`,
+        )
+        .all(sessionID) as Array<{ node_id: string; message_ids_json: string }>;
+      for (const row of rows) {
+        for (const messageID of parseJson<string[]>(row.message_ids_json)) {
+          coveringByMessage.set(`${sessionID}:${messageID}`, row.node_id);
+        }
+      }
+    }
+
+    return results.map((result) => ({
+      ...result,
+      nodeID:
+        result.type === 'summary'
+          ? result.id
+          : result.sessionID
+            ? coveringByMessage.get(`${result.sessionID}:${result.id}`)
+            : undefined,
+    }));
   }
 
   async describe(input?: { sessionID?: string; scope?: string }): Promise<string> {
@@ -2062,6 +2169,7 @@ export class SqliteLcmStore {
         const appliedActions: string[] = [];
 
         this.ensureSessionColumnsSync();
+        this.ensureMessageColumnsSync();
         this.ensureSummaryStateColumnsSync();
         this.ensureArtifactColumnsSync();
         appliedActions.push('ensured schema columns');
@@ -2077,6 +2185,17 @@ export class SqliteLcmStore {
           this.refreshAllLineageSync();
           this.syncAllDerivedSessionStateSync(true);
           appliedActions.push('refreshed lineage metadata');
+        }
+
+        if (before.resumeSessionsNeedingRefresh.length > 0) {
+          for (const driftSessionID of before.resumeSessionsNeedingRefresh) {
+            const session = this.readSessionSync(driftSessionID);
+            const roots = this.getSummaryRootsForSession(session);
+            this.writeResumeSync(session, roots);
+          }
+          appliedActions.push(
+            `refreshed ${before.resumeSessionsNeedingRefresh.length} managed resume note(s)`,
+          );
         }
 
         if (before.orphanArtifactBlobs > 0) {
@@ -2115,6 +2234,9 @@ export class SqliteLcmStore {
     const lineageSessionsNeedingRefresh = sessions
       .filter((session) => this.needsLineageRefresh(session))
       .map((session) => session.sessionID);
+    const resumeSessionsNeedingRefresh = sessions
+      .filter((session) => this.managedResumeHasDriftSync(session.sessionID))
+      .map((session) => session.sessionID);
 
     const messageFtsExpected = sessions.reduce((count, session) => {
       return (
@@ -2131,6 +2253,7 @@ export class SqliteLcmStore {
       checkedSessions: sessions.length,
       summarySessionsNeedingRebuild,
       lineageSessionsNeedingRefresh,
+      resumeSessionsNeedingRefresh,
       orphanSummaryEdges: this.countScopedOrphanSummaryEdges(sessionIDs),
       messageFts: {
         expected: messageFtsExpected,
@@ -2141,7 +2264,7 @@ export class SqliteLcmStore {
         actual: this.countScopedFtsRows('summary_fts', sessionIDs),
       },
       artifactFts: {
-        expected: this.readScopedArtifactRowsSync(sessionIDs).length,
+        expected: this.readScopedSearchArtifactRowsSync(sessionIDs).length,
         actual: this.countScopedFtsRows('artifact_fts', sessionIDs),
       },
       orphanArtifactBlobs: this.selectOrphanBlobsForDeletionSync(this.orphanBlobGracePeriodMs())
@@ -2160,6 +2283,7 @@ export class SqliteLcmStore {
     return (
       report.summarySessionsNeedingRebuild.length > 0 ||
       report.lineageSessionsNeedingRefresh.length > 0 ||
+      report.resumeSessionsNeedingRefresh.length > 0 ||
       report.orphanSummaryEdges > 0 ||
       report.messageFts.expected !== report.messageFts.actual ||
       report.summaryFts.expected !== report.summaryFts.actual ||
@@ -2513,6 +2637,22 @@ export class SqliteLcmStore {
     return note.startsWith('LCM prototype resume note\n') || note === 'LCM prototype resume note';
   }
 
+  private managedResumeHasDriftSync(sessionID: string): boolean {
+    const note = this.getResumeSync(sessionID);
+    if (!note || !this.isManagedResumeNote(note)) return false;
+    const state = safeQueryOne<SummaryStateRow>(
+      this.getDb().prepare('SELECT * FROM summary_state WHERE session_id = ?'),
+      [sessionID],
+      'managedResumeHasDriftSync',
+    );
+    const expected = state ? parseJson<string[]>(state.root_node_ids_json) : [];
+    const embedded = [...note.matchAll(/\bsum_[a-f0-9]{12}_l\d+_p\d+\b/g)].map((match) => match[0]);
+    return (
+      embedded.length !== expected.length ||
+      embedded.some((nodeID, index) => nodeID !== expected[index])
+    );
+  }
+
   private resolveRetentionPolicy(input?: {
     staleSessionDays?: number;
     deletedSessionDays?: number;
@@ -2582,6 +2722,7 @@ export class SqliteLcmStore {
       this.syncAllDerivedSessionStateSync(true);
       this.refreshSearchIndexesSync();
     }
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
 
     return {
       deletedSessions: uniqueSessionIDs.length,
@@ -2896,6 +3037,23 @@ export class SqliteLcmStore {
         `SELECT * FROM artifacts WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY created_at DESC`,
       )
       .all(...sessionIDs) as ArtifactRow[];
+  }
+
+  private readScopedSearchArtifactRowsSync(sessionIDs?: string[]): ArtifactRow[] {
+    if (sessionIDs?.length === 0) return [];
+    const scopeClause =
+      sessionIDs === undefined
+        ? ''
+        : `AND a.session_id IN (${sessionIDs.map(() => '?').join(', ')})`;
+    return this.getDb()
+      .prepare(
+        `SELECT a.*
+         FROM artifacts a
+         JOIN messages m ON m.message_id = a.message_id
+         WHERE m.deleted_at IS NULL ${scopeClause}
+         ORDER BY a.created_at DESC`,
+      )
+      .all(...(sessionIDs ?? [])) as ArtifactRow[];
   }
 
   private readScopedArtifactBlobRowsSync(sessionIDs?: string[]): ArtifactBlobRow[] {
@@ -3232,6 +3390,7 @@ export class SqliteLcmStore {
         }
 
         this.deleteOrphanArtifactBlobsSync(gracePeriodMs);
+        this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
 
         return [
           `orphan_blobs=${orphanRows.length}`,
@@ -3357,9 +3516,11 @@ export class SqliteLcmStore {
         if (candidateEvents > 0) {
           const eventTypes = candidates.map((row) => row.eventType);
           const placeholders = eventTypes.map(() => '?').join(', ');
-          this.getDb()
-            .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
-            .run(...eventTypes);
+          withTransaction(this.getDb(), 'compactEventLog', () => {
+            this.getDb()
+              .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
+              .run(...eventTypes);
+          });
         }
 
         const decisionMetrics = this.readStorageMetricsSync();
@@ -3650,7 +3811,6 @@ export class SqliteLcmStore {
       await this.prepareForRead();
       const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
       if (!resolvedSessionID) return 'No stored resume snapshots yet.';
-
       const existing = this.getResumeSync(resolvedSessionID);
       if (existing && !this.isManagedResumeNote(existing)) return existing;
 
@@ -3710,7 +3870,7 @@ export class SqliteLcmStore {
             session,
             node,
             depth,
-            input.includeRaw ?? true,
+            input.includeRaw ?? false,
             messageLimit,
           );
 
@@ -3723,7 +3883,7 @@ export class SqliteLcmStore {
           session,
           node,
           depth,
-          input.includeRaw ?? true,
+          input.includeRaw ?? false,
           messageLimit,
           query,
           matches,
@@ -4043,7 +4203,9 @@ export class SqliteLcmStore {
           sessionID,
           scope,
           limit: remainingBudget,
+          allowScan: false,
         });
+        if (!Array.isArray(scopedResults)) continue;
 
         for (const result of scopedResults) {
           const key = `${result.type}:${result.id}`;
@@ -4247,11 +4409,12 @@ export class SqliteLcmStore {
     }
 
     if (tokens.length < minTokens) return undefined;
-    const queryTokens = tokens.slice(0, 5);
+    const queryTokens = tokens.slice(0, AUTOMATIC_RETRIEVAL_WEIGHTED_TOKENS);
 
     // Apply TF-IDF weighting to filter corpus-common noise tokens
     const weightedTokens = filterTokensByTfidf(this.getDb(), queryTokens, {
       minTokens,
+      docFreqCache: this.tfidfDocFreqCache,
     });
 
     return {
@@ -4479,9 +4642,9 @@ export class SqliteLcmStore {
     limit = SUMMARY_NODE_CHAR_LIMIT,
   ): string {
     const strategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
-    return strategy === 'deterministic-v2'
-      ? this.summarizeMessagesDeterministicV2(messages, limit)
-      : this.summarizeMessagesDeterministicV1(messages, limit);
+    return strategy === 'deterministic-v1'
+      ? this.summarizeMessagesDeterministicV1(messages, limit)
+      : this.summarizeMessagesDeterministicV2(messages, limit);
   }
 
   private summarizeMessagesDeterministicV1(
@@ -4581,6 +4744,88 @@ export class SqliteLcmStore {
     return truncate(segments.join(' || '), limit);
   }
 
+  private buildSummaryDigest(messages: ConversationMessage[]): SummaryDigest {
+    const ignoreToolPrefixes = this.options.interop.ignoreToolPrefixes;
+    const userTexts = messages
+      .filter((message) => message.info.role === 'user')
+      .map((message) => guessMessageText(message, ignoreToolPrefixes))
+      .filter(Boolean);
+    const assistantTexts = messages
+      .filter((message) => message.info.role === 'assistant')
+      .map((message) => guessMessageText(message, ignoreToolPrefixes))
+      .filter(Boolean);
+    return {
+      goals:
+        userTexts.length > 1
+          ? [userTexts[0], userTexts[userTexts.length - 1]]
+          : userTexts.slice(0, 1),
+      lastAssistant: assistantTexts.at(-1) ?? '',
+      files: [...new Set(messages.flatMap(listFiles))],
+      tools: [...new Set(this.listTools(messages))],
+      messageCount: messages.length,
+      userCount: userTexts.length,
+      assistantCount: assistantTexts.length,
+      errFlag: messages.some((message) =>
+        message.parts.some(
+          (part) =>
+            (part.type === 'tool' && 'state' in part && part.state?.status === 'error') ||
+            (part.type === 'text' &&
+              /\b(?:error|exception|fail(?:ed|ure)?)\b/i.test(part.text ?? '')),
+        ),
+      ),
+    };
+  }
+
+  private mergeSummaryDigests(children: SummaryDigest[]): SummaryDigest {
+    const firstGoal = children.flatMap((child) => child.goals.slice(0, 1)).at(0);
+    const lastAssistant =
+      children
+        .slice()
+        .reverse()
+        .find((child) => child.lastAssistant)?.lastAssistant ?? '';
+    return {
+      goals: firstGoal ? [firstGoal] : [],
+      lastAssistant,
+      files: [...new Set(children.flatMap((child) => child.files))],
+      tools: [...new Set(children.flatMap((child) => child.tools))],
+      messageCount: children.reduce((sum, child) => sum + child.messageCount, 0),
+      userCount: children.reduce((sum, child) => sum + child.userCount, 0),
+      assistantCount: children.reduce((sum, child) => sum + child.assistantCount, 0),
+      errFlag: children.some((child) => child.errFlag),
+    };
+  }
+
+  private condenseChildDigests(children: SummaryDigest[]): {
+    digest: SummaryDigest;
+    summaryText: string;
+  } {
+    const digest = this.mergeSummaryDigests(children);
+    const perMsgBudget = this.options.summaryV2?.perMessageBudget ?? 110;
+    const segments: string[] = [];
+    if (digest.goals[0]) segments.push(`Goals: ${truncate(digest.goals[0], perMsgBudget)}`);
+    if (digest.lastAssistant) {
+      segments.push(`Work: ${truncate(digest.lastAssistant, perMsgBudget)}`);
+    }
+    if (digest.files.length > 0) {
+      const shown = digest.files.slice(0, 8).join(', ');
+      segments.push(
+        digest.files.length > 8 ? `Files[${digest.files.length}]: ${shown}` : `Files: ${shown}`,
+      );
+    }
+    if (digest.tools.length > 0) {
+      const shown = digest.tools.slice(0, 8).join(', ');
+      segments.push(
+        digest.tools.length > 8 ? `Tools[${digest.tools.length}]: ${shown}` : `Tools: ${shown}`,
+      );
+    }
+    if (digest.errFlag) segments.push('⚠err');
+    segments.push(`${digest.messageCount}msg(u:${digest.userCount}/a:${digest.assistantCount})`);
+    return {
+      digest,
+      summaryText: truncate(segments.join(' || '), SUMMARY_INTERNAL_CHAR_LIMIT),
+    };
+  }
+
   private listTools(messages: ConversationMessage[]): string[] {
     const tools: string[] = [];
     for (const message of messages) {
@@ -4667,12 +4912,16 @@ export class SqliteLcmStore {
     if (roots.length === 0) return false;
 
     const expectedMessageIDs = archivedMessages.map((message) => message.info.id);
+    const summaryStrategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
     const seen = new Set<string>();
 
-    const validateNode = (node: SummaryNodeData, expectedSlot: number): boolean => {
-      if (node.sessionID !== sessionID) return false;
-      if (node.nodeID !== buildSummaryNodeID(sessionID, node.level, expectedSlot)) return false;
-      if (seen.has(node.nodeID)) return false;
+    const validateNode = (
+      node: SummaryNodeData,
+      expectedSlot: number,
+    ): SummaryDigest | undefined => {
+      if (node.sessionID !== sessionID) return undefined;
+      if (node.nodeID !== buildSummaryNodeID(sessionID, node.level, expectedSlot)) return undefined;
+      if (seen.has(node.nodeID)) return undefined;
       seen.add(node.nodeID);
 
       if (
@@ -4680,41 +4929,51 @@ export class SqliteLcmStore {
         node.endIndex < node.startIndex ||
         node.endIndex >= expectedMessageIDs.length
       ) {
-        return false;
+        return undefined;
       }
 
       const expectedNodeMessageIDs = expectedMessageIDs.slice(node.startIndex, node.endIndex + 1);
-      if (node.messageIDs.length !== expectedNodeMessageIDs.length) return false;
+      if (node.messageIDs.length !== expectedNodeMessageIDs.length) return undefined;
       for (let index = 0; index < expectedNodeMessageIDs.length; index += 1) {
-        if (node.messageIDs[index] !== expectedNodeMessageIDs[index]) return false;
+        if (node.messageIDs[index] !== expectedNodeMessageIDs[index]) return undefined;
       }
+      if (node.strategy !== summaryStrategy) return undefined;
 
-      const expectedSummaryText = this.summarizeMessages(
-        archivedMessages.slice(node.startIndex, node.endIndex + 1),
-      );
-      if (node.summaryText !== expectedSummaryText) return false;
-      if (node.strategy !== (this.options.summaryV2?.strategy ?? 'deterministic-v1')) return false;
-
+      const coveredMessages = archivedMessages.slice(node.startIndex, node.endIndex + 1);
       const children = this.readSummaryChildrenSync(node.nodeID);
       if (node.nodeKind === 'leaf') {
-        return (
-          children.length === 0 && node.endIndex - node.startIndex + 1 <= SUMMARY_LEAF_MESSAGES
-        );
+        if (
+          children.length !== 0 ||
+          node.endIndex - node.startIndex + 1 > SUMMARY_LEAF_MESSAGES ||
+          node.summaryText !== this.summarizeMessages(coveredMessages)
+        ) {
+          return undefined;
+        }
+        return this.buildSummaryDigest(coveredMessages);
       }
-      if (children.length === 0 || children.length > SUMMARY_BRANCH_FACTOR) return false;
-      if (children[0]?.startIndex !== node.startIndex) return false;
-      if (children.at(-1)?.endIndex !== node.endIndex) return false;
+      if (node.nodeKind !== 'internal') return undefined;
+      if (children.length === 0 || children.length > SUMMARY_BRANCH_FACTOR) return undefined;
+      if (children[0]?.startIndex !== node.startIndex) return undefined;
+      if (children.at(-1)?.endIndex !== node.endIndex) return undefined;
 
       let nextStartIndex = node.startIndex;
+      const childDigests: SummaryDigest[] = [];
       for (const [childPosition, child] of children.entries()) {
-        if (child.level !== node.level - 1) return false;
-        if (child.startIndex !== nextStartIndex) return false;
-        if (!validateNode(child, expectedSlot * SUMMARY_BRANCH_FACTOR + childPosition))
-          return false;
+        if (child.level !== node.level - 1) return undefined;
+        if (child.startIndex !== nextStartIndex) return undefined;
+        const digest = validateNode(child, expectedSlot * SUMMARY_BRANCH_FACTOR + childPosition);
+        if (!digest) return undefined;
+        childDigests.push(digest);
         nextStartIndex = child.endIndex + 1;
       }
+      if (nextStartIndex !== node.endIndex + 1) return undefined;
 
-      return nextStartIndex === node.endIndex + 1;
+      const condensed = this.condenseChildDigests(childDigests);
+      const expectedSummaryText =
+        summaryStrategy === 'deterministic-v3'
+          ? condensed.summaryText
+          : this.summarizeMessages(coveredMessages);
+      return node.summaryText === expectedSummaryText ? condensed.digest : undefined;
     };
 
     let nextStartIndex = 0;
@@ -4736,6 +4995,7 @@ export class SqliteLcmStore {
     const summaryStrategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
     let level = 0;
     const nodes: SummaryNodeData[] = [];
+    const digests = new Map<string, SummaryDigest>();
     const edges: Array<{
       sessionID: string;
       parentID: string;
@@ -4780,6 +5040,7 @@ export class SqliteLcmStore {
         level,
         slot,
       });
+      digests.set(node.nodeID, this.buildSummaryDigest(chunk));
       nodes.push(node);
       currentLevel.push(node);
     }
@@ -4793,15 +5054,24 @@ export class SqliteLcmStore {
         const startIndex = children[0].startIndex;
         const endIndex = children.at(-1)?.endIndex ?? startIndex;
         const covered = archivedMessages.slice(startIndex, endIndex + 1);
+        const childDigests = children.map((child) => digests.get(child.nodeID));
+        if (childDigests.some((digest) => !digest)) {
+          throw new Error('Unable to condense summary graph: child digest missing.');
+        }
+        const condensed = this.condenseChildDigests(childDigests as SummaryDigest[]);
         const node = makeNode({
           nodeKind: 'internal',
           startIndex,
           endIndex,
           messageIDs: covered.map((message) => message.info.id),
-          summaryText: this.summarizeMessages(covered),
+          summaryText:
+            summaryStrategy === 'deterministic-v3'
+              ? condensed.summaryText
+              : this.summarizeMessages(covered),
           level,
           slot: nextLevel.length,
         });
+        digests.set(node.nodeID, condensed.digest);
         nodes.push(node);
         nextLevel.push(node);
         children.forEach((child, childPosition) => {
@@ -5058,13 +5328,30 @@ export class SqliteLcmStore {
     indent = '',
   ): string[] {
     const byID = new Map(session.messages.map((message) => [message.info.id, message]));
-    const allCovered = node.messageIDs
-      .map((messageID) => byID.get(messageID))
-      .filter((message): message is ConversationMessage => Boolean(message));
+    const deletionState = this.getDb().prepare(
+      'SELECT deleted_at FROM messages WHERE session_id = ? AND message_id = ?',
+    );
+    const allCovered = node.messageIDs.map((messageID) => {
+      const liveMessage = byID.get(messageID);
+      if (liveMessage) {
+        return { messageID, message: liveMessage, removed: false, pruned: false };
+      }
+
+      const row = deletionState.get(session.sessionID, messageID) as
+        | { deleted_at: number | null }
+        | undefined;
+      if (!row) return { messageID, removed: false, pruned: true };
+      return {
+        messageID,
+        message: this.readMessageSync(session.sessionID, messageID, { includeDeleted: true }),
+        removed: row.deleted_at !== null,
+        pruned: false,
+      };
+    });
 
     const filteredCovered =
       matches && matches.messageIDs.size > 0
-        ? allCovered.filter((message) => matches.messageIDs.has(message.info.id))
+        ? allCovered.filter((entry) => matches.messageIDs.has(entry.messageID))
         : allCovered;
     const covered = (filteredCovered.length > 0 ? filteredCovered : allCovered).slice(
       0,
@@ -5073,11 +5360,23 @@ export class SqliteLcmStore {
     if (covered.length === 0) return [];
 
     const lines = [`${indent}Raw messages:`];
-    for (const message of covered) {
+    for (const entry of covered) {
+      if (entry.pruned) {
+        lines.push(`${indent}- [pruned: ${entry.messageID}]`);
+        continue;
+      }
+      if (!entry.message) {
+        lines.push(`${indent}- ${entry.removed ? '[removed] ' : ''}${entry.messageID}`);
+        continue;
+      }
+
       const snippet =
-        guessMessageText(message, this.options.interop.ignoreToolPrefixes) || '(no text content)';
-      lines.push(`${indent}- ${message.info.role} ${message.info.id}: ${truncate(snippet, 220)}`);
-      const artifacts = this.readArtifactsForMessageSync(message.info.id);
+        guessMessageText(entry.message, this.options.interop.ignoreToolPrefixes) ||
+        '(no text content)';
+      lines.push(
+        `${indent}- ${entry.removed ? '[removed] ' : ''}${entry.message.info.role} ${entry.messageID}: ${truncate(snippet, 220)}`,
+      );
+      const artifacts = this.readArtifactsForMessageSync(entry.messageID);
       const shownArtifacts =
         matches && matches.artifactIDs.size > 0
           ? artifacts.filter((artifact) => matches.artifactIDs.has(artifact.artifactID))
@@ -5092,12 +5391,9 @@ export class SqliteLcmStore {
       }
     }
 
-    if (
-      (filteredCovered.length > 0 ? filteredCovered.length : allCovered.length) > covered.length
-    ) {
-      lines.push(
-        `${indent}- ... ${(filteredCovered.length > 0 ? filteredCovered.length : allCovered.length) - covered.length} more message(s)`,
-      );
+    const totalCovered = filteredCovered.length > 0 ? filteredCovered.length : allCovered.length;
+    if (totalCovered > covered.length) {
+      lines.push(`${indent}- ... ${totalCovered - covered.length} more message(s)`);
     }
     return lines;
   }
@@ -5241,7 +5537,7 @@ export class SqliteLcmStore {
       readScopedSummaryRowsSync: (sessionIDs?: string[]) =>
         this.readScopedSummaryRowsSync(sessionIDs),
       readScopedArtifactRowsSync: (sessionIDs?: string[]) =>
-        this.readScopedArtifactRowsSync(sessionIDs),
+        this.readScopedSearchArtifactRowsSync(sessionIDs),
       buildArtifactSearchContent: (row: ArtifactRow) =>
         this.buildArtifactSearchContent(this.materializeArtifactRow(row)),
       ignoreToolPrefixes: this.options.interop.ignoreToolPrefixes,
@@ -5274,12 +5570,22 @@ export class SqliteLcmStore {
     };
   }
 
-  private searchWithFts(query: string, sessionIDs?: string[], limit = 5): SearchResult[] {
-    return searchWithFtsModule(this.searchDeps(), query, sessionIDs, limit);
+  private searchWithFts(
+    query: string,
+    sessionIDs?: string[],
+    limit = 5,
+    within?: { messageIDs?: string[]; summaryNodeIDs?: string[] },
+  ): SearchResult[] {
+    return searchWithFtsModule(this.searchDeps(), query, sessionIDs, limit, within);
   }
 
-  private searchByScan(query: string, sessionIDs?: string[], limit = 5): SearchResult[] {
-    return searchByScanModule(this.searchDeps(), query, sessionIDs, limit);
+  private searchByScan(
+    query: string,
+    sessionIDs?: string[],
+    limit = 5,
+    within?: { messageIDs?: string[]; summaryNodeIDs?: string[] },
+  ): SearchResult[] {
+    return searchByScanModule(this.searchDeps(), query, sessionIDs, limit, within);
   }
 
   private replaceMessageSearchRowsSync(session: NormalizedSession): void {
@@ -5328,6 +5634,13 @@ export class SqliteLcmStore {
     ensure('lineage_depth', 'lineage_depth INTEGER');
     ensure('pinned', 'pinned INTEGER NOT NULL DEFAULT 0');
     ensure('pin_reason', 'pin_reason TEXT');
+  }
+
+  private ensureMessageColumnsSync(): void {
+    const db = this.getDb();
+    const columns = db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
+    if (columns.some((column) => column.name === 'deleted_at')) return;
+    db.exec('ALTER TABLE messages ADD COLUMN deleted_at INTEGER');
   }
 
   private ensureSummaryStateColumnsSync(): void {
@@ -5692,7 +6005,7 @@ export class SqliteLcmStore {
     // 2. Messages (batch)
     const messageRows = db
       .prepare(
-        `SELECT * FROM messages WHERE session_id IN (${placeholders}) ORDER BY session_id ASC, created_at ASC, message_id ASC`,
+        `SELECT * FROM messages WHERE session_id IN (${placeholders}) AND deleted_at IS NULL ORDER BY session_id ASC, created_at ASC, message_id ASC`,
       )
       .all(...sessionIDs) as MessageRow[];
 
@@ -5803,7 +6116,7 @@ export class SqliteLcmStore {
     );
     const messageRows = db
       .prepare(
-        'SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, message_id ASC',
+        'SELECT * FROM messages WHERE session_id = ? AND deleted_at IS NULL ORDER BY created_at ASC, message_id ASC',
       )
       .all(sessionID) as MessageRow[];
     const partRows = db
@@ -5922,7 +6235,9 @@ export class SqliteLcmStore {
   ): ConversationMessage | undefined {
     const db = this.getDb();
     const row = safeQueryOne<MessageRow>(
-      db.prepare('SELECT * FROM messages WHERE session_id = ? AND message_id = ?'),
+      db.prepare(
+        `SELECT * FROM messages WHERE session_id = ? AND message_id = ?${options?.includeDeleted ? '' : ' AND deleted_at IS NULL'}`,
+      ),
       [sessionID, messageID],
       'readMessageSync',
     );
@@ -5960,7 +6275,7 @@ export class SqliteLcmStore {
 
   private readMessageCountSync(sessionID: string): number {
     const row = this.getDb()
-      .prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?')
+      .prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ? AND deleted_at IS NULL')
       .get(sessionID) as { count: number };
     return row.count;
   }
@@ -5971,6 +6286,7 @@ export class SqliteLcmStore {
         `SELECT COUNT(*) AS count
          FROM messages
          WHERE session_id = ?
+           AND deleted_at IS NULL
            AND (created_at > ? OR (created_at = ? AND message_id > ?))`,
       )
       .get(sessionID, createdAt, createdAt, messageID) as { count: number };
@@ -6062,13 +6378,12 @@ export class SqliteLcmStore {
         });
         return;
       }
-      default: {
-        const externalized = await this.externalizeSession(session);
-        withTransaction(this.getDb(), 'capture', () => {
-          writeEvent();
-          this.persistStoredSessionSync(externalized.storedSession, externalized.artifacts);
+      default:
+        getLogger().debug('Ignoring unsupported persistable event type', {
+          eventType: payload.type,
+          sessionID: session.sessionID,
         });
-      }
+        return;
     }
   }
 
@@ -6141,12 +6456,13 @@ export class SqliteLcmStore {
     const info = redactStructuredValue(validated, this.privacy);
     this.getDb()
       .prepare(
-        `INSERT INTO messages (message_id, session_id, created_at, info_json)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO messages (message_id, session_id, created_at, info_json, deleted_at)
+         VALUES (?, ?, ?, ?, NULL)
          ON CONFLICT(message_id) DO UPDATE SET
             session_id = excluded.session_id,
             created_at = excluded.created_at,
-            info_json = excluded.info_json`,
+            info_json = excluded.info_json,
+            deleted_at = NULL`,
       )
       .run(info.id, sessionID, info.time.created, JSON.stringify(info));
   }
@@ -6155,15 +6471,8 @@ export class SqliteLcmStore {
     const db = this.getDb();
     db.prepare('DELETE FROM artifact_fts WHERE message_id = ?').run(messageID);
     db.prepare('DELETE FROM message_fts WHERE message_id = ?').run(messageID);
-    db.prepare('DELETE FROM artifacts WHERE session_id = ? AND message_id = ?').run(
-      sessionID,
-      messageID,
-    );
-    db.prepare('DELETE FROM parts WHERE session_id = ? AND message_id = ?').run(
-      sessionID,
-      messageID,
-    );
-    db.prepare('DELETE FROM messages WHERE session_id = ? AND message_id = ?').run(
+    db.prepare('UPDATE messages SET deleted_at = ? WHERE session_id = ? AND message_id = ?').run(
+      Date.now(),
       sessionID,
       messageID,
     );

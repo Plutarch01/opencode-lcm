@@ -498,8 +498,9 @@ test('message.updated preserves existing parts and search content', async () => 
   }
 });
 
-test('message.removed drops reverted content from session memory and search', async () => {
+test('message.removed tombstones reverted content without recalling it', async () => {
   const workspace = makeWorkspace('lcm-message-removed');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
   let store;
 
   try {
@@ -540,11 +541,41 @@ test('message.removed drops reverted content from session memory and search', as
     const after = await store.grep({ query: 'reverted memory body', sessionID: 's1', limit: 3 });
     const describe = await store.describe({ sessionID: 's1' });
     const stats = await store.stats();
+    const db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const tombstone = db.prepare('SELECT deleted_at FROM messages WHERE message_id = ?').get('m1');
+    const retainedParts = db
+      .prepare('SELECT COUNT(*) AS count FROM parts WHERE message_id = ?')
+      .get('m1');
+    db.prepare(
+      `INSERT INTO summary_nodes
+       (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, strategy, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'removed-pointer',
+      's1',
+      0,
+      'leaf',
+      0,
+      1,
+      JSON.stringify(['m1', 'pre-migration-pruned']),
+      'stale summary pointer',
+      'deterministic-v2',
+      Date.now(),
+    );
+    db.close();
+    const expanded = await store.expand({ nodeID: 'removed-pointer', includeRaw: true });
 
     assert.equal(after.length, 0);
     assert.ok(!describe.includes('reverted memory body'));
-    assert.equal(stats.artifactCount, 0);
-    assert.equal(stats.orphanArtifactBlobCount, 1);
+    assert.equal(stats.artifactCount, 1);
+    assert.equal(stats.orphanArtifactBlobCount, 0);
+    assert.equal(typeof tombstone.deleted_at, 'number');
+    assert.equal(retainedParts.count, 1);
+    assert.match(expanded, /\[removed\].*m1.*reverted memory body/);
+    assert.match(expanded, /\[pruned: pre-migration-pruned\]/);
   } finally {
     store?.close();
     await cleanupWorkspace(workspace);
@@ -553,6 +584,7 @@ test('message.removed drops reverted content from session memory and search', as
 
 test('message.part.updated replaces stale artifacts and retains the blob through its grace period', async () => {
   const workspace = makeWorkspace('lcm-message-part-replace');
+  const dbPath = path.join(workspace, '.lcm', 'lcm.db');
   let store;
 
   try {
@@ -584,12 +616,45 @@ test('message.part.updated replaces stale artifacts and retains the blob through
 
     const before = await store.stats();
     assert.equal(before.artifactCount, 1);
+    let db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const initialArtifact = db
+      .prepare('SELECT artifact_id FROM artifacts WHERE message_id = ?')
+      .get('m1');
+    db.close();
 
     await store.capture({
       type: 'message.part.updated',
       properties: {
         sessionID: 's1',
         time: 3,
+        part: {
+          id: 'm1-p',
+          sessionID: 's1',
+          messageID: 'm1',
+          type: 'text',
+          text: 'large stale body '.repeat(12),
+        },
+      },
+    });
+
+    db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+    });
+    const stableArtifacts = db
+      .prepare('SELECT artifact_id FROM artifacts WHERE message_id = ?')
+      .all('m1');
+    db.close();
+    assert.deepEqual(stableArtifacts, [initialArtifact]);
+
+    await store.capture({
+      type: 'message.part.updated',
+      properties: {
+        sessionID: 's1',
+        time: 4,
         part: {
           id: 'm1-p',
           sessionID: 's1',
@@ -1218,17 +1283,9 @@ test('deferred init applies retention pruning at startup', async () => {
   let store;
 
   try {
-    store = new SqliteLcmStore(
-      workspace,
-      makeOptions({
-        retention: {
-          staleSessionDays: 0,
-          deletedSessionDays: undefined,
-          orphanBlobDays: undefined,
-        },
-      }),
-    );
+    store = new SqliteLcmStore(workspace, makeOptions());
     await store.init();
+    await store.whenIdle();
     await store.capture({
       type: 'session.created',
       properties: { sessionID: 'drop', info: sessionInfo(workspace, 'drop', 1) },
@@ -1268,6 +1325,7 @@ test('deferred init applies retention pruning at startup', async () => {
       }),
     );
     await store.init();
+    await store.whenIdle();
 
     const stats = await store.stats();
     assert.equal(stats.sessionCount, 0);

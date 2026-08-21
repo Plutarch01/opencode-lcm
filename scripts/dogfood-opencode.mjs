@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -15,21 +15,65 @@ if (!existsSync(distPath)) {
 const model = process.argv[2] ?? process.env.OPENCODE_LCM_DOGFOOD_MODEL ?? 'openai/gpt-5.4-mini';
 const distUrl = pathToFileURL(distPath).href;
 const expectedMarker = 'ZX729ALBATROSS';
+const windowsOpencodeExe =
+  process.platform === 'win32' && process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe')
+    : undefined;
+const opencodeTimeoutMs = Number(process.env.OPENCODE_LCM_DOGFOOD_TIMEOUT_MS ?? 300000);
 
-function runOpencode(cwd, args) {
-  if (process.platform === 'win32') {
-    return spawnSync('cmd.exe', ['/c', 'opencode', ...args], {
-      cwd,
-      encoding: 'utf8',
-      timeout: 180000,
+async function runOpencode(cwd, args) {
+  const useWindowsExe = windowsOpencodeExe && existsSync(windowsOpencodeExe);
+  const command = useWindowsExe
+    ? windowsOpencodeExe
+    : process.platform === 'win32'
+      ? 'cmd.exe'
+      : 'opencode';
+  const commandArgs = useWindowsExe
+    ? args
+    : process.platform === 'win32'
+      ? ['/c', 'opencode', ...args]
+      : args;
+  const run = () =>
+    new Promise((resolve) => {
+      const child = spawn(command, commandArgs, {
+        cwd,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, opencodeTimeoutMs);
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      child.once('error', (error) => {
+        clearTimeout(timer);
+        resolve({ status: null, stdout, stderr, error });
+      });
+      child.once('close', (status) => {
+        clearTimeout(timer);
+        if (!timedOut) {
+          resolve({ status, stdout, stderr });
+          return;
+        }
+        const error = new Error(`OpenCode timed out after ${opencodeTimeoutMs}ms`);
+        error.code = 'ETIMEDOUT';
+        resolve({ status: null, stdout, stderr, error });
+      });
     });
-  }
 
-  return spawnSync('opencode', args, {
-    cwd,
-    encoding: 'utf8',
-    timeout: 180000,
-  });
+  const first = await run();
+  if (first.error?.code !== 'ETIMEDOUT' || !useWindowsExe) return first;
+  return await run();
 }
 
 function extractText(output) {
@@ -98,7 +142,7 @@ function validateResults(results) {
   return errors;
 }
 
-function runScenario(enabled) {
+async function runScenario(enabled) {
   const projectDir = mkdtempSync(
     path.join(tmpdir(), enabled ? 'lcm-dogfood-on-' : 'lcm-dogfood-off-'),
   );
@@ -150,7 +194,7 @@ function runScenario(enabled) {
   const secondPrompt =
     'What exact root cause marker did I mention earlier? Reply only with the marker.';
 
-  const first = runOpencode(projectDir, [
+  const first = await runOpencode(projectDir, [
     'run',
     firstPrompt,
     '--format',
@@ -169,7 +213,7 @@ function runScenario(enabled) {
     };
   }
 
-  const second = runOpencode(projectDir, [
+  const second = await runOpencode(projectDir, [
     'run',
     secondPrompt,
     '--continue',
@@ -208,7 +252,7 @@ function runScenario(enabled) {
   };
 }
 
-const results = [runScenario(false), runScenario(true)];
+const results = [await runScenario(false), await runScenario(true)];
 const keepProjects = process.env.OPENCODE_LCM_DOGFOOD_KEEP === '1';
 const validationErrors = validateResults(results);
 

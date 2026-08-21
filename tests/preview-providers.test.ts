@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -230,5 +230,31 @@ test('ignores file paths outside the workspace', async () => {
   } finally {
     cleanupWorkspace(workspace);
     cleanupWorkspace(outside);
+  }
+});
+
+test('skips whole-file fingerprints above 32 MiB while retaining bounded metadata', async () => {
+  const workspace = makeWorkspace('preview-providers-large');
+
+  try {
+    const filePath = writeFixtureFile(workspace, 'large.bin', Buffer.from([1, 2, 3, 4]));
+    truncateSync(filePath, 32 * 1024 * 1024 + 1);
+    const output = await runBinaryPreviewProviders({
+      workspaceDirectory: workspace,
+      file: makeFilePart(filePath),
+      category: 'binary',
+      extension: 'bin',
+      mime: 'application/octet-stream',
+      enabledProviders: ['fingerprint', 'byte-peek'],
+      bytePeek: 16,
+    });
+
+    assert.equal(output.metadata.fingerprint, 'skipped-large-file');
+    assert.equal(output.metadata.previewSizeBytes, 32 * 1024 * 1024 + 1);
+    assert.equal(output.metadata.previewSha256, undefined);
+    assert.match(output.lines[0], /skipped large file/);
+    assert.match(output.lines[1], /^Byte peek:/);
+  } finally {
+    cleanupWorkspace(workspace);
   }
 });

@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
-
 import type { Message, Part } from '@opencode-ai/sdk';
+import { ARTIFACT_FTS_CHAR_LIMIT } from './constants.js';
+import { buildExplorationSummary } from './exploration.js';
 import { getLogger } from './logging.js';
 import { runBinaryPreviewProviders } from './preview-providers.js';
 import {
@@ -124,15 +124,28 @@ function createArtifactData(
   },
 ): ArtifactData {
   const contentText = redactText(input.contentText, bindings.options.privacy);
-  const metadata = redactStructuredValue(input.metadata ?? {}, bindings.options.privacy);
-  const previewText = redactText(
+  const redactedMetadata = redactStructuredValue(input.metadata ?? {}, bindings.options.privacy);
+  const category = typeof redactedMetadata.category === 'string' ? redactedMetadata.category : '';
+  const extension =
+    typeof redactedMetadata.extension === 'string' ? redactedMetadata.extension : '';
+  const exploration = buildExplorationSummary(category, extension, contentText);
+  const metadata = exploration ? { ...redactedMetadata, exploration } : redactedMetadata;
+  const basePreview = redactText(
     input.previewText ??
       truncate(contentText.replace(/\s+/g, ' ').trim(), bindings.options.artifactPreviewChars),
     bindings.options.privacy,
   );
+  const previewText = exploration
+    ? truncate(
+        `${basePreview}${basePreview ? ' | ' : ''}${exploration}`,
+        bindings.options.artifactPreviewChars * 2,
+      )
+    : basePreview;
   const contentHash = hashContent(contentText);
   return {
-    artifactID: `art_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+    artifactID: `art_${hashContent(
+      `${input.sessionID}:${input.messageID}:${input.partID ?? ''}:${input.fieldName}:${contentHash}`,
+    ).slice(0, 16)}`,
     sessionID: input.sessionID,
     messageID: input.messageID,
     partID: input.partID,
@@ -183,7 +196,9 @@ export function buildArtifactSearchContent(artifact: ArtifactData): string {
     .filter((line): line is string => Boolean(line))
     .join('\n');
 
-  return [artifact.previewText, metadata, artifact.contentText].filter(Boolean).join('\n');
+  return [artifact.previewText, metadata, truncate(artifact.contentText, ARTIFACT_FTS_CHAR_LIMIT)]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function buildFileArtifactMetadata(
@@ -544,13 +559,14 @@ function insertArtifactsSync(bindings: StoreArtifactBindings, artifacts: Artifac
      VALUES (?, ?, ?, ?)`,
   );
   const insertArtifact = db.prepare(
-    `INSERT INTO artifacts
+    `INSERT OR REPLACE INTO artifacts
      (artifact_id, session_id, message_id, part_id, artifact_kind, field_name, preview_text, content_text, content_hash, metadata_json, char_count, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertFts = db.prepare(
     'INSERT INTO artifact_fts (session_id, artifact_id, message_id, part_id, artifact_kind, created_at, content) VALUES (?, ?, ?, ?, ?, ?, ?)',
   );
+  const deleteFts = db.prepare('DELETE FROM artifact_fts WHERE artifact_id = ?');
 
   for (const artifact of artifacts) {
     insertBlob.run(
@@ -559,6 +575,7 @@ function insertArtifactsSync(bindings: StoreArtifactBindings, artifacts: Artifac
       artifact.charCount,
       artifact.createdAt,
     );
+    deleteFts.run(artifact.artifactID);
     insertArtifact.run(
       artifact.artifactID,
       artifact.sessionID,
@@ -629,8 +646,23 @@ export function replaceStoredMessageSync(
   artifacts: ArtifactData[],
 ): void {
   const db = bindings.getDb();
+  const messageID = storedMessage.info.id;
+  const artifactIDs = [...new Set(artifacts.map((artifact) => artifact.artifactID))];
 
-  bindings.deleteMessageSync(sessionID, storedMessage.info.id);
+  db.prepare('DELETE FROM artifact_fts WHERE message_id = ?').run(messageID);
+  if (artifactIDs.length === 0) {
+    db.prepare('DELETE FROM artifacts WHERE session_id = ? AND message_id = ?').run(
+      sessionID,
+      messageID,
+    );
+  } else {
+    db.prepare(
+      `DELETE FROM artifacts
+       WHERE session_id = ? AND message_id = ?
+         AND artifact_id NOT IN (${artifactIDs.map(() => '?').join(', ')})`,
+    ).run(sessionID, messageID, ...artifactIDs);
+  }
+  db.prepare('DELETE FROM parts WHERE session_id = ? AND message_id = ?').run(sessionID, messageID);
   bindings.upsertMessageInfoSync(sessionID, storedMessage);
 
   const insertPart = db.prepare(

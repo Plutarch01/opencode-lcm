@@ -58,6 +58,12 @@ OpenCode handles compaction normally — when the conversation gets too large, i
 
 Listens to OpenCode events and stores session state, messages, parts, and artifacts in `.lcm/lcm.db`. Builds deterministic summary nodes for archived turns and automatically repairs summary, index, lineage, and resume drift.
 
+### Losslessness boundaries
+
+`message.removed` tombstones the archived message instead of deleting its stored parts or artifacts. Removed content is excluded from recall and is rendered with a `[removed]` prefix when `lcm_expand` expands a summary node that still references it; missing pre-migration or retention-pruned rows are rendered as `[pruned: <message-id>]`.
+
+Hard deletion occurs only through explicit retention/prune operations or the configured retention policy. Defaults prune deleted sessions after 30 days and orphan blobs after 14 days; stale-session pruning is disabled by default. Privacy `redactPatterns` are intentionally destructive: matching text is replaced before storage and cannot be recovered.
+
 ### Automatic Recall
 
 Inserts archived context into the prompt via `experimental.chat.messages.transform`. Starts with the current session and escalates to broader scopes when needed. Uses TF-IDF weighted retrieval with bigram phrase queries for corpus-aware ranking.
@@ -74,8 +80,14 @@ Appends a compact resume note during compaction so important context survives th
 - **Snapshot export/import** — portable snapshots with safe merge and worktree modes
 - **Privacy controls** — tool-output exclusion, path-based capture exclusion, regex redaction
 - **Configurable retrieval** — scope ordering, per-scope budgets, stop rules, recency-aware ranking
-- **17 tools** — `lcm_status`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_compact`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, `lcm_import_snapshot`
+- **18 tools** — `lcm_status`, `lcm_retrieval_debug`, `lcm_resume`, `lcm_grep`, `lcm_describe`, `lcm_lineage`, `lcm_expand`, `lcm_artifact`, `lcm_pin_session`, `lcm_unpin_session`, `lcm_blob_stats`, `lcm_blob_gc`, `lcm_compact`, `lcm_doctor`, `lcm_retention_report`, `lcm_retention_prune`, `lcm_export_snapshot`, `lcm_import_snapshot`
 - **Legacy migration** — auto-migrates `.lcm/events.jsonl`, `.lcm/resume.json`, `.lcm/sessions/*.json`
+
+### Archive tool behavior
+
+- `lcm_grep` accepts `limit`, `offset`, and `summaryID`. Paginate with `offset = previous offset + limit`; `summaryID` restricts results to that node and its descendants. Interactive grep retains its substring-scan fallback, while automatic recall passes internal `allowScan=false` and stays FTS-only to avoid blocking chat turns.
+- `lcm_expand` returns summaries by default (`includeRaw=false`). Pass `includeRaw=true` only when progressive summary expansion is insufficient.
+- `lcm_import_snapshot` requires an explicit `mode` of `merge` or `replace`.
 
 ## Configuration
 
@@ -172,7 +184,7 @@ These controls are not encryption and not retroactive. Existing archived rows ke
 
 ## context-mode Interop
 
-Pairing with [context-mode](https://github.com/mksglu/context-mode/) reduces tool-output token waste. Add the `interop` block to avoid hook conflicts:
+Pairing with [context-mode](https://github.com/mksglu/context-mode/) reduces tool-output token waste. Use `ignoreToolPrefixes` to keep infrastructure tools out of archive summaries and retrieval intent:
 
 ```json
 {
@@ -187,8 +199,6 @@ Pairing with [context-mode](https://github.com/mksglu/context-mode/) reduces too
     "context-mode",
     ["opencode-lcm", {
       "interop": {
-        "contextMode": true,
-        "neverOverrideCompactionPrompt": true,
         "ignoreToolPrefixes": ["ctx_"]
       },
       "scopeDefaults": { "grep": "session", "describe": "session" },

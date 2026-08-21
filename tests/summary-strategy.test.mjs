@@ -6,6 +6,7 @@ import {
   captureMessage,
   cleanupWorkspace,
   createSession,
+  filePart,
   makeOptions,
   makeWorkspace,
   textPart,
@@ -144,6 +145,156 @@ test('changing the summary strategy invalidates cached summary graph nodes', asy
   } finally {
     v1?.close();
     v2?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('deterministic-v3 condenses internal nodes from child digests', async () => {
+  const workspace = makeWorkspace('summary-strategy-v3');
+  let v2;
+  let v3;
+
+  try {
+    v2 = makeStore(workspace, 'deterministic-v2');
+    await v2.init();
+    await createSession(v2, workspace, 's1', 1);
+
+    const filesByIndex = new Map([
+      [3, 'alpha.ts'],
+      [21, 'beta.ts'],
+      [45, 'gamma.ts'],
+    ]);
+    for (let index = 1; index <= 54; index += 1) {
+      const messageID = `m${index}`;
+      const fileName = filesByIndex.get(index);
+      const parts = [
+        textPart(
+          's1',
+          messageID,
+          `${messageID}-text`,
+          index === 1 ? 'Preserve the multi-leaf file inventory.' : `summary message ${index}`,
+        ),
+      ];
+      if (fileName) {
+        parts.push(
+          filePart(
+            's1',
+            messageID,
+            `${messageID}-file`,
+            `${workspace}/${fileName}`,
+            `export const value${index} = ${index};`,
+            'text/typescript',
+          ),
+        );
+      }
+      await captureMessage(v2, {
+        sessionID: 's1',
+        messageID,
+        created: index + 1,
+        role: index % 2 === 0 ? 'assistant' : 'user',
+        parts,
+      });
+    }
+
+    const v2Roots = await getRoots(v2, 's1');
+    assert.equal(v2Roots[0].strategy, 'deterministic-v2');
+    await v2.close();
+    v2 = undefined;
+
+    v3 = makeStore(workspace, 'deterministic-v3');
+    await v3.init();
+    const v3Roots = await getRoots(v3, 's1');
+
+    assert.equal(v3Roots.length, 1);
+    assert.equal(v3Roots[0].level, 2);
+    assert.equal(v3Roots[0].strategy, 'deterministic-v3');
+    assert.match(v3Roots[0].summaryText, /alpha\.ts/);
+    assert.match(v3Roots[0].summaryText, /gamma\.ts/);
+    assert.match(v3Roots[0].summaryText, /52msg\(u:26\/a:26\)/);
+  } finally {
+    await v2?.close();
+    await v3?.close();
+    await cleanupWorkspace(workspace);
+  }
+});
+
+test('grep paginates, scopes to descendants, and annotates covering leaves', async () => {
+  const workspace = makeWorkspace('summary-grep-scope');
+  let store;
+
+  try {
+    store = new SqliteLcmStore(
+      workspace,
+      makeOptions({
+        freshTailMessages: 0,
+        summaryV2: { strategy: 'deterministic-v3', perMessageBudget: 110 },
+      }),
+    );
+    await store.init();
+    await createSession(store, workspace, 's1', 1);
+    for (let index = 1; index <= 18; index += 1) {
+      await captureMessage(store, {
+        sessionID: 's1',
+        messageID: `m${index}`,
+        created: index + 1,
+        role: index % 2 === 0 ? 'assistant' : 'user',
+        parts: [
+          textPart(
+            's1',
+            `m${index}`,
+            `m${index}-text`,
+            `pagination needle archived message ${index}`,
+          ),
+        ],
+      });
+    }
+
+    const roots = await getRoots(store, 's1');
+    const leaf = store.readSummaryChildrenSync(roots[0].nodeID)[0];
+    const firstPage = await store.grep({
+      query: 'pagination needle',
+      sessionID: 's1',
+      limit: 5,
+      offset: 0,
+    });
+    const secondPage = await store.grep({
+      query: 'pagination needle',
+      sessionID: 's1',
+      limit: 5,
+      offset: 5,
+    });
+    const scoped = await store.grep({
+      query: 'pagination needle',
+      summaryID: leaf.nodeID,
+      limit: 20,
+    });
+    const unknown = await store.grep({
+      query: 'pagination needle',
+      summaryID: 'missing-node',
+    });
+    const summaryOnly = await store.expand({ nodeID: leaf.nodeID });
+    const withRaw = await store.expand({ nodeID: leaf.nodeID, includeRaw: true });
+
+    assert.ok(Array.isArray(firstPage));
+    assert.ok(Array.isArray(secondPage));
+    assert.ok(Array.isArray(scoped));
+    assert.equal(
+      firstPage.some((left) =>
+        secondPage.some((right) => `${left.type}:${left.id}` === `${right.type}:${right.id}`),
+      ),
+      false,
+    );
+    const scopedMessages = scoped.filter(
+      (result) => result.type !== 'summary' && !result.type.startsWith('artifact:'),
+    );
+    assert.ok(scopedMessages.length > 0);
+    assert.ok(scopedMessages.every((result) => leaf.messageIDs.includes(result.id)));
+    assert.ok(scopedMessages.every((result) => result.nodeID === leaf.nodeID));
+    assert.equal(unknown, 'Unknown summary node.');
+    assert.doesNotMatch(summaryOnly, /Raw messages:/);
+    assert.match(withRaw, /Raw messages:/);
+  } finally {
+    await store?.close();
     await cleanupWorkspace(workspace);
   }
 });

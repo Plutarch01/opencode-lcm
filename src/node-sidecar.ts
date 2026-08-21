@@ -66,6 +66,9 @@ async function handleRequest(request: RequestMessage): Promise<unknown> {
     case 'captureDeferred':
       await requireStore().captureDeferred(request.params as Event);
       return true;
+    case 'captureImmediate':
+      await requireStore().capture(request.params as Event);
+      return true;
     case 'stats':
       return await requireStore().stats();
     case 'automaticRetrievalDebug':

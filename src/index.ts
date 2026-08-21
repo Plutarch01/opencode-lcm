@@ -7,9 +7,11 @@ import { SqliteLcmStore } from './store.js';
 import type { OpencodeLcmOptions } from './types.js';
 
 type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
-type RuntimeBackend = 'in_process' | 'node_sidecar' | 'disabled';
+type RuntimeBackend = 'in_process' | 'node_sidecar';
 
 const ALLOW_UNSAFE_BUN_WINDOWS_ENV = 'OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS';
+
+const hookFailures: Array<{ op: string; message: string; at: number }> = [];
 
 type BunWindowsSafetyDecision = {
   allowed: boolean;
@@ -100,6 +102,12 @@ async function runOptionalPluginWork<T>(
   try {
     return await work();
   } catch (error) {
+    hookFailures.push({
+      op: operation,
+      message: error instanceof Error ? error.message : String(error),
+      at: Date.now(),
+    });
+    if (hookFailures.length > 20) hookFailures.splice(0, hookFailures.length - 20);
     getLogger().warn('Optional LCM hook failed; continuing without archived context', {
       operation,
       message: error instanceof Error ? error.message : String(error),
@@ -112,10 +120,6 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
   const options = resolveOptions(rawOptions);
   const bunWindowsSafety = resolveBunWindowsSafety(options);
   const runtimeBackend = resolveRuntimeBackend(bunWindowsSafety);
-
-  if (runtimeBackend === 'disabled') {
-    return createSafeModeHooks(bunWindowsSafety);
-  }
 
   const store = createStore(ctx.directory, options, runtimeBackend);
 
@@ -197,6 +201,13 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
             `privacy_exclude_tool_prefixes=${options.privacy.excludeToolPrefixes.join(',')}`,
             `privacy_exclude_path_patterns=${options.privacy.excludePathPatterns.length}`,
             `privacy_redact_patterns=${options.privacy.redactPatterns.length}`,
+            `recent_hook_failures=${hookFailures.length}`,
+            ...hookFailures
+              .slice(-3)
+              .map(
+                (failure) =>
+                  `hook_failure=${failure.at} op=${failure.op} message=${failure.message.replace(/[\r\n]+/g, ' ')}`,
+              ),
             ...Object.entries(stats.prunableEventTypes)
               .sort((a, b) => b[1] - a[1])
               .slice(0, 10)
@@ -225,32 +236,38 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         args: {
           sessionID: tool.schema.string().optional(),
         },
-        async execute(args) {
-          return await store.resume(args.sessionID);
+        async execute(args, context) {
+          return await store.resume(args.sessionID ?? context.sessionID);
         },
       }),
 
       lcm_grep: tool({
-        description: 'Search archived LCM capture with scope',
+        description:
+          'Search archived LCM capture with scope. Paginate by repeating with offset = previous offset + limit.',
         args: {
           query: tool.schema.string().min(1),
           sessionID: tool.schema.string().optional(),
           scope: tool.schema.string().optional(),
           limit: tool.schema.number().int().min(1).max(20).optional(),
+          offset: tool.schema.number().int().min(0).max(200).optional(),
+          summaryID: tool.schema.string().optional(),
         },
-        async execute(args) {
+        async execute(args, context) {
           const results = await store.grep({
             query: args.query,
-            sessionID: args.sessionID,
+            sessionID: args.sessionID ?? context.sessionID,
             scope: args.scope,
             limit: args.limit ?? 5,
+            offset: args.offset,
+            summaryID: args.summaryID,
           });
+          if (typeof results === 'string') return results;
           if (results.length === 0) return 'No archived matches found.';
 
           return results
             .map((result) => {
-              const suffix = result.sessionID ? ` session=${result.sessionID}` : '';
-              return `[${result.type}]${suffix} ${result.snippet}`;
+              const session = result.sessionID ?? '-';
+              return `[${result.type}] session=${session} node=${result.nodeID ?? '-'} ${result.snippet}`;
             })
             .join('\n\n');
         },
@@ -262,9 +279,9 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           sessionID: tool.schema.string().optional(),
           scope: tool.schema.string().optional(),
         },
-        async execute(args) {
+        async execute(args, context) {
           return await store.describe({
-            sessionID: args.sessionID,
+            sessionID: args.sessionID ?? context.sessionID,
             scope: args.scope,
           });
         },
@@ -275,8 +292,8 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         args: {
           sessionID: tool.schema.string().optional(),
         },
-        async execute(args) {
-          return await store.lineage(args.sessionID);
+        async execute(args, context) {
+          return await store.lineage(args.sessionID ?? context.sessionID);
         },
       }),
 
@@ -286,9 +303,9 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           sessionID: tool.schema.string().optional(),
           reason: tool.schema.string().optional(),
         },
-        async execute(args) {
+        async execute(args, context) {
           return await store.pinSession({
-            sessionID: args.sessionID,
+            sessionID: args.sessionID ?? context.sessionID,
             reason: args.reason,
           });
         },
@@ -299,15 +316,16 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
         args: {
           sessionID: tool.schema.string().optional(),
         },
-        async execute(args) {
+        async execute(args, context) {
           return await store.unpinSession({
-            sessionID: args.sessionID,
+            sessionID: args.sessionID ?? context.sessionID,
           });
         },
       }),
 
       lcm_expand: tool({
-        description: 'Expand archived summary nodes into targeted descendants or raw messages',
+        description:
+          'Progressively expand archived summary nodes. Raw messages are excluded by default; pass includeRaw=true only when summaries are insufficient.',
         args: {
           sessionID: tool.schema.string().optional(),
           nodeID: tool.schema.string().optional(),
@@ -316,9 +334,9 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           messageLimit: tool.schema.number().int().min(1).max(20).optional(),
           includeRaw: tool.schema.boolean().optional(),
         },
-        async execute(args) {
+        async execute(args, context) {
           return await store.expand({
-            sessionID: args.sessionID,
+            sessionID: args.sessionID ?? context.sessionID,
             nodeID: args.nodeID,
             query: args.query,
             depth: args.depth,
@@ -463,9 +481,12 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
           worktreeMode: tool.schema.string().optional(),
         },
         async execute(args) {
+          if (args.mode !== 'merge' && args.mode !== 'replace') {
+            return 'Snapshot import mode is required; choose "merge" or "replace".';
+          }
           return await store.importSnapshot({
             filePath: args.filePath,
-            mode: args.mode === 'merge' ? 'merge' : 'replace',
+            mode: args.mode,
             worktreeMode:
               args.worktreeMode === 'preserve' || args.worktreeMode === 'current'
                 ? args.worktreeMode

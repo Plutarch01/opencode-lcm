@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `lcm_grep` offset pagination, summary-node scoping, and covering leaf-node annotations
+- Deterministic JSON, CSV/TSV, SQL, and code exploration summaries for text file artifacts
+- `lcm_status` recent hook-failure diagnostics and `lcm_doctor` managed resume-note drift repair
+- Message tombstones with explicit `[removed]` and `[pruned: <id>]` expansion markers
+
+### Changed
+- The default summary strategy is now `deterministic-v3`, which condenses internal nodes from child digests instead of repeatedly summarizing the full raw span
+- `lcm_expand` defaults to summary-only output; pass `includeRaw=true` for raw messages
+- Snapshot import now requires an explicit `merge` or `replace` mode and preserves tombstones
+- Interactive tools default to the invoking session; automatic recall uses FTS-only grep without substring scans
+- SQLite transactions begin with `BEGIN IMMEDIATE`; retention, blob GC, close, and compaction perform WAL checkpoints
+
+### Fixed
+- Artifact IDs are deterministic and remain stable across identical part updates and session rewrites
+- Snapshot imports validate referential closure and no longer overwrite existing content-addressed blobs
+- Binary preview providers use bounded reads, and artifact FTS content is capped at 16,384 characters
+- Deferred startup maintenance no longer blocks the first capture or prompt read
+- Bun-on-Windows sidecar capture coalesces streaming part updates before RPC
+- The headless OpenCode dogfood harness uses an async Windows launcher and a configurable five-minute timeout, avoiding `spawnSync` hangs during slow plugin startup
+
+### Removed
+- Unused `interop.contextMode` and `interop.neverOverrideCompactionPrompt` options
+- Dead retention SQL helpers that used blob creation time instead of `orphaned_at`
+
 ## [0.14.5] - 2026-07-26
 
 ### Added

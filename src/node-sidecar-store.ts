@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 import type { Event } from '@opencode-ai/sdk';
+import { DEFERRED_PART_UPDATE_DELAY_MS } from './constants.js';
 
 import type {
   ApplyLimitInput,
@@ -20,6 +21,8 @@ import type {
   RetentionInput,
   SessionIDInput,
 } from './lcm-store.js';
+import { getLogger } from './logging.js';
+import { getDeferredPartUpdateKey } from './store.js';
 import type { ConversationMessage, OpencodeLcmOptions, SearchResult, StoreStats } from './types.js';
 
 type SidecarResponse =
@@ -81,6 +84,9 @@ export class NodeSidecarLcmStore implements LcmStore {
   private restartBarrier: Promise<void> = Promise.resolve();
   private restartError?: Error;
   private terminatingChild?: ChildProcessWithoutNullStreams;
+  private readonly pendingPartUpdates = new Map<string, Event>();
+  private pendingPartUpdateTimer?: NodeJS.Timeout;
+  private pendingPartUpdateFlushPromise?: Promise<void>;
 
   constructor(
     private readonly projectDir: string,
@@ -96,6 +102,9 @@ export class NodeSidecarLcmStore implements LcmStore {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    this.clearPendingPartUpdateTimer();
+    if (this.pendingPartUpdateFlushPromise) await this.pendingPartUpdateFlushPromise;
+    if (this.pendingPartUpdates.size > 0) await this.flushPendingPartUpdates();
     this.closed = true;
     const child = this.child;
     this.rejectAll(new Error('opencode-lcm Node sidecar closed'));
@@ -125,6 +134,24 @@ export class NodeSidecarLcmStore implements LcmStore {
   }
 
   async captureDeferred(event: Event): Promise<void> {
+    const key = getDeferredPartUpdateKey(event);
+    if (key) {
+      this.pendingPartUpdates.set(key, event);
+      this.schedulePendingPartUpdateFlush();
+      return;
+    }
+
+    if (event.type === 'message.part.removed') {
+      this.pendingPartUpdates.delete(
+        `${event.properties.sessionID}:${event.properties.messageID}:${event.properties.partID}`,
+      );
+    } else if (event.type === 'message.removed') {
+      this.clearPendingPartUpdates(`${event.properties.sessionID}:${event.properties.messageID}:`);
+    } else if (event.type === 'session.deleted') {
+      const sessionID = event.properties.info.id;
+      this.clearPendingPartUpdates(`${sessionID}:`);
+    }
+
     await this.request('captureDeferred', event);
   }
 
@@ -140,8 +167,8 @@ export class NodeSidecarLcmStore implements LcmStore {
     return (await this.request('resume', sessionID)) as string;
   }
 
-  async grep(input: GrepInput): Promise<SearchResult[]> {
-    return (await this.request('grep', input)) as SearchResult[];
+  async grep(input: GrepInput): Promise<SearchResult[] | string> {
+    return (await this.request('grep', input)) as SearchResult[] | string;
   }
 
   async describe(input?: DescribeInput): Promise<string> {
@@ -214,6 +241,61 @@ export class NodeSidecarLcmStore implements LcmStore {
     return localSystemHint(this.options);
   }
 
+  private schedulePendingPartUpdateFlush(): void {
+    if (this.pendingPartUpdateTimer || this.pendingPartUpdates.size === 0) return;
+    this.pendingPartUpdateTimer = setTimeout(() => {
+      this.pendingPartUpdateTimer = undefined;
+      void this.flushPendingPartUpdates().catch((error) => {
+        getLogger().warn('Deferred sidecar part-update flush failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, DEFERRED_PART_UPDATE_DELAY_MS);
+    this.pendingPartUpdateTimer.unref?.();
+  }
+
+  private clearPendingPartUpdateTimer(): void {
+    if (!this.pendingPartUpdateTimer) return;
+    clearTimeout(this.pendingPartUpdateTimer);
+    this.pendingPartUpdateTimer = undefined;
+  }
+
+  private clearPendingPartUpdates(prefix: string): void {
+    for (const key of this.pendingPartUpdates.keys()) {
+      if (key.startsWith(prefix)) this.pendingPartUpdates.delete(key);
+    }
+    if (this.pendingPartUpdates.size === 0) this.clearPendingPartUpdateTimer();
+  }
+
+  private async flushPendingPartUpdates(): Promise<void> {
+    if (this.pendingPartUpdateFlushPromise) return this.pendingPartUpdateFlushPromise;
+    if (this.pendingPartUpdates.size === 0) return;
+    this.clearPendingPartUpdateTimer();
+    this.pendingPartUpdateFlushPromise = (async () => {
+      while (this.pendingPartUpdates.size > 0) {
+        const batch = [...this.pendingPartUpdates.values()];
+        this.pendingPartUpdates.clear();
+        for (const [index, event] of batch.entries()) {
+          try {
+            await this.request('captureImmediate', event);
+          } catch (error) {
+            for (const pendingEvent of batch.slice(index)) {
+              const key = getDeferredPartUpdateKey(pendingEvent);
+              if (key && !this.pendingPartUpdates.has(key)) {
+                this.pendingPartUpdates.set(key, pendingEvent);
+              }
+            }
+            throw error;
+          }
+        }
+      }
+    })().finally(() => {
+      this.pendingPartUpdateFlushPromise = undefined;
+      if (this.pendingPartUpdates.size > 0) this.schedulePendingPartUpdateFlush();
+    });
+    return this.pendingPartUpdateFlushPromise;
+  }
+
   private ensureStarted(): void {
     if (this.closed) throw new Error('opencode-lcm Node sidecar is closed');
     if (this.child) return;
@@ -252,6 +334,15 @@ export class NodeSidecarLcmStore implements LcmStore {
     params: unknown,
     timeoutMs: number = SIDECAR_REQUEST_TIMEOUT_MS,
   ): Promise<unknown> {
+    if (
+      method !== 'captureDeferred' &&
+      method !== 'captureImmediate' &&
+      method !== 'init' &&
+      method !== 'close'
+    ) {
+      if (this.pendingPartUpdateFlushPromise) await this.pendingPartUpdateFlushPromise;
+      if (this.pendingPartUpdates.size > 0) await this.flushPendingPartUpdates();
+    }
     await this.restartBarrier;
     if (this.restartError) throw this.restartError;
     this.ensureStarted();

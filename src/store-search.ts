@@ -1,3 +1,4 @@
+import { TFIDF_MIN_CORPUS_DOCS } from './constants.js';
 import { getLogger } from './logging.js';
 import { rankSearchCandidates, type SearchCandidate } from './search-ranking.js';
 import type { ArtifactRow, SummaryNodeRow } from './store-snapshot.js';
@@ -16,6 +17,11 @@ type FtsDeps = {
     message: NormalizedSession['messages'][number],
     ignorePrefixes: string[],
   ): string;
+};
+
+type SearchWithin = {
+  messageIDs?: string[];
+  summaryNodeIDs?: string[];
 };
 
 function deleteScopedFtsRows(
@@ -70,56 +76,68 @@ function getTotalDocCount(db: SqlDatabaseLike): number {
 export function computeTfidfWeights(
   db: SqlDatabaseLike,
   candidateTokens: string[],
-): Array<{ token: string; idf: number; docFreq: number }> {
-  if (candidateTokens.length === 0) return [];
-
+  docFreqCache?: Map<string, { docFreq: number; at: number }>,
+): {
+  weights: Array<{ token: string; idf: number; docFreq: number }>;
+  totalDocs: number;
+} {
   const totalDocs = getTotalDocCount(db);
+  if (candidateTokens.length === 0) return { weights: [], totalDocs };
 
   const results: Array<{ token: string; idf: number; docFreq: number }> = [];
+  const now = Date.now();
 
   for (const token of candidateTokens) {
-    // Query document frequency across all FTS tables
-    // FTS5 MATCH 'token*' finds all documents containing terms with this prefix
-    const query = `${token}*`;
-    let docFreq = 0;
+    const cached = docFreqCache?.get(token);
+    let docFreq = cached && now - cached.at < 5 * 60_000 ? cached.docFreq : 0;
 
-    try {
-      const msgFreq = db
-        .prepare('SELECT COUNT(*) AS count FROM message_fts WHERE message_fts MATCH ?')
-        .get(query) as { count: number } | undefined;
-      docFreq += msgFreq?.count ?? 0;
-    } catch (error) {
-      getLogger().debug('TF-IDF message_fts query failed for token', { token, error });
+    if (!cached || now - cached.at >= 5 * 60_000) {
+      const query = `${token}*`;
+
+      try {
+        const msgFreq = db
+          .prepare('SELECT COUNT(*) AS count FROM message_fts WHERE message_fts MATCH ?')
+          .get(query) as { count: number } | undefined;
+        docFreq += msgFreq?.count ?? 0;
+      } catch (error) {
+        getLogger().debug('TF-IDF message_fts query failed for token', { token, error });
+      }
+
+      try {
+        const sumFreq = db
+          .prepare('SELECT COUNT(*) AS count FROM summary_fts WHERE summary_fts MATCH ?')
+          .get(query) as { count: number } | undefined;
+        docFreq += sumFreq?.count ?? 0;
+      } catch (error) {
+        getLogger().debug('TF-IDF summary_fts query failed for token', { token, error });
+      }
+
+      try {
+        const artFreq = db
+          .prepare('SELECT COUNT(*) AS count FROM artifact_fts WHERE artifact_fts MATCH ?')
+          .get(query) as { count: number } | undefined;
+        docFreq += artFreq?.count ?? 0;
+      } catch (error) {
+        getLogger().debug('TF-IDF artifact_fts query failed for token', { token, error });
+      }
+
+      if (docFreqCache) {
+        docFreqCache.delete(token);
+        docFreqCache.set(token, { docFreq, at: now });
+        while (docFreqCache.size > 512) {
+          const oldest = docFreqCache.keys().next().value;
+          if (oldest === undefined) break;
+          docFreqCache.delete(oldest);
+        }
+      }
     }
 
-    try {
-      const sumFreq = db
-        .prepare('SELECT COUNT(*) AS count FROM summary_fts WHERE summary_fts MATCH ?')
-        .get(query) as { count: number } | undefined;
-      docFreq += sumFreq?.count ?? 0;
-    } catch (error) {
-      getLogger().debug('TF-IDF summary_fts query failed for token', { token, error });
-    }
-
-    try {
-      const artFreq = db
-        .prepare('SELECT COUNT(*) AS count FROM artifact_fts WHERE artifact_fts MATCH ?')
-        .get(query) as { count: number } | undefined;
-      docFreq += artFreq?.count ?? 0;
-    } catch (error) {
-      getLogger().debug('TF-IDF artifact_fts query failed for token', { token, error });
-    }
-
-    // Smoothed IDF: log(N / (df + 1)) + 1
-    // Smoothing prevents division by zero and ensures non-zero weights
     const idf = Math.log(totalDocs / (docFreq + 1)) + 1;
     results.push({ token, idf, docFreq });
   }
 
-  // Sort by descending IDF — most informative tokens first
   results.sort((a, b) => b.idf - a.idf);
-
-  return results;
+  return { weights: results, totalDocs };
 }
 
 /**
@@ -131,15 +149,16 @@ export function computeTfidfWeights(
 export function filterTokensByTfidf(
   db: SqlDatabaseLike,
   candidateTokens: string[],
-  options?: { maxCommonRatio?: number; minTokens?: number },
+  options?: {
+    maxCommonRatio?: number;
+    minTokens?: number;
+    docFreqCache?: Map<string, { docFreq: number; at: number }>;
+  },
 ): string[] {
   const { maxCommonRatio = 0.8, minTokens = 1 } = options ?? {};
 
-  const weights = computeTfidfWeights(db, candidateTokens);
-  if (weights.length === 0) return candidateTokens;
-
-  // Get total docs for common-ratio threshold (already computed inside computeTfidfWeights, but needed here for ratio)
-  const totalDocs = getTotalDocCount(db);
+  const { weights, totalDocs } = computeTfidfWeights(db, candidateTokens, options?.docFreqCache);
+  if (weights.length === 0 || totalDocs < TFIDF_MIN_CORPUS_DOCS) return candidateTokens;
 
   // Compute median IDF
   const sortedIdfs = weights.map((w) => w.idf).sort((a, b) => a - b);
@@ -168,6 +187,7 @@ export function searchWithFts(
   query: string,
   sessionIDs?: string[],
   limit = 5,
+  within?: SearchWithin,
 ): SearchResult[] {
   const ftsQuery = buildFtsQuery(query);
   if (!ftsQuery) return [];
@@ -183,17 +203,28 @@ export function searchWithFts(
         params: ids,
       };
     };
+    const buildEntityClause = (column: string, ids: string[] | undefined) => {
+      if (!ids) return { clause: '', params: [] as string[] };
+      if (ids.length === 0) return { clause: '0 AND ', params: [] as string[] };
+      return {
+        clause: `${column} IN (${ids.map(() => '?').join(', ')}) AND `,
+        params: ids,
+      };
+    };
     const scope = buildScopeClause(sessionIDs);
+    const messageFilter = buildEntityClause('message_id', within?.messageIDs);
+    const summaryFilter = buildEntityClause('node_id', within?.summaryNodeIDs);
+    const artifactFilter = buildEntityClause('message_id', within?.messageIDs);
 
     const messageRows = db
       .prepare(
         `SELECT message_id, session_id, role, created_at, content, snippet(message_fts, 4, '[', ']', '...', 12) AS snippet, bm25(message_fts) AS rank
          FROM message_fts
-         WHERE ${scope.clause}message_fts MATCH ?
+         WHERE ${scope.clause}${messageFilter.clause}message_fts MATCH ?
          ORDER BY rank, created_at DESC
          LIMIT ?`,
       )
-      .all(...scope.params, ftsQuery, fetchLimit) as Array<{
+      .all(...scope.params, ...messageFilter.params, ftsQuery, fetchLimit) as Array<{
       message_id: string;
       session_id: string;
       role: string;
@@ -207,11 +238,11 @@ export function searchWithFts(
       .prepare(
         `SELECT node_id, session_id, created_at, content, snippet(summary_fts, 4, '[', ']', '...', 14) AS snippet, bm25(summary_fts) AS rank
          FROM summary_fts
-         WHERE ${scope.clause}summary_fts MATCH ?
+         WHERE ${scope.clause}${summaryFilter.clause}summary_fts MATCH ?
          ORDER BY rank, created_at DESC
          LIMIT ?`,
       )
-      .all(...scope.params, ftsQuery, fetchLimit) as Array<{
+      .all(...scope.params, ...summaryFilter.params, ftsQuery, fetchLimit) as Array<{
       node_id: string;
       session_id: string;
       created_at: string | number;
@@ -224,11 +255,11 @@ export function searchWithFts(
       .prepare(
         `SELECT artifact_id, session_id, artifact_kind, created_at, content, snippet(artifact_fts, 6, '[', ']', '...', 14) AS snippet, bm25(artifact_fts) AS rank
          FROM artifact_fts
-         WHERE ${scope.clause}artifact_fts MATCH ?
+         WHERE ${scope.clause}${artifactFilter.clause}artifact_fts MATCH ?
          ORDER BY rank, created_at DESC
          LIMIT ?`,
       )
-      .all(...scope.params, ftsQuery, fetchLimit) as Array<{
+      .all(...scope.params, ...artifactFilter.params, ftsQuery, fetchLimit) as Array<{
       artifact_id: string;
       session_id: string;
       artifact_kind: string;
@@ -283,12 +314,16 @@ export function searchByScan(
   query: string,
   sessionIDs?: string[],
   limit = 5,
+  within?: SearchWithin,
 ): SearchResult[] {
   const sessions = deps.readScopedSessionsSync(sessionIDs);
+  const messageIDs = within?.messageIDs ? new Set(within.messageIDs) : undefined;
+  const summaryNodeIDs = within?.summaryNodeIDs ? new Set(within.summaryNodeIDs) : undefined;
   const candidates: SearchCandidate[] = [];
 
   for (const session of sessions) {
     for (const [index, message] of session.messages.entries()) {
+      if (messageIDs && !messageIDs.has(message.info.id)) continue;
       const blob = deps.guessMessageText(message, deps.ignoreToolPrefixes);
       if (!blob.toLowerCase().includes(query)) continue;
 
@@ -308,6 +343,7 @@ export function searchByScan(
   const summaryRows = deps.readScopedSummaryRowsSync(sessionIDs);
 
   summaryRows.forEach((row, index) => {
+    if (summaryNodeIDs && !summaryNodeIDs.has(row.node_id)) return;
     if (!row.summary_text.toLowerCase().includes(query)) return;
     candidates.push({
       id: row.node_id,
@@ -324,6 +360,7 @@ export function searchByScan(
   const artifactRows = deps.readScopedArtifactRowsSync(sessionIDs);
 
   for (const [index, row] of artifactRows.entries()) {
+    if (messageIDs && !messageIDs.has(row.message_id)) continue;
     const haystack = `${row.preview_text}\n${row.content_text}`.toLowerCase();
     if (!haystack.includes(query)) continue;
 

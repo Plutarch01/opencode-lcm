@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { type FileHandle, open, stat } from 'node:fs/promises';
 
 import type { Part } from '@opencode-ai/sdk';
 
@@ -38,7 +38,10 @@ type Provider = {
 
 type ProviderHelpers = {
   resolvePath(): string | undefined;
-  readBytes(): Buffer | undefined;
+  fileSize(): number | undefined;
+  readWholeBytes(): Buffer | undefined;
+  readPrefixBytes(): Buffer | undefined;
+  readSuffixBytes(): Buffer | undefined;
 };
 
 function inferLocalPath(workspaceDirectory: string, file: FilePart): string | undefined {
@@ -119,20 +122,13 @@ function estimateZipEntries(buffer: Buffer): number | undefined {
 
   const localFileHeaderSignature = 0x04034b50;
   const endOfCentralDirectorySignature = 0x06054b50;
-  const firstSignature = buffer.readUInt32LE(0);
-  if (
-    firstSignature !== localFileHeaderSignature &&
-    firstSignature !== endOfCentralDirectorySignature
-  ) {
-    return undefined;
-  }
-
   const searchStart = Math.max(0, buffer.length - 65557);
   for (let offset = buffer.length - 22; offset >= searchStart; offset -= 1) {
     if (buffer.readUInt32LE(offset) !== endOfCentralDirectorySignature) continue;
     return buffer.readUInt16LE(offset + 10);
   }
 
+  if (buffer.readUInt32LE(0) !== localFileHeaderSignature) return undefined;
   let entries = 0;
   for (let offset = 0; offset <= buffer.length - 4; offset += 1) {
     if (buffer.readUInt32LE(offset) === localFileHeaderSignature) entries += 1;
@@ -144,11 +140,21 @@ const fingerprintProvider: Provider = {
   name: 'fingerprint',
   apply(_context, helpers) {
     const filePath = helpers.resolvePath();
-    const bytes = helpers.readBytes();
-    if (!filePath || !bytes) return { metadata: {}, lines: [], summaryBits: [] };
+    const sizeBytes = helpers.fileSize();
+    if (!filePath || sizeBytes === undefined) {
+      return { metadata: {}, lines: [], summaryBits: [] };
+    }
+    if (sizeBytes > 32 * 1024 * 1024) {
+      return {
+        metadata: { fingerprint: 'skipped-large-file', previewSizeBytes: sizeBytes },
+        lines: ['Fingerprint: skipped large file'],
+        summaryBits: [`${sizeBytes} bytes`],
+      };
+    }
+    const bytes = helpers.readWholeBytes();
+    if (!bytes) return { metadata: {}, lines: [], summaryBits: [] };
 
     const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const sizeBytes = bytes.length;
     return {
       metadata: {
         previewLocalPath: filePath,
@@ -164,7 +170,7 @@ const fingerprintProvider: Provider = {
 const bytePeekProvider: Provider = {
   name: 'byte-peek',
   apply(context, helpers) {
-    const bytes = helpers.readBytes();
+    const bytes = helpers.readPrefixBytes();
     const preview = bytes ? toHexPreview(bytes, context.bytePeek) : undefined;
     if (!preview) return { metadata: {}, lines: [], summaryBits: [] };
 
@@ -182,7 +188,7 @@ const imageDimensionsProvider: Provider = {
   name: 'image-dimensions',
   apply(context, helpers) {
     if (context.category !== 'image') return { metadata: {}, lines: [], summaryBits: [] };
-    const bytes = helpers.readBytes();
+    const bytes = helpers.readPrefixBytes();
     if (!bytes) return { metadata: {}, lines: [], summaryBits: [] };
 
     const dimensions =
@@ -204,7 +210,10 @@ const pdfMetadataProvider: Provider = {
   name: 'pdf-metadata',
   apply(context, helpers) {
     if (context.category !== 'pdf') return { metadata: {}, lines: [], summaryBits: [] };
-    const bytes = helpers.readBytes();
+    if ((helpers.fileSize() ?? Number.POSITIVE_INFINITY) > 8 * 1024 * 1024) {
+      return { metadata: {}, lines: [], summaryBits: [] };
+    }
+    const bytes = helpers.readWholeBytes();
     if (!bytes) return { metadata: {}, lines: [], summaryBits: [] };
     const pageEstimate = estimatePdfPages(bytes);
     if (!pageEstimate) return { metadata: {}, lines: [], summaryBits: [] };
@@ -222,7 +231,7 @@ const pdfMetadataProvider: Provider = {
 const zipMetadataProvider: Provider = {
   name: 'zip-metadata',
   apply(_context, helpers) {
-    const bytes = helpers.readBytes();
+    const bytes = helpers.readSuffixBytes();
     if (!bytes) return { metadata: {}, lines: [], summaryBits: [] };
     const entryCount = estimateZipEntries(bytes);
     if (entryCount === undefined) return { metadata: {}, lines: [], summaryBits: [] };
@@ -245,30 +254,76 @@ const PROVIDERS: Provider[] = [
   zipMetadataProvider,
 ];
 
+async function readRange(file: FileHandle, length: number, position: number): Promise<Buffer> {
+  const buffer = Buffer.alloc(Math.max(0, length));
+  let offset = 0;
+  while (offset < buffer.length) {
+    const result = await file.read(buffer, offset, buffer.length - offset, position + offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  return offset === buffer.length ? buffer : buffer.subarray(0, offset);
+}
+
 export async function runBinaryPreviewProviders(context: PreviewContext): Promise<PreviewOutput> {
   const localPath = inferLocalPath(context.workspaceDirectory, context.file);
+  const enabled = new Set(context.enabledProviders);
   let resolvedPath: string | undefined;
-  let resolvedBytes: Buffer | undefined;
+  let resolvedSize: number | undefined;
+  let wholeBytes: Buffer | undefined;
+  let prefixBytes: Buffer | undefined;
+  let suffixBytes: Buffer | undefined;
 
   if (localPath) {
+    let file: FileHandle | undefined;
     try {
-      resolvedBytes = await readFile(localPath);
-      resolvedPath = localPath;
+      const fileStats = await stat(localPath);
+      if (fileStats.isFile()) {
+        resolvedPath = localPath;
+        resolvedSize = fileStats.size;
+        file = await open(localPath, 'r');
+
+        const needsWhole =
+          (enabled.has('fingerprint') && resolvedSize <= 32 * 1024 * 1024) ||
+          (enabled.has('pdf-metadata') &&
+            context.category === 'pdf' &&
+            resolvedSize <= 8 * 1024 * 1024);
+        if (needsWhole) wholeBytes = await readRange(file, resolvedSize, 0);
+
+        const prefixLength = enabled.has('image-dimensions')
+          ? Math.min(resolvedSize, 65_536)
+          : enabled.has('byte-peek')
+            ? Math.min(resolvedSize, 16)
+            : 0;
+        if (prefixLength > 0) {
+          prefixBytes =
+            wholeBytes?.subarray(0, prefixLength) ?? (await readRange(file, prefixLength, 0));
+        }
+
+        if (enabled.has('zip-metadata')) {
+          const suffixLength = Math.min(resolvedSize, 131_072);
+          suffixBytes =
+            wholeBytes?.subarray(resolvedSize - suffixLength) ??
+            (await readRange(file, suffixLength, resolvedSize - suffixLength));
+        }
+      }
     } catch (error) {
-      getLogger().debug('Failed to read file bytes for preview', { filePath: localPath, error });
+      getLogger().debug('Failed to read bounded file bytes for preview', {
+        filePath: localPath,
+        error,
+      });
+    } finally {
+      await file?.close();
     }
   }
 
   const helpers: ProviderHelpers = {
-    resolvePath() {
-      return resolvedPath;
-    },
-    readBytes() {
-      return resolvedBytes;
-    },
+    resolvePath: () => resolvedPath,
+    fileSize: () => resolvedSize,
+    readWholeBytes: () => wholeBytes,
+    readPrefixBytes: () => prefixBytes,
+    readSuffixBytes: () => suffixBytes,
   };
-
-  const enabled = new Set(context.enabledProviders);
   const outputs = PROVIDERS.filter((provider) => enabled.has(provider.name)).map((provider) => ({
     name: provider.name,
     output: provider.apply(context, helpers),
@@ -290,9 +345,5 @@ export async function runBinaryPreviewProviders(context: PreviewContext): Promis
     summaryBits.push(...entry.output.summaryBits);
   }
 
-  return {
-    metadata,
-    lines,
-    summaryBits,
-  };
+  return { metadata, lines, summaryBits };
 }

@@ -620,3 +620,53 @@ test('snapshot merge import rejects colliding session IDs', async () => {
     await cleanupWorkspace(targetWorkspace);
   }
 });
+
+test('snapshot import rejects unknown artifact blobs before changing the store', async () => {
+  const sourceWorkspace = makeWorkspace('lcm-closure-src');
+  const targetWorkspace = makeWorkspace('lcm-closure-dst');
+  const snapshotPath = path.join(sourceWorkspace, 'invalid-closure.json');
+  let source;
+  let target;
+
+  try {
+    source = new SqliteLcmStore(sourceWorkspace, makeOptions({ largeContentThreshold: 20 }));
+    await source.init();
+    await createSession(source, sourceWorkspace, 'source-session', 1);
+    await captureMessage(source, {
+      sessionID: 'source-session',
+      messageID: 'source-message',
+      created: 2,
+      parts: [
+        textPart(
+          'source-session',
+          'source-message',
+          'source-part',
+          'snapshot artifact body '.repeat(20),
+        ),
+      ],
+    });
+    await source.exportSnapshot({ filePath: snapshotPath, scope: 'all' });
+    const payload = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+    payload.artifacts[0].content_hash = 'missing-content-hash';
+    payload.artifact_blobs = [];
+    writeFileSync(snapshotPath, JSON.stringify(payload), 'utf8');
+
+    target = new SqliteLcmStore(targetWorkspace, makeOptions());
+    await target.init();
+    await createSession(target, targetWorkspace, 'existing-session', 3);
+    const before = await target.stats();
+
+    await assert.rejects(
+      target.importSnapshot({ filePath: snapshotPath, mode: 'merge' }),
+      /missing-content-hash/,
+    );
+    const after = await target.stats();
+    assert.equal(after.sessionCount, before.sessionCount);
+    assert.equal(after.artifactCount, before.artifactCount);
+  } finally {
+    await source?.close();
+    await target?.close();
+    await cleanupWorkspace(sourceWorkspace);
+    await cleanupWorkspace(targetWorkspace);
+  }
+});

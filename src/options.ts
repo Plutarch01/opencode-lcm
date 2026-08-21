@@ -15,8 +15,6 @@ import type {
 } from './types.js';
 
 const DEFAULT_INTEROP: InteropOptions = {
-  contextMode: true,
-  neverOverrideCompactionPrompt: true,
   ignoreToolPrefixes: ['ctx_'],
 };
 
@@ -58,7 +56,7 @@ const DEFAULT_AUTOMATIC_RETRIEVAL: AutomaticRetrievalOptions = {
 };
 
 export const DEFAULT_SUMMARY_V2: SummaryV2Options = {
-  strategy: 'deterministic-v2',
+  strategy: 'deterministic-v3',
   perMessageBudget: 110,
 };
 
@@ -253,7 +251,11 @@ function asAutomaticRetrievalStopOptions(
 }
 
 function asSummaryStrategy(value: unknown, fallback: SummaryStrategyName): SummaryStrategyName {
-  return value === 'deterministic-v1' || value === 'deterministic-v2' ? value : fallback;
+  return value === 'deterministic-v1' ||
+    value === 'deterministic-v2' ||
+    value === 'deterministic-v3'
+    ? value
+    : fallback;
 }
 
 function asSummaryV2Options(value: unknown, fallback: SummaryV2Options): SummaryV2Options {
@@ -281,11 +283,6 @@ export function resolveOptions(raw: unknown): OpencodeLcmOptions {
 
   return {
     interop: {
-      contextMode: asBoolean(interop?.contextMode, DEFAULT_INTEROP.contextMode),
-      neverOverrideCompactionPrompt: asBoolean(
-        interop?.neverOverrideCompactionPrompt,
-        DEFAULT_INTEROP.neverOverrideCompactionPrompt,
-      ),
       ignoreToolPrefixes: asStringArray(
         interop?.ignoreToolPrefixes,
         DEFAULT_INTEROP.ignoreToolPrefixes,
