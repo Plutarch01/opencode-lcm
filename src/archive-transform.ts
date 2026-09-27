@@ -84,7 +84,12 @@ export function selectAutomaticRetrievalHits(input: {
   quotas: AutomaticRetrievalQuotas;
   isFreshResult: (result: SearchResult, freshMessageIDs: Set<string>) => boolean;
 }): AutomaticRetrievalHit[] {
-  const freshMessageIDs = new Set(input.recent.map((message) => message.info.id));
+  const freshMessageIDs = new Set(
+    input.recent.flatMap((message) => {
+      const id = message.info.id;
+      return typeof id === 'string' ? [id] : [];
+    }),
+  );
   const quotas = { ...input.quotas };
   // With few tokens each one is critical — require at least 2 token matches when possible
   const minSnippetMatches = input.tokens.length >= 2 ? 2 : 1;

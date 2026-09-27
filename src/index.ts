@@ -1,12 +1,11 @@
-import { type Hooks, type PluginInput, tool } from '@opencode-ai/plugin';
-import type { LcmStore } from './lcm-store.js';
+import { Plugin } from '@opencode/plugin';
+import type { Event as LcmEvent, LcmStore, Properties } from './lcm-store.js';
 import { getLogger } from './logging.js';
 import { NodeSidecarLcmStore } from './node-sidecar-store.js';
 import { resolveOptions } from './options.js';
 import { SqliteLcmStore } from './store.js';
-import type { OpencodeLcmOptions } from './types.js';
+import type { Message, OpencodeLcmOptions, Part, SearchResult } from './types.js';
 
-type PluginWithOptions = (ctx: PluginInput, rawOptions?: unknown) => Promise<Hooks>;
 type RuntimeBackend = 'in_process' | 'node_sidecar';
 
 const ALLOW_UNSAFE_BUN_WINDOWS_ENV = 'OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS';
@@ -61,26 +60,6 @@ function buildSafeModeStatus(decision: BunWindowsSafetyDecision): string {
   ].join('\n');
 }
 
-function createSafeModeHooks(decision: BunWindowsSafetyDecision): Hooks {
-  return {
-    event: async () => {},
-
-    tool: {
-      lcm_status: tool({
-        description: 'Show archived LCM capture stats',
-        args: {},
-        async execute() {
-          return buildSafeModeStatus(decision);
-        },
-      }),
-    },
-
-    'experimental.chat.messages.transform': async () => {},
-    'experimental.chat.system.transform': async () => {},
-    'experimental.session.compacting': async () => {},
-  };
-}
-
 function resolveRuntimeBackend(decision: BunWindowsSafetyDecision): RuntimeBackend {
   if (!isUnsafeBunWindowsRuntime()) return 'in_process';
   return decision.allowed ? 'in_process' : 'node_sidecar';
@@ -116,30 +95,65 @@ async function runOptionalPluginWork<T>(
   }
 }
 
-export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
-  const options = resolveOptions(rawOptions);
-  const bunWindowsSafety = resolveBunWindowsSafety(options);
-  const runtimeBackend = resolveRuntimeBackend(bunWindowsSafety);
+export default Plugin.define({
+  id: 'opencode-lcm',
+  async setup(ctx) {
+    const options = resolveOptions(ctx.options);
+    const bunWindowsSafety = resolveBunWindowsSafety(options);
+    const runtimeBackend = resolveRuntimeBackend(bunWindowsSafety);
 
-  const store = createStore(ctx.directory, options, runtimeBackend);
+    const store = createStore(ctx.location.directory, options, runtimeBackend);
 
-  try {
-    await store.init();
-  } catch (_error) {
-    await store.close();
-    if (runtimeBackend === 'node_sidecar') return createSafeModeHooks(bunWindowsSafety);
-    throw _error;
-  }
+    try {
+      await store.init();
+    } catch (_error) {
+      await store.close();
+      if (runtimeBackend === 'node_sidecar') {
+        // Register safe-mode tool when store init fails
+        await ctx.tool.transform((editor) => {
+          editor.add({
+            name: 'lcm_status',
+            description: 'Show archived LCM capture stats',
+            input: {
+              type: 'object',
+              additionalProperties: false,
+            },
+            async execute() {
+              return { content: buildSafeModeStatus(bunWindowsSafety) };
+            },
+          });
+        });
+        return;
+      }
+      throw _error;
+    }
 
-  return {
-    event: async ({ event }) => {
-      await runOptionalPluginWork('event.capture', () => store.captureDeferred(event));
-    },
+    // Event subscription — captures deferred events into the archive
+    const controller = new AbortController();
 
-    tool: {
-      lcm_status: tool({
+    void (async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        const detail = (event as unknown as { detail?: unknown }).detail as Properties | undefined;
+        const lcmEvent: LcmEvent = {
+          type: event.type,
+          properties: detail ?? { part: {} as Part, info: {} as Message },
+          sessionID: detail?.sessionID as string | undefined,
+          timestamp: detail?.timestamp as number | undefined,
+          payload: detail?.payload,
+        };
+        await runOptionalPluginWork('event.capture', () => store.captureDeferred(lcmEvent));
+      }
+    })();
+
+    // Register all 18 custom tools via tool.transform
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: 'lcm_status',
         description: 'Show archived LCM capture stats',
-        args: {},
+        input: {
+          type: 'object',
+          additionalProperties: false,
+        },
         async execute() {
           const stats = await store.stats();
           const lines = [
@@ -176,7 +190,7 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
                   `recovery_at=${stats.recovery.at}`,
                   `recovery_reason=${stats.recovery.reason.replace(/[\r\n]+/g, ' ')}`,
                   `recovery_quarantined_files=${stats.recovery.quarantinedFiles.length}`,
-                  ...stats.recovery.quarantinedFiles.map((file) => `recovery_file=${file}`),
+                  ...stats.recovery.quarantinedFiles.map((file: string) => `recovery_file=${file}`),
                 ]
               : ['recovery=none']),
             `automatic_retrieval_enabled=${options.automaticRetrieval.enabled}`,
@@ -208,315 +222,463 @@ export const OpencodeLcmPlugin: PluginWithOptions = async (ctx, rawOptions) => {
                 (failure) =>
                   `hook_failure=${failure.at} op=${failure.op} message=${failure.message.replace(/[\r\n]+/g, ' ')}`,
               ),
-            ...Object.entries(stats.prunableEventTypes)
+            ...Object.entries(stats.prunableEventTypes as Record<string, number>)
               .sort((a, b) => b[1] - a[1])
               .slice(0, 10)
               .map(([type, count]) => `prunable_${type}=${count}`),
-            ...Object.entries(stats.eventTypes)
+            ...Object.entries(stats.eventTypes as Record<string, number>)
               .sort((a, b) => b[1] - a[1])
               .slice(0, 10)
               .map(([type, count]) => `${type}=${count}`),
           ];
-          return lines.join('\n');
+          return { content: lines.join('\n') };
         },
-      }),
+      });
 
-      lcm_retrieval_debug: tool({
+      editor.add({
+        name: 'lcm_retrieval_debug',
         description: 'Show latest automatic retrieval diagnostics',
-        args: {
-          sessionID: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.automaticRetrievalDebug(args.sessionID ?? context.sessionID);
+        async execute(input) {
+          const sessionID = (input as { sessionID?: string }).sessionID;
+          return { content: await store.automaticRetrievalDebug(sessionID) };
         },
-      }),
+      });
 
-      lcm_resume: tool({
+      editor.add({
+        name: 'lcm_resume',
         description: 'Show the latest archived resume note',
-        args: {
-          sessionID: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.resume(args.sessionID ?? context.sessionID);
+        async execute(input) {
+          const sessionID = (input as { sessionID?: string }).sessionID;
+          return { content: await store.resume(sessionID) };
         },
-      }),
+      });
 
-      lcm_grep: tool({
+      editor.add({
+        name: 'lcm_grep',
         description:
           'Search archived LCM capture with scope. Paginate by repeating with offset = previous offset + limit.',
-        args: {
-          query: tool.schema.string().min(1),
-          sessionID: tool.schema.string().optional(),
-          scope: tool.schema.string().optional(),
-          limit: tool.schema.number().int().min(1).max(20).optional(),
-          offset: tool.schema.number().int().min(0).max(200).optional(),
-          summaryID: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', minLength: 1 },
+            sessionID: { type: 'string' },
+            scope: { type: 'string' },
+            limit: { type: 'integer', minimum: 1, maximum: 20 },
+            offset: { type: 'integer', minimum: 0, maximum: 200 },
+            summaryID: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        async execute(input) {
+          const typedInput = input as {
+            query: string;
+            sessionID?: string;
+            scope?: string;
+            limit?: number;
+            offset?: number;
+            summaryID?: string;
+          };
           const results = await store.grep({
-            query: args.query,
-            sessionID: args.sessionID ?? context.sessionID,
-            scope: args.scope,
-            limit: args.limit ?? 5,
-            offset: args.offset,
-            summaryID: args.summaryID,
+            query: typedInput.query,
+            sessionID: typedInput.sessionID,
+            scope: typedInput.scope,
+            limit: typedInput.limit ?? 5,
+            offset: typedInput.offset,
+            summaryID: typedInput.summaryID,
           });
-          if (typeof results === 'string') return results;
-          if (results.length === 0) return 'No archived matches found.';
+          if (typeof results === 'string') return { content: results };
+          if (results.length === 0) return { content: 'No archived matches found.' };
 
-          return results
-            .map((result) => {
-              const session = result.sessionID ?? '-';
-              return `[${result.type}] session=${session} node=${result.nodeID ?? '-'} ${result.snippet}`;
-            })
-            .join('\n\n');
+          return {
+            content: results
+              .map((result: SearchResult) => {
+                const session = result.sessionID ?? '-';
+                return `[${result.type}] session=${session} node=${result.nodeID ?? '-'} ${result.snippet}`;
+              })
+              .join('\n\n'),
+          };
         },
-      }),
+      });
 
-      lcm_describe: tool({
+      editor.add({
+        name: 'lcm_describe',
         description: 'Summarize archived session capture with scope',
-        args: {
-          sessionID: tool.schema.string().optional(),
-          scope: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+            scope: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.describe({
-            sessionID: args.sessionID ?? context.sessionID,
-            scope: args.scope,
-          });
+        async execute(input) {
+          const typedInput = input as { sessionID?: string; scope?: string };
+          return { content: await store.describe({
+            sessionID: typedInput.sessionID,
+            scope: typedInput.scope,
+          })};
         },
-      }),
+      });
 
-      lcm_lineage: tool({
+      editor.add({
+        name: 'lcm_lineage',
         description: 'Show archived branch lineage for a session',
-        args: {
-          sessionID: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.lineage(args.sessionID ?? context.sessionID);
+        async execute(input) {
+          const sessionID = (input as { sessionID?: string }).sessionID;
+          return { content: await store.lineage(sessionID) };
         },
-      }),
+      });
 
-      lcm_pin_session: tool({
+      editor.add({
+        name: 'lcm_pin_session',
         description: 'Pin a session so retention pruning will skip it',
-        args: {
-          sessionID: tool.schema.string().optional(),
-          reason: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+            reason: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.pinSession({
-            sessionID: args.sessionID ?? context.sessionID,
-            reason: args.reason,
-          });
+        async execute(input) {
+          const typedInput = input as { sessionID?: string; reason?: string };
+          return { content: await store.pinSession({
+            sessionID: typedInput.sessionID,
+            reason: typedInput.reason,
+          })};
         },
-      }),
+      });
 
-      lcm_unpin_session: tool({
+      editor.add({
+        name: 'lcm_unpin_session',
         description: 'Remove a session retention pin',
-        args: {
-          sessionID: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.unpinSession({
-            sessionID: args.sessionID ?? context.sessionID,
-          });
+        async execute(input) {
+          const sessionID = (input as { sessionID?: string }).sessionID;
+          return { content: await store.unpinSession({ sessionID }) };
         },
-      }),
+      });
 
-      lcm_expand: tool({
+      editor.add({
+        name: 'lcm_expand',
         description:
           'Progressively expand archived summary nodes. Raw messages are excluded by default; pass includeRaw=true only when summaries are insufficient.',
-        args: {
-          sessionID: tool.schema.string().optional(),
-          nodeID: tool.schema.string().optional(),
-          query: tool.schema.string().optional(),
-          depth: tool.schema.number().int().min(1).max(4).optional(),
-          messageLimit: tool.schema.number().int().min(1).max(20).optional(),
-          includeRaw: tool.schema.boolean().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+            nodeID: { type: 'string' },
+            query: { type: 'string' },
+            depth: { type: 'integer', minimum: 1, maximum: 4 },
+            messageLimit: { type: 'integer', minimum: 1, maximum: 20 },
+            includeRaw: { type: 'boolean' },
+          },
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return await store.expand({
-            sessionID: args.sessionID ?? context.sessionID,
-            nodeID: args.nodeID,
-            query: args.query,
-            depth: args.depth,
-            messageLimit: args.messageLimit,
-            includeRaw: args.includeRaw,
-          });
+        async execute(input) {
+          const typedInput = input as {
+            sessionID?: string;
+            nodeID?: string;
+            query?: string;
+            depth?: number;
+            messageLimit?: number;
+            includeRaw?: boolean;
+          };
+          return { content: await store.expand({
+            sessionID: typedInput.sessionID,
+            nodeID: typedInput.nodeID,
+            query: typedInput.query,
+            depth: typedInput.depth,
+            messageLimit: typedInput.messageLimit,
+            includeRaw: typedInput.includeRaw,
+          })};
         },
-      }),
+      });
 
-      lcm_artifact: tool({
+      editor.add({
+        name: 'lcm_artifact',
         description: 'View externalized archived content by artifact ID',
-        args: {
-          artifactID: tool.schema.string().min(1),
-          chars: tool.schema.number().int().min(200).max(20000).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            artifactID: { type: 'string', minLength: 1 },
+            chars: { type: 'integer', minimum: 200, maximum: 20000 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.artifact({
-            artifactID: args.artifactID,
-            chars: args.chars,
-          });
+        async execute(input) {
+          const typedInput = input as { artifactID: string; chars?: number };
+          return { content: await store.artifact({
+            artifactID: typedInput.artifactID,
+            chars: typedInput.chars,
+          })};
         },
-      }),
+      });
 
-      lcm_blob_stats: tool({
+      editor.add({
+        name: 'lcm_blob_stats',
         description: 'Show deduplicated artifact blob stats',
-        args: {
-          limit: tool.schema.number().int().min(1).max(20).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', minimum: 1, maximum: 20 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.blobStats({
-            limit: args.limit,
-          });
+        async execute(input) {
+          const typedInput = input as { limit?: number };
+          return { content: await store.blobStats({
+            limit: typedInput.limit,
+          })};
         },
-      }),
+      });
 
-      lcm_blob_gc: tool({
+      editor.add({
+        name: 'lcm_blob_gc',
         description: 'Preview or delete orphaned artifact blobs',
-        args: {
-          apply: tool.schema.boolean().optional(),
-          limit: tool.schema.number().int().min(1).max(50).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            apply: { type: 'boolean' },
+            limit: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.gcBlobs({
-            apply: args.apply,
-            limit: args.limit,
-          });
+        async execute(input) {
+          const typedInput = input as { apply?: boolean; limit?: number };
+          return { content: await store.gcBlobs({
+            apply: typedInput.apply,
+            limit: typedInput.limit,
+          })};
         },
-      }),
+      });
 
-      lcm_compact: tool({
+      editor.add({
+        name: 'lcm_compact',
         description:
           'Measure and reclaim archive database space (prune internal events, checkpoint WAL, and VACUUM when worthwhile)',
-        args: {
-          apply: tool.schema.boolean().optional(),
-          vacuum: tool.schema.boolean().optional(),
-          limit: tool.schema.number().int().min(1).max(50).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            apply: { type: 'boolean' },
+            vacuum: { type: 'boolean' },
+            limit: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.compact({
-            apply: args.apply,
-            vacuum: args.vacuum,
-            limit: args.limit,
-          });
+        async execute(input) {
+          const typedInput = input as { apply?: boolean; vacuum?: boolean; limit?: number };
+          return { content: await store.compact({
+            apply: typedInput.apply,
+            vacuum: typedInput.vacuum,
+            limit: typedInput.limit,
+          })};
         },
-      }),
+      });
 
-      lcm_doctor: tool({
+      editor.add({
+        name: 'lcm_doctor',
         description: 'Inspect or repair archive summaries and indexes',
-        args: {
-          apply: tool.schema.boolean().optional(),
-          sessionID: tool.schema.string().optional(),
-          limit: tool.schema.number().int().min(1).max(50).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            apply: { type: 'boolean' },
+            sessionID: { type: 'string' },
+            limit: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.doctor({
-            apply: args.apply,
-            sessionID: args.sessionID,
-            limit: args.limit,
-          });
+        async execute(input) {
+          const typedInput = input as { apply?: boolean; sessionID?: string; limit?: number };
+          return { content: await store.doctor({
+            apply: typedInput.apply,
+            sessionID: typedInput.sessionID,
+            limit: typedInput.limit,
+          })};
         },
-      }),
+      });
 
-      lcm_retention_report: tool({
+      editor.add({
+        name: 'lcm_retention_report',
         description: 'Preview stale-session and orphan-blob retention candidates',
-        args: {
-          staleSessionDays: tool.schema.number().min(0).optional(),
-          deletedSessionDays: tool.schema.number().min(0).optional(),
-          orphanBlobDays: tool.schema.number().min(0).optional(),
-          limit: tool.schema.number().int().min(1).max(50).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            staleSessionDays: { type: 'number' },
+            deletedSessionDays: { type: 'number' },
+            orphanBlobDays: { type: 'number' },
+            limit: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.retentionReport({
-            staleSessionDays: args.staleSessionDays,
-            deletedSessionDays: args.deletedSessionDays,
-            orphanBlobDays: args.orphanBlobDays,
-            limit: args.limit,
-          });
+        async execute(input) {
+          const typedInput = input as {
+            staleSessionDays?: number;
+            deletedSessionDays?: number;
+            orphanBlobDays?: number;
+            limit?: number;
+          };
+          return { content: await store.retentionReport({
+            staleSessionDays: typedInput.staleSessionDays,
+            deletedSessionDays: typedInput.deletedSessionDays,
+            orphanBlobDays: typedInput.orphanBlobDays,
+            limit: typedInput.limit,
+          })};
         },
-      }),
+      });
 
-      lcm_retention_prune: tool({
+      editor.add({
+        name: 'lcm_retention_prune',
         description: 'Preview or apply stale-session and orphan-blob retention pruning',
-        args: {
-          apply: tool.schema.boolean().optional(),
-          staleSessionDays: tool.schema.number().min(0).optional(),
-          deletedSessionDays: tool.schema.number().min(0).optional(),
-          orphanBlobDays: tool.schema.number().min(0).optional(),
-          limit: tool.schema.number().int().min(1).max(50).optional(),
+        input: {
+          type: 'object',
+          properties: {
+            apply: { type: 'boolean' },
+            staleSessionDays: { type: 'number' },
+            deletedSessionDays: { type: 'number' },
+            orphanBlobDays: { type: 'number' },
+            limit: { type: 'integer', minimum: 1, maximum: 50 },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.retentionPrune({
-            apply: args.apply,
-            staleSessionDays: args.staleSessionDays,
-            deletedSessionDays: args.deletedSessionDays,
-            orphanBlobDays: args.orphanBlobDays,
-            limit: args.limit,
-          });
+        async execute(input) {
+          const typedInput = input as {
+            apply?: boolean;
+            staleSessionDays?: number;
+            deletedSessionDays?: number;
+            orphanBlobDays?: number;
+            limit?: number;
+          };
+          return { content: await store.retentionPrune({
+            apply: typedInput.apply,
+            staleSessionDays: typedInput.staleSessionDays,
+            deletedSessionDays: typedInput.deletedSessionDays,
+            orphanBlobDays: typedInput.orphanBlobDays,
+            limit: typedInput.limit,
+          })};
         },
-      }),
+      });
 
-      lcm_export_snapshot: tool({
+      editor.add({
+        name: 'lcm_export_snapshot',
         description: 'Export a portable long-memory snapshot to a JSON file',
-        args: {
-          filePath: tool.schema.string().min(1),
-          sessionID: tool.schema.string().optional(),
-          scope: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string', minLength: 1 },
+            sessionID: { type: 'string' },
+            scope: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          return await store.exportSnapshot({
-            filePath: args.filePath,
-            sessionID: args.sessionID,
-            scope: args.scope,
-          });
+        async execute(input) {
+          const typedInput = input as { filePath: string; sessionID?: string; scope?: string };
+          return { content: await store.exportSnapshot({
+            filePath: typedInput.filePath,
+            sessionID: typedInput.sessionID,
+            scope: typedInput.scope,
+          })};
         },
-      }),
+      });
 
-      lcm_import_snapshot: tool({
+      editor.add({
+        name: 'lcm_import_snapshot',
         description: 'Import a portable long-memory snapshot from a JSON file',
-        args: {
-          filePath: tool.schema.string().min(1),
-          mode: tool.schema.string().optional(),
-          worktreeMode: tool.schema.string().optional(),
+        input: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string', minLength: 1 },
+            mode: { type: 'string' },
+            worktreeMode: { type: 'string' },
+          },
+          additionalProperties: false,
         },
-        async execute(args) {
-          if (args.mode !== 'merge' && args.mode !== 'replace') {
-            return 'Snapshot import mode is required; choose "merge" or "replace".';
+        async execute(input) {
+          const typedInput = input as {
+            filePath: string;
+            mode?: string;
+            worktreeMode?: string;
+          };
+          if (typedInput.mode !== 'merge' && typedInput.mode !== 'replace') {
+            return { content: 'Snapshot import mode is required; choose "merge" or "replace".' };
           }
-          return await store.importSnapshot({
-            filePath: args.filePath,
-            mode: args.mode,
+          return { content: await store.importSnapshot({
+            filePath: typedInput.filePath,
+            mode: typedInput.mode,
             worktreeMode:
-              args.worktreeMode === 'preserve' || args.worktreeMode === 'current'
-                ? args.worktreeMode
+              typedInput.worktreeMode === 'preserve' || typedInput.worktreeMode === 'current'
+                ? typedInput.worktreeMode
                 : 'auto',
-          });
+          })};
         },
-      }),
-    },
+      });
+    });
 
-    'experimental.chat.messages.transform': async (_input, output) => {
+    // Hook: chat.messages.transform → session.hook("context")
+    // This transforms messages before they're sent to the model (automatic recall)
+    await ctx.session.hook('context', async (event) => {
+      // Convert V2 SDK messages to local ConversationMessage[] for the store
+      const conversationMessages: Array<{ info: Message; parts: Part[] }> = event.messages.map((msg) => ({
+        info: {
+          id: msg.id,
+          sessionID: event.sessionID,
+          role: msg.role,
+          time: { created: Date.now() },
+        } as Message,
+        parts: (msg.content ?? []) as Part[],
+      }));
       await runOptionalPluginWork('chat.messages.transform', () =>
-        store.transformMessages(output.messages),
+        store.transformMessages(conversationMessages),
       );
-    },
+    });
 
-    'experimental.chat.system.transform': async (_input, output) => {
+    // Hook: chat.system.transform → session.hook("context")
+    // This adds the system hint to the system messages
+    await ctx.session.hook('context', (event) => {
       const hint = store.systemHint();
       if (!hint) return;
-      output.system.push(hint);
-    },
+      event.system.push({ type: 'text', text: hint });
+    });
 
-    'experimental.session.compacting': async (input, output) => {
+    // Hook: session.compacting → session.hook("compaction")
+    // This adds the resume note during compaction
+    await ctx.session.hook('compaction', async (event) => {
       const note = await runOptionalPluginWork('session.compacting', () =>
-        store.buildCompactionContext(input.sessionID),
+        store.buildCompactionContext(event.sessionID),
       );
-      if (!note) return;
-      if (output.context.some((entry) => entry.includes('LCM prototype resume note'))) return;
-      output.context.push(note);
-    },
-  };
-};
+      if (!note || typeof note !== 'string') return;
+      if (event.system.some((s) => s.type === 'text' && s.text.includes('LCM prototype resume note'))) return;
+      event.system.push({ type: 'text', text: note });
+    });
 
-export default OpencodeLcmPlugin;
+    // Cleanup: abort the event subscription when the plugin unloads
+    return () => controller.abort();
+  },
+});

@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto';
 import { type FileHandle, open, stat } from 'node:fs/promises';
 
-import type { Part } from '@opencode-ai/sdk';
+import type { Part } from './types.js';
 
 import { getLogger } from './logging.js';
 import { resolveWorkspacePath } from './workspace-path.js';
 
-type FilePart = Extract<Part, { type: 'file' }>;
+type FilePart = Part & { type: 'file' };
 
 type PreviewContext = {
   workspaceDirectory: string;

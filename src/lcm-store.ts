@@ -1,4 +1,16 @@
-import type { Event } from '@opencode-ai/sdk';
+import type { Message, Part, Properties } from './types.js';
+
+// Re-export Properties for use in index.ts
+export type { Properties };
+
+// V2 event shape used by the store (generic payload for captured events)
+export interface Event {
+  type: string;
+  properties: Properties;
+  sessionID?: string;
+  timestamp?: number;
+  payload?: unknown;
+}
 
 import type { ConversationMessage, SearchResult, StoreStats } from './types.js';
 

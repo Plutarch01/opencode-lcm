@@ -1,4 +1,81 @@
-import type { Message, Part } from '@opencode-ai/sdk';
+// V2-compatible types used by the store layer (JSON-serializable shapes)
+// These types capture all properties the store code accesses. Values are unknown
+// to allow JSON deserialization; the store code uses type assertions where needed.
+
+export type MessageTime = {
+  created: number;
+  [key: string]: unknown;
+};
+
+export type Message = {
+  id: string;
+  sessionID: string;
+  role: string;
+  title?: string;
+  directory?: string;
+  parentID?: string;
+  time: MessageTime;
+  [key: string]: unknown;
+};
+
+export type Part = {
+  id: string;
+  messageID: string;
+  sessionID: string;
+  type: string;
+  text?: string;
+  state: PartState;
+  files: string[];
+  source: PartSource;
+  filename?: string;
+  url?: string;
+  mime?: string;
+  value?: string;
+  start?: number;
+  end?: number;
+  path?: string;
+  created?: number;
+  tool?: string;
+  metadata?: Record<string, unknown>;
+  snapshot?: string;
+  prompt?: string;
+  description?: string;
+  agent?: string;
+  name?: string;
+  [key: string]: unknown;
+};
+
+export type PartSource = {
+  path?: string;
+  text?: { value?: string; start?: number; end?: number };
+  value?: string;
+  start?: number;
+  end?: number;
+  type?: string;
+  [key: string]: unknown;
+};
+
+export type PartState = {
+  attachments?: Part[];
+  status?: string;
+  title?: string;
+  input?: unknown;
+  output: string;
+  error: string;
+  metadata?: unknown;
+  [key: string]: unknown;
+};
+
+export type Properties = {
+  part: Part;
+  info: Message;
+  sessionID?: string;
+  messageID?: string;
+  partID?: string;
+  id?: string;
+  time?: { created?: number };
+  [key: string]: unknown;
+};
 
 export type InteropOptions = {
   ignoreToolPrefixes: string[];

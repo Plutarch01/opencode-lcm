@@ -2,7 +2,16 @@ import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
-import type { Event } from '@opencode-ai/sdk';
+import type { Message, Part, Properties } from './types.js';
+
+// V2 event shape used by the store (generic payload for captured events)
+export interface Event {
+  type: string;
+  properties: Properties;
+  sessionID?: string;
+  timestamp?: number;
+  payload?: unknown;
+}
 import { DEFERRED_PART_UPDATE_DELAY_MS } from './constants.js';
 
 import type {
@@ -143,12 +152,12 @@ export class NodeSidecarLcmStore implements LcmStore {
 
     if (event.type === 'message.part.removed') {
       this.pendingPartUpdates.delete(
-        `${event.properties.sessionID}:${event.properties.messageID}:${event.properties.partID}`,
+        `${event.properties?.sessionID}:${event.properties?.messageID}:${event.properties?.partID}`,
       );
     } else if (event.type === 'message.removed') {
-      this.clearPendingPartUpdates(`${event.properties.sessionID}:${event.properties.messageID}:`);
+      this.clearPendingPartUpdates(`${event.properties?.sessionID}:${event.properties?.messageID}:`);
     } else if (event.type === 'session.deleted') {
-      const sessionID = event.properties.info.id;
+      const sessionID = (event.properties?.info as { id?: string } | undefined)?.id;
       this.clearPendingPartUpdates(`${sessionID}:`);
     }
 

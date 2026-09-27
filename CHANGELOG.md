@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Migrated from OpenCode V1 plugin API to V2 (`Plugin.define`, `ctx.session.hook`, `ctx.tool.transform`, `ctx.event.subscribe`)
+- Plugin config format changed from `"plugin"` to `"plugins"` in `opencode.json`
+- Requires OpenCode ≥2.0; no longer compatible with OpenCode V1
+
 ## [0.15.1] - 2026-08-21
 
 ### Fixed

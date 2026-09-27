@@ -12,6 +12,9 @@ A transparent long-memory plugin for [OpenCode](https://github.com/sst/opencode)
 > [!NOTE]
 > This is an early community plugin for OpenCode and is not affiliated with or endorsed by the OpenCode project. Behavior, internals, and configuration may change as the project evolves.
 
+> [!IMPORTANT]
+> This version requires OpenCode ≥2.0. For OpenCode V1, use a pre-2.0 release.
+
 ## context-mode
 
 `opencode-lcm` preserves archived conversation context so the assistant can recall earlier decisions without re-reading old files. Pairing it with [context-mode](https://github.com/mksglu/context-mode/) reduces tool-output token waste and keeps the active prompt lean.
@@ -23,7 +26,7 @@ Add to your `opencode.json` (project or global `~/.config/opencode/opencode.json
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-lcm"]
+  "plugins": ["opencode-lcm"]
 }
 ```
 
@@ -96,20 +99,24 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    ["opencode-lcm", {
-      "scopeDefaults": { "grep": "session", "describe": "session" },
-      "automaticRetrieval": {
-        "enabled": true,
-        "scopeOrder": ["session", "root", "worktree"],
-        "scopeBudgets": { "session": 16, "root": 12, "worktree": 8, "all": 6 }
-      },
-      "retention": {
-        "staleSessionDays": 90,
-        "deletedSessionDays": 30,
-        "orphanBlobDays": 14
+  "plugins": [
+    "opencode-lcm",
+    {
+      "package": "opencode-lcm",
+      "options": {
+        "scopeDefaults": { "grep": "session", "describe": "session" },
+        "automaticRetrieval": {
+          "enabled": true,
+          "scopeOrder": ["session", "root", "worktree"],
+          "scopeBudgets": { "session": 16, "root": 12, "worktree": 8, "all": 6 }
+        },
+        "retention": {
+          "staleSessionDays": 90,
+          "deletedSessionDays": 30,
+          "orphanBlobDays": 14
+        }
       }
-    }]
+    }
   ]
 }
 ```
@@ -126,46 +133,50 @@ Add `opencode-lcm` to your `opencode.json` (project or global `~/.config/opencod
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    ["opencode-lcm", {
-      "scopeDefaults": {
-        "grep": "session",
-        "describe": "session"
-      },
-      "retention": {
-        "staleSessionDays": 90,
-        "deletedSessionDays": 30,
-        "orphanBlobDays": 14
-      },
-      "privacy": {
-        "excludeToolPrefixes": ["playwright_browser_"],
-        "excludePathPatterns": ["[\\\\/]secrets[\\\\/]", "\\\\.env($|\\\\.)"],
-        "redactPatterns": ["sk-[A-Za-z0-9_-]+", "ZX729ALBATROSS"]
-      },
-      "automaticRetrieval": {
-        "enabled": true,
-        "scopeOrder": ["session", "root", "worktree"],
-        "scopeBudgets": {
-          "session": 16,
-          "root": 12,
-          "worktree": 8,
-          "all": 6
+  "plugins": [
+    "opencode-lcm",
+    {
+      "package": "opencode-lcm",
+      "options": {
+        "scopeDefaults": {
+          "grep": "session",
+          "describe": "session"
         },
-        "stop": {
-          "targetHits": 3,
-          "stopOnFirstScopeWithHits": false
+        "retention": {
+          "staleSessionDays": 90,
+          "deletedSessionDays": 30,
+          "orphanBlobDays": 14
         },
-        "maxMessageHits": 2,
-        "maxSummaryHits": 1,
-        "maxArtifactHits": 1
-      },
-      "freshTailMessages": 10,
-      "minMessagesForTransform": 16,
-      "summaryCharBudget": 1500,
-      "systemHint": true,
-      "binaryPreviewProviders": ["fingerprint", "byte-peek", "image-dimensions", "pdf-metadata"],
-      "previewBytePeek": 16
-    }]
+        "privacy": {
+          "excludeToolPrefixes": ["playwright_browser_"],
+          "excludePathPatterns": ["[\\\\/]secrets[\\\\/]", "\\\\.env($|\\\\.)"],
+          "redactPatterns": ["sk-[A-Za-z0-9_-]+", "ZX729ALBATROSS"]
+        },
+        "automaticRetrieval": {
+          "enabled": true,
+          "scopeOrder": ["session", "root", "worktree"],
+          "scopeBudgets": {
+            "session": 16,
+            "root": 12,
+            "worktree": 8,
+            "all": 6
+          },
+          "stop": {
+            "targetHits": 3,
+            "stopOnFirstScopeWithHits": false
+          },
+          "maxMessageHits": 2,
+          "maxSummaryHits": 1,
+          "maxArtifactHits": 1
+        },
+        "freshTailMessages": 10,
+        "minMessagesForTransform": 16,
+        "summaryCharBudget": 1500,
+        "systemHint": true,
+        "binaryPreviewProviders": ["fingerprint", "byte-peek", "image-dimensions", "pdf-metadata"],
+        "previewBytePeek": 16
+      }
+    }
   ]
 }
 ```
@@ -195,26 +206,32 @@ Pairing with [context-mode](https://github.com/mksglu/context-mode/) reduces too
       "command": ["context-mode"]
     }
   },
-  "plugin": [
+  "plugins": [
     "context-mode",
-    ["opencode-lcm", {
-      "interop": {
-        "ignoreToolPrefixes": ["ctx_"]
-      },
-      "scopeDefaults": { "grep": "session", "describe": "session" },
-      "retention": {
-        "staleSessionDays": 90,
-        "deletedSessionDays": 30,
-        "orphanBlobDays": 14
+    [
+      "opencode-lcm",
+      {
+        "package": "opencode-lcm",
+        "options": {
+          "interop": {
+            "ignoreToolPrefixes": ["ctx_"]
+          },
+          "scopeDefaults": { "grep": "session", "describe": "session" },
+          "retention": {
+            "staleSessionDays": 90,
+            "deletedSessionDays": 30,
+            "orphanBlobDays": 14
+          }
+        }
       }
-    }]
+    ]
   ]
 }
 ```
 
 ## Disable
 
-Remove `opencode-lcm` from the `plugin` array and restart OpenCode. To keep the archive but stop automatic recall, set `automaticRetrieval.enabled` to `false`.
+Remove `opencode-lcm` from the `plugins` array and restart OpenCode. To keep the archive but stop automatic recall, set `automaticRetrieval.enabled` to `false`.
 
 ## Performance
 

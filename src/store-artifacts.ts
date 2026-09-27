@@ -1,4 +1,4 @@
-import type { Message, Part } from '@opencode-ai/sdk';
+import type { Message, Part } from './types.js';
 import { ARTIFACT_FTS_CHAR_LIMIT } from './constants.js';
 import { buildExplorationSummary } from './exploration.js';
 import { getLogger } from './logging.js';
@@ -160,12 +160,12 @@ function createArtifactData(
   };
 }
 
-function filePrivacyCandidates(file: Extract<Part, { type: 'file' }>): Array<string | undefined> {
+function filePrivacyCandidates(file: Part): Array<string | undefined> {
   const sourcePath = file.source && 'path' in file.source ? file.source.path : undefined;
   return [file.filename, file.url, sourcePath];
 }
 
-function excludeStoredFilePart(file: Extract<Part, { type: 'file' }>): void {
+function excludeStoredFilePart(file: Part): void {
   file.filename = PRIVACY_EXCLUDED_FILE_REFERENCE;
   file.url = 'lcm://privacy-excluded';
   if (file.source && 'path' in file.source) file.source.path = PRIVACY_REDACTED_PATH_TEXT;
@@ -202,7 +202,7 @@ export function buildArtifactSearchContent(artifact: ArtifactData): string {
 }
 
 function buildFileArtifactMetadata(
-  file: Extract<Part, { type: 'file' }>,
+  file: Part,
   extras: Record<string, unknown> = {},
 ): Record<string, unknown> {
   const sourcePath = file.source && 'path' in file.source ? file.source.path : undefined;
@@ -224,7 +224,7 @@ function buildFileArtifactMetadata(
 
 async function buildBinaryPreviewArtifact(
   bindings: StoreArtifactBindings,
-  file: Extract<Part, { type: 'file' }>,
+  file: Part,
   fieldName: string,
   label: string,
   createdAt: number,
@@ -240,7 +240,7 @@ async function buildBinaryPreviewArtifact(
     'unknown file';
   const previewDetails = await runBinaryPreviewProviders({
     workspaceDirectory: bindings.workspaceDirectory,
-    file,
+    file: file as Part & { type: 'file' },
     category,
     extension,
     mime: file.mime,
@@ -268,9 +268,9 @@ async function buildBinaryPreviewArtifact(
   );
 
   return createArtifactData(bindings, {
-    sessionID: file.sessionID,
-    messageID: file.messageID,
-    partID: file.id,
+    sessionID: file.sessionID!,
+    messageID: file.messageID!,
+    partID: file.id!,
     artifactKind: 'file',
     fieldName,
     contentText,
@@ -304,9 +304,9 @@ async function externalizePart(
     if (contentText.length < bindings.options.largeContentThreshold) return contentText;
 
     const artifact = createArtifactData(bindings, {
-      sessionID: storedPart.sessionID,
-      messageID: storedPart.messageID,
-      partID: storedPart.id,
+      sessionID: storedPart.sessionID!,
+      messageID: storedPart.messageID!,
+      partID: storedPart.id!,
       artifactKind,
       fieldName,
       contentText,
@@ -325,7 +325,7 @@ async function externalizePart(
 
   switch (storedPart.type) {
     case 'text':
-      storedPart.text = externalize('message', 'text', storedPart.text, {}, undefined, true);
+      storedPart.text = externalize('message', 'text', storedPart.text ?? '', {}, undefined, true);
       if (artifacts.length > 0) {
         storedPart.metadata = {
           ...(storedPart.metadata ?? {}),
@@ -334,7 +334,7 @@ async function externalizePart(
       }
       break;
     case 'reasoning':
-      storedPart.text = externalize('reasoning', 'text', storedPart.text, {}, undefined, true);
+      storedPart.text = externalize('reasoning', 'text', storedPart.text ?? '', {}, undefined, true);
       if (artifacts.length > 0) {
         storedPart.metadata = {
           ...(storedPart.metadata ?? {}),
@@ -342,78 +342,80 @@ async function externalizePart(
         };
       }
       break;
-    case 'tool':
-      if (isExcludedTool(storedPart.tool, privacy)) {
-        storedPart.state.input = { excluded: true };
-        if ('metadata' in storedPart.state) storedPart.state.metadata = { excluded: true };
-        if (storedPart.state.status === 'completed') {
-          storedPart.state.output = PRIVACY_EXCLUDED_TOOL_OUTPUT;
-          storedPart.state.attachments = [];
-        }
-        if (storedPart.state.status === 'error') {
-          storedPart.state.error = PRIVACY_EXCLUDED_TOOL_OUTPUT;
-        }
-        break;
-      }
-      if (storedPart.state.status === 'completed') {
-        storedPart.state.output = externalize(
-          'tool',
-          'output',
-          storedPart.state.output,
-          {},
-          undefined,
-          true,
-        );
-        if (storedPart.state.attachments) {
-          const storedAttachments: Extract<Part, { type: 'file' }>[] = [];
-          for (const [index, attachment] of storedPart.state.attachments.entries()) {
-            if (matchesExcludedPath(filePrivacyCandidates(attachment), privacy)) {
-              excludeStoredFilePart(attachment);
-              storedAttachments.push(attachment);
-              continue;
-            }
-            const previewMetadata = {
-              attachmentIndex: index,
-              tool: storedPart.tool,
-              title: storedPart.state.status === 'completed' ? storedPart.state.title : undefined,
-            };
-            artifacts.push(
-              await buildBinaryPreviewArtifact(
-                bindings,
-                attachment,
-                `attachment:${index}`,
-                `Tool attachment for ${storedPart.tool}`,
-                createdAt,
-                previewMetadata,
-              ),
-            );
-
-            if (attachment.source?.text?.value) {
-              attachment.source.text.value = externalize(
-                'file',
-                `attachment_text:${index}`,
-                attachment.source.text.value,
-                buildFileArtifactMetadata(attachment, previewMetadata),
-              );
-              attachment.source.text.start = 0;
-              attachment.source.text.end = attachment.source.text.value.length;
-            }
-            storedAttachments.push(attachment);
+    case 'tool': {
+      const state = storedPart.state;
+      if (state) {
+        if (isExcludedTool(storedPart.tool ?? '', privacy)) {
+          state.input = { excluded: true };
+          if ('metadata' in state) state.metadata = { excluded: true };
+          if (state.status === 'completed') {
+            state.output = PRIVACY_EXCLUDED_TOOL_OUTPUT;
+            state.attachments = [];
           }
-          storedPart.state.attachments = storedAttachments;
+          if (state.status === 'error') {
+            state.error = PRIVACY_EXCLUDED_TOOL_OUTPUT;
+          }
+        } else if (state.status === 'completed') {
+          state.output = externalize(
+            'tool',
+            'output',
+            state.output,
+            {},
+            undefined,
+            true,
+          );
+          if (state.attachments) {
+            const storedAttachments: Part[] = [];
+            for (const [index, attachment] of state.attachments.entries()) {
+              if (matchesExcludedPath(filePrivacyCandidates(attachment), privacy)) {
+                excludeStoredFilePart(attachment);
+                storedAttachments.push(attachment);
+                continue;
+              }
+              const previewMetadata = {
+                attachmentIndex: index,
+                tool: storedPart.tool,
+                title: state.status === 'completed' ? state.title : undefined,
+              };
+              artifacts.push(
+                await buildBinaryPreviewArtifact(
+                  bindings,
+                  attachment,
+                  `attachment:${index}`,
+                  `Tool attachment for ${storedPart.tool}`,
+                  createdAt,
+                  previewMetadata,
+                ),
+              );
+
+              if (attachment.source?.text?.value) {
+                attachment.source.text.value = externalize(
+                  'file',
+                  `attachment_text:${index}`,
+                  attachment.source.text.value,
+                  buildFileArtifactMetadata(attachment, previewMetadata),
+                );
+                attachment.source.text.start = 0;
+                attachment.source.text.end = attachment.source.text.value.length;
+              }
+              storedAttachments.push(attachment);
+            }
+            storedPart.state!.attachments = storedAttachments;
+          }
         }
-      }
-      if (storedPart.state.status === 'error') {
-        storedPart.state.error = externalize(
-          'tool',
-          'error',
-          storedPart.state.error,
-          {},
-          undefined,
-          true,
-        );
+        if (state.status === 'error') {
+          state.error = externalize(
+            'tool',
+            'error',
+            state.error,
+            {},
+            undefined,
+            true,
+          );
+        }
       }
       break;
+    }
     case 'file':
       if (matchesExcludedPath(filePrivacyCandidates(storedPart), privacy)) {
         excludeStoredFilePart(storedPart);
@@ -443,7 +445,7 @@ async function externalizePart(
       storedPart.snapshot = externalize(
         'snapshot',
         'snapshot',
-        storedPart.snapshot,
+        storedPart.snapshot ?? '',
         {},
         undefined,
         true,
@@ -464,11 +466,11 @@ async function externalizePart(
       }
       break;
     case 'subtask':
-      storedPart.prompt = externalize('subtask', 'prompt', storedPart.prompt, {}, undefined, true);
+      storedPart.prompt = externalize('subtask', 'prompt', storedPart.prompt ?? '', {}, undefined, true);
       storedPart.description = externalize(
         'subtask',
         'description',
-        storedPart.description,
+        storedPart.description ?? '',
         {},
         undefined,
         true,

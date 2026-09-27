@@ -3,7 +3,16 @@ import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import type { Event, Message, Part } from '@opencode-ai/sdk';
+import type { Message, Part, Properties } from './types.js';
+
+// V2 event shape used by the store (generic payload for captured events)
+export interface Event {
+  type: string;
+  properties: Properties;
+  sessionID?: string;
+  timestamp?: number;
+  payload?: unknown;
+}
 
 import {
   buildActiveSummaryText,
@@ -542,17 +551,18 @@ function hydratePartFromArtifacts(part: Part, artifacts: ArtifactData[]): void {
       case 'reasoning':
         if (artifact.fieldName === 'text') part.text = artifact.contentText;
         break;
-      case 'tool':
-        if (part.state.status === 'completed' && artifact.fieldName === 'output')
-          part.state.output = artifact.contentText;
-        if (part.state.status === 'error' && artifact.fieldName === 'error')
-          part.state.error = artifact.contentText;
+      case 'tool': {
+        const partState = part.state;
+        if (partState.status === 'completed' && artifact.fieldName === 'output')
+          partState.output = artifact.contentText;
+        if (partState.status === 'error' && artifact.fieldName === 'error')
+          partState.error = artifact.contentText;
         if (
-          part.state.status === 'completed' &&
+          partState.status === 'completed' &&
           artifact.fieldName.startsWith('attachment_text:')
         ) {
           const index = Number(artifact.fieldName.split(':')[1]);
-          const attachment = part.state.attachments?.[index];
+          const attachment = partState.attachments?.[index];
           if (attachment?.source?.text) {
             attachment.source.text.value = artifact.contentText;
             attachment.source.text.start = 0;
@@ -560,6 +570,7 @@ function hydratePartFromArtifacts(part: Part, artifacts: ArtifactData[]): void {
           }
         }
         break;
+      }
       case 'file':
         if (artifact.fieldName === 'source' && part.source?.text) {
           part.source.text.value = artifact.contentText;
@@ -645,10 +656,10 @@ function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: stri
         segments.push(`${part.agent}: ${part.description}`);
         break;
       case 'agent':
-        segments.push(part.name);
+        segments.push(part.name ?? '');
         break;
       case 'snapshot':
-        segments.push(part.snapshot);
+        segments.push(part.snapshot ?? '');
         break;
       default:
         break;
@@ -668,7 +679,7 @@ function listFiles(message: ConversationMessage): string[] {
     }
 
     if (part.type === 'patch') {
-      for (const file of part.files.slice(0, 20)) files.add(file);
+      for (const file of (part.files ?? []).slice(0, 20)) files.add(file);
     }
   }
 
@@ -4026,6 +4037,9 @@ export class SqliteLcmStore {
           messageID: anchor.info.id,
           type: 'text',
           text: retrieval,
+          state: { output: '', error: '' },
+          files: [],
+          source: {},
           synthetic: true,
           metadata: { opencodeLcm: 'retrieved-context' },
         });
@@ -4036,6 +4050,9 @@ export class SqliteLcmStore {
         messageID: anchor.info.id,
         type: 'text',
         text: summary,
+        state: { output: '', error: '' },
+        files: [],
+        source: {},
         synthetic: true,
         metadata: { opencodeLcm: 'archive-summary' },
       });
@@ -4589,15 +4606,16 @@ export class SqliteLcmStore {
           part.text = archivePlaceholder('reasoning omitted');
           break;
         case 'tool': {
-          if (part.state.status === 'completed') {
-            const label = this.shouldIgnoreTool(part.tool)
+          const partState = part.state;
+          if (partState.status === 'completed') {
+            const label = this.shouldIgnoreTool(part.tool ?? '')
               ? 'infrastructure tool output omitted'
               : `tool output for ${part.tool} omitted`;
-            part.state.output = archivePlaceholder(label);
-            part.state.attachments = undefined;
+            partState.output = archivePlaceholder(label);
+            partState.attachments = undefined;
           }
-          if (part.state.status === 'error') {
-            part.state.error = archivePlaceholder(`error output for ${part.tool} omitted`);
+          if (partState.status === 'error') {
+            partState.error = archivePlaceholder(`error output for ${part.tool} omitted`);
           }
           break;
         }
@@ -4621,11 +4639,11 @@ export class SqliteLcmStore {
           }
           break;
         case 'patch':
-          part.files = part.files.slice(0, 8);
+          part.files = (part.files ?? []).slice(0, 8);
           break;
         case 'subtask':
-          part.prompt = truncate(part.prompt, this.options.partCharBudget);
-          part.description = truncate(part.description, this.options.partCharBudget);
+          part.prompt = truncate(part.prompt ?? '', this.options.partCharBudget);
+          part.description = truncate(part.description ?? '', this.options.partCharBudget);
           break;
         default:
           break;
@@ -4831,8 +4849,8 @@ export class SqliteLcmStore {
     for (const message of messages) {
       for (const part of message.parts) {
         if (part.type !== 'tool') continue;
-        if (this.shouldIgnoreTool(part.tool)) continue;
-        tools.push(part.tool);
+        if (this.shouldIgnoreTool(part.tool ?? '')) continue;
+        tools.push(part.tool ?? '');
       }
     }
     return tools;
@@ -5836,15 +5854,15 @@ export class SqliteLcmStore {
     switch (payload.type) {
       case 'session.created':
       case 'session.updated':
-        session.title = payload.properties.info.title;
-        session.directory = payload.properties.info.directory;
-        session.parentSessionID = payload.properties.info.parentID ?? undefined;
+        session.title = payload.properties.info.title as string | undefined;
+        session.directory = payload.properties.info.directory as string | undefined;
+        session.parentSessionID = payload.properties.info.parentID as string | undefined;
         session.deleted = false;
         return session;
       case 'session.deleted':
-        session.title = payload.properties.info.title;
-        session.directory = payload.properties.info.directory;
-        session.parentSessionID = payload.properties.info.parentID ?? session.parentSessionID;
+        session.title = payload.properties.info.title as string | undefined;
+        session.directory = payload.properties.info.directory as string | undefined;
+        session.parentSessionID = (payload.properties.info.parentID as string | undefined) ?? session.parentSessionID;
         session.deleted = true;
         return session;
       case 'session.compacted':
@@ -6214,12 +6232,16 @@ export class SqliteLcmStore {
         return session;
       }
       case 'message.part.updated': {
-        const message = this.readMessageSync(sessionID, payload.properties.part.messageID, options);
+        const messageID = payload.properties.part.messageID;
+        if (!messageID) return session;
+        const message = this.readMessageSync(sessionID, messageID, options);
         if (message) session.messages = [message];
         return session;
       }
       case 'message.part.removed': {
-        const message = this.readMessageSync(sessionID, payload.properties.messageID, options);
+        const messageID = payload.properties.messageID;
+        if (!messageID) return session;
+        const message = this.readMessageSync(sessionID, messageID, options);
         if (message) session.messages = [message];
         return session;
       }
@@ -6331,7 +6353,8 @@ export class SqliteLcmStore {
         withTransaction(this.getDb(), 'capture', () => {
           writeEvent();
           this.upsertSessionRowSync(session);
-          this.deleteMessageSync(session.sessionID, payload.properties.messageID);
+          const messageID = payload.properties.messageID as string | undefined;
+          if (messageID) this.deleteMessageSync(session.sessionID, messageID);
         });
         return;
       case 'message.part.updated': {
